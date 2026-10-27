@@ -1,0 +1,84 @@
+{
+  "name": "taskboard-workbench",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "agent team 任务工作台：零依赖核心（node:sqlite）+ CLI + 本地 Web 看板 + DSH 内嵌插件",
+  "license": "MIT",
+  "author": {
+    "name": "SilenZerOrz",
+    "email": "SilenZerOrz@users.noreply.github.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SilenZerOrz/taskboard-workbench.git"
+  },
+  "homepage": "https://github.com/SilenZerOrz/taskboard-workbench#readme",
+  "bugs": {
+    "url": "https://github.com/SilenZerOrz/taskboard-workbench/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "taskboard",
+    "agent",
+    "agent-team",
+    "sqlite",
+    "local-first"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "src",
+    "web",
+    "cli",
+    "spec/团队agent.md",
+    "tools/seed.mjs",
+    "tools/env-check.mjs"
+  ],
+  "bin": {
+    "tb": "./cli/tb.mjs"
+  },
+  "scripts": {
+    "start": "node src/server/server.mjs",
+    "seed": "node tools/seed.mjs",
+    "test": "node --test",
+    "env-check": "node tools/env-check.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-client-ui-layout": "*",
+    "@deepseek-ai/dsh-client-ui-sidebar": "*",
+    "@deepseek-ai/dsh-client-ui-slots": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-client-ui-layout": { "optional": true },
+    "@deepseek-ai/dsh-client-ui-sidebar": { "optional": true },
+    "@deepseek-ai/dsh-client-ui-slots": { "optional": true }
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  }
+}

@@ -1,0 +1,30 @@
+# 依赖与构建产物
+node_modules/
+dist/
+*.tgz
+
+# 运行期数据
+.data/
+*.sqlite
+*.sqlite-*
+
+# 日志与临时文件
+*.log
+.tmp/
+*.pid
+
+# 编辑器与系统
+.DS_Store
+.idea/
+.vscode/
+
+# 本地过程文档与规范（不上传；SOP 见 docs/发布与收录/）
+docs/
+# 架构产物（archify 生成）
+.archify/
+# 本机 agent 约定（含内网信息，是否公开由人拍板）
+AGENTS.md
+# 临时探针
+.perm-write-test
+# npm 打包临时产物
+package/

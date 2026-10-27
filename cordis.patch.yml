@@ -1,0 +1,5 @@
+# DSH 宿主插件条目（形态对照 integrations/deepseek-harness/cordis.patch.yml）。
+# 卸载 = 删除本条目（或用 `dsh plugin --profile web remove`）。
+- insert:
+    - id: taskboard-workbench
+      name: taskboard-workbench
