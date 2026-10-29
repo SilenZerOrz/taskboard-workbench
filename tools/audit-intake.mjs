@@ -126,6 +126,35 @@ async function runE2E({ root }) {
   });
   const body = await res.json().catch(() => ({}));
   const after = await count();
+
+  // ── 拒绝路径（A 的另一半验收）────────────────────────────────────────────
+  // 只测 doc 路径等于只测一半：「那条路不存在」要证的是**打这条路会被拦住且零副作用**。
+  // 三条各跑一次：items / both ⇒ INTAKE_ITEMS_DISABLED；未知 mode ⇒ USAGE_ERROR；全部 400。
+  const rejectCases = [
+    { mode: "items", expect: "INTAKE_ITEMS_DISABLED" },
+    { mode: "both", expect: "INTAKE_ITEMS_DISABLED" },
+    { mode: "bogus", expect: "USAGE_ERROR" },
+  ];
+  const beforeReject = await count();
+  const rejects = [];
+  for (const c of rejectCases) {
+    const r = await fetch(`${base}/api/projects/${encodeURIComponent(projectId)}/intake`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: c.mode }),
+    });
+    const j = await r.json().catch(() => ({}));
+    const code = j?.error?.code ?? null;
+    rejects.push({
+      mode: c.mode, status: r.status, code,
+      itemsCreatedPresent: Object.prototype.hasOwnProperty.call(j ?? {}, "itemsCreated"),
+      expected: c.expect,
+      ok: r.status === 400 && code === c.expect,
+      message: j?.error?.message ?? null,
+    });
+  }
+  const afterReject = await count();
+  const rejectDelta = afterReject.total - beforeReject.total;
+  const rejectsOk = rejects.every((x) => x.ok) && rejectDelta === 0;
+
   child.kill("SIGTERM");
   await new Promise((r) => { child.once("exit", r); setTimeout(r, 4000); });
   return {
@@ -135,10 +164,14 @@ async function runE2E({ root }) {
     httpStatus: res.status,
     scanned: body.scanned ?? null,
     itemsCreatedReported: body.itemsCreated ?? null,   // A 之后恒为 null（响应体已无该字段）
-    rejectionCode: body?.error?.code ?? null,          // A 之后 mode:both 应得 INTAKE_ITEMS_DISABLED
+    rejectionCode: body?.error?.code ?? null,          // doc 路径应为 null（201）；拒绝路径见 rejects
     itemsBefore: before,
     itemsAfter: after,
     itemsDelta: after.total - before.total,
+    // 拒绝路径（items/both ⇒ INTAKE_ITEMS_DISABLED · 未知 mode ⇒ USAGE_ERROR · 全 400 · 零副作用）
+    rejects,
+    rejectDelta,
+    rejectsOk,
   };
 }
 
@@ -212,6 +245,16 @@ const main = async () => {
   };
   if (!existsSync(dbPath)) report.error = `数据库不存在：${dbPath}`;
   process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+  // e2e 跑了就守住拒绝路径：任一条不是 400 / 码不对 / 有副作用 ⇒ 退出码 1（可进 CI）
+  if (report.e2e) {
+    const bad = report.e2e.rejects.filter((x) => !x.ok);
+    if (bad.length || report.e2e.rejectDelta !== 0) {
+      process.stderr.write(`[audit-intake] ✗ 拒绝路径不符：${JSON.stringify(bad)} rejectDelta=${report.e2e.rejectDelta}\n`);
+      process.exitCode = 1;
+    } else {
+      process.stderr.write(`[audit-intake] ✓ 拒绝路径 3/3 均为 400 且零副作用（rejectDelta=0）· doc 路径 itemsDelta=${report.e2e.itemsDelta}\n`);
+    }
+  }
 };
 
 main().catch((e) => {
