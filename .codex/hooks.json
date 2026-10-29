@@ -1,0 +1,67 @@
+{
+  "description": "项目开发钩子 1-5：1-提示词防泄密 / 2-危险命令守卫 / 3-改动语法体检 / 4-收尾测试闸门 / 5-会话留痕",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/2-guard-bash.py\"",
+            "statusMessage": "2-危险命令守卫",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "apply_patch|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/3-post-edit-check.py\"",
+            "statusMessage": "3-改动语法体检",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/1-scan-prompt-secrets.py\"",
+            "statusMessage": "1-提示词防泄密",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/4-stop-verify.py\"",
+            "statusMessage": "4-收尾测试闸门",
+            "timeout": 150
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/5-session-note.py\"",
+            "statusMessage": "5-会话留痕",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

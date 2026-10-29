@@ -28,3 +28,5 @@ AGENTS.md
 .perm-write-test
 # npm 打包临时产物
 package/
+# Codex 钩子的本地运行痕迹（会话留痕等，不入库）
+.codex/local/
