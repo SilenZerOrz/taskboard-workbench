@@ -28,6 +28,9 @@ export const ERROR_CATEGORY = Object.freeze({
   UNKNOWN_OPTION: EXIT.USAGE,
   // FR-03：删除项目必须先显式确认（缺确认 ⇒ 用法错误，避免误触删掉项目）
   PROJECT_DELETE_UNCONFIRMED: EXIT.USAGE,
+  // FR-57（2026-10-29 修订 · A）：资料引入**只建索引、不产生条目**。
+  // 旧 `mode:"items"/"both"` 显式拒绝（不静默降级成 doc-only）——「那条路不存在」要在契约层成立。
+  INTAKE_ITEMS_DISABLED: EXIT.USAGE,
 
   // 存储不可用
   STORE_UNAVAILABLE: EXIT.SERVICE,

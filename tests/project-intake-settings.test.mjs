@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { openStore } from "../src/core/store.mjs";
-import { createApiRouter } from "../src/server/api.mjs";
+import { createApiRouter, httpStatusFor } from "../src/server/api.mjs";
 import { scanProjectMaterials, buildMaterialIndex } from "../src/core/intake.mjs";
 
 // 验证台建的临时目录/文件：跑完（含断言失败）统一清理，别把 OS 临时目录堆满。
@@ -42,23 +42,42 @@ test("intake 扫描：只收文档、跳过 node_modules/隐藏；文本可读�
   assert.ok(built.docs.some((d) => d.title === "需求总纲")); // 取自首个一级标题
 });
 
-test("/api/projects/:id/intake：写入需求文档 + 生成条目；重复执行不重复建条目", async () => {
+test("/api/projects/:id/intake：只写资料索引、不建条目；items/both/未知 mode 显式拒绝", async () => {
   const dir = makeTree();
   const store = openStore({ dbPath: ":memory:" });
   store.createProject({ id: "p1", name: "P1", workspacePath: dir });
   const router = createApiRouter({ store });
   const post = (pathname, body) => router.route({ method: "POST", pathname, searchParams: new URLSearchParams(), body });
+  const reject = async (mode, code) => {
+    let err = null;
+    try { await post("/api/projects/p1/intake", { mode }); } catch (e) { err = e; }
+    assert.ok(err, `mode=${mode} 必须被拒绝，而不是静默按 doc 处理`);
+    assert.equal(err.code, code, `mode=${mode}`);
+    assert.equal(httpStatusFor(err), 400, `mode=${mode} 必须 400`);
+    return err;
+  };
 
   const first = await post("/api/projects/p1/intake", {});
   assert.equal(first.status, 201);
   assert.equal(first.payload.scanned, 3);
-  assert.equal(first.payload.itemsCreated, 2);
   assert.ok(first.payload.doc && first.payload.doc.bytes > 0);
   assert.ok(store.getRequirementDoc("p1").body.includes("资料清单"));
-  assert.equal(store.listRequirementItems({ projectId: "p1" }).length, 2);
+  // FR-57（2026-10-29 修订 · A）：引入**不产生条目**；响应体也不再带 itemsCreated / items
+  assert.equal(store.listRequirementItems({ projectId: "p1" }).length, 0);
+  assert.equal("itemsCreated" in first.payload, false);
+  assert.equal("items" in first.payload, false);
 
   const second = await post("/api/projects/p1/intake", {});
-  assert.equal(second.payload.itemsCreated, 0); // 幂等：不重复建条目
+  assert.equal(second.status, 201);
+  assert.ok(second.payload.doc.version > first.payload.doc.version); // 索引幂等更新
+  assert.equal(store.listRequirementItems({ projectId: "p1" }).length, 0);
+
+  // 门：显式拒绝 + **零副作用**（索引版本不前进）
+  const before = store.getRequirementDoc("p1").version;
+  await reject("items", "INTAKE_ITEMS_DISABLED");
+  await reject("both", "INTAKE_ITEMS_DISABLED");
+  await reject("whatever", "USAGE_ERROR");
+  assert.equal(store.getRequirementDoc("p1").version, before, "被拒绝的请求不得留下任何副作用");
   store.close();
 });
 
@@ -98,15 +117,17 @@ test("intake 范围过滤：include / exclude / exts", async () => {
   assert.deepEqual(mdOnly.files.map((f) => f.relPath).sort(), ["README.md", "docs/需求.md"]);
 });
 
-test("intake 生成条目默认 draft/intake；条目可改状态(PATCH)与删除(DELETE)", async () => {
+test("历史 source=intake 条目仍可改状态(PATCH)与删除(DELETE)（能力 2026-10-29 迁 FR-35）", async () => {
   const dir = makeTree();
   const store = openStore({ dbPath: ":memory:" });
   store.createProject({ id: "p1", name: "P1", workspacePath: dir });
   const router = createApiRouter({ store });
   const call = (method, pathname, body) => router.route({ method, pathname, searchParams: new URLSearchParams(), body });
 
-  const res = await call("POST", "/api/projects/p1/intake", {});
-  assert.equal(res.status, 201);
+  // 引入不再产出条目（A），所以这里**直接 seed 历史存量**：验证「老数据仍可查、可改、可删」不被 A 打破。
+  for (const t of ["需求总纲", "项目简介"]) {
+    store.createRequirementItem({ projectId: "p1", title: t, description: `来源：\`docs/${t}.md\``, source: "intake", status: "draft" });
+  }
   const items = store.listRequirementItems({ projectId: "p1" });
   assert.equal(items.length, 2);
   assert.ok(items.every((i) => i.status === "draft" && i.source === "intake"));
@@ -136,7 +157,31 @@ test("intake extraPaths：按引用纳入工作区外文件（不拷贝）", asy
   assert.equal(dry.payload.scanned, 4); // 3 篇内置 + 1 外部
   assert.ok(dry.payload.files.some((f) => f.external && f.relPath.includes("«外部»")));
 
-  await call("POST", "/api/projects/p1/intake", { extraPaths: [external], mode: "items" });
-  assert.ok(store.listRequirementItems({ projectId: "p1" }).some((i) => i.title === "外部取证"));
+  const res = await call("POST", "/api/projects/p1/intake", { extraPaths: [external], mode: "doc" });
+  assert.equal(res.status, 201);
+  assert.ok(store.getRequirementDoc("p1").body.includes("外部取证")); // 外部文件进索引
+  assert.equal(store.listRequirementItems({ projectId: "p1" }).length, 0); // 但**不建条目**
+  store.close();
+});
+
+test("FR-57 不变量：任意顺序连续 3 次引入后 requirement_items 计数恒定（幂等）", async () => {
+  const dir = makeTree();
+  const store = openStore({ dbPath: ":memory:" });
+  store.createProject({ id: "p1", name: "P1", workspacePath: dir });
+  const router = createApiRouter({ store });
+  const post = (body) => router.route({ method: "POST", pathname: "/api/projects/p1/intake", searchParams: new URLSearchParams(), body });
+
+  const count = () => store.listRequirementItems({ projectId: "p1" }).length;
+  assert.equal(count(), 0);
+
+  const modes = [{}, { mode: "doc" }, {}]; // 缺省 / 显式 doc / 再缺省
+  for (const body of modes) {
+    const r = await post(body);
+    assert.equal(r.status, 201);
+    assert.equal(count(), 0, `第 ${modes.indexOf(body) + 1} 次引入后条目数必须仍为 0`);
+  }
+  const doc = store.getRequirementDoc("p1");
+  assert.ok(doc.version >= 3, `索引应被更新 3 次，实际 version=${doc.version}`);
+  assert.ok(doc.body.includes("资料清单"));
   store.close();
 });

@@ -287,32 +287,26 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
       if (body.dryRun) {
         return { status: 200, payload: { project: project.id, root: combined.root, scanned: combined.count, truncated: combined.truncated, files: combined.files.map((f) => ({ relPath: f.relPath, bytes: f.bytes, readable: f.readable, external: !!f.external })), dryRun: true } };
       }
-      const mode = body.mode ?? "both";
-      let doc = null;
-      if (mode !== "items") {
-        const ensured = store.ensureRequirementDoc(project.id, { body: "" });
-        doc = store.updateRequirementDoc(ensured.id, { expectedVersion: ensured.version, body: built.index });
-      }
-      let created = [];
-      if (mode === "items" || mode === "both") {
-        const existing = new Set(store.listRequirementItems({ projectId: project.id }).map((i) => i.title));
-        for (const d of built.docs) {
-          if (existing.has(d.title)) continue;
-          const item = store.createRequirementItem({
-            projectId: project.id, title: d.title, docId: doc?.id,
-            description: `来源：\`${d.relPath}\`\n\n${d.content.slice(0, 2000)}`,
-            source: "intake", status: body.status ?? "draft",
-          });
-          existing.add(d.title);
-          created.push({ identifier: item.identifier, title: item.title });
+      // FR-57（2026-10-29 修订 · A 方案）：**引入只建资料索引，不产生需求条目**。
+      // 条目只由三条正路产生：人工新建 / elaborate 候选确认 / MCP requirement_upsert。
+      // 旧 `items` / `both` 一律**显式拒绝**（不静默降级成 doc-only）——「那条路根本不存在」要在契约层成立，
+      // 而不是「前端不点它就没事」。未知 mode 同样收紧为用法错误（仓内无调用方传未知值，见
+      // 进度/2026-10-29-intake口径A-FR条款修订草案.md §8.3）。
+      const mode = body.mode ?? "doc";
+      if (mode !== "doc") {
+        if (mode === "items" || mode === "both") {
+          throw new TbError("INTAKE_ITEMS_DISABLED",
+            "资料引入只生成索引、不产生需求条目；条目请走人工新建 / elaborate 候选确认 / MCP requirement_upsert。历史 source=intake 条目仍可查询、筛选、关闭、删除。");
         }
+        throw new TbError("USAGE_ERROR", `未知 mode：${mode}（intake 仅支持 "doc"）`);
       }
+      const ensured = store.ensureRequirementDoc(project.id, { body: "" });
+      const doc = store.updateRequirementDoc(ensured.id, { expectedVersion: ensured.version, body: built.index });
       return {
         status: 201,
         payload: {
           project: project.id, root: combined.root, scanned: combined.count, truncated: combined.truncated, mode,
-          doc: doc ? { id: doc.id, version: doc.version, bytes: built.index.length } : null,
-          itemsCreated: created.length, items: created,
+          doc: { id: doc.id, version: doc.version, bytes: built.index.length },
         },
       };
     }

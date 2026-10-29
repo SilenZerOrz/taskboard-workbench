@@ -2669,10 +2669,11 @@
         init.appendChild(alignBox);
         void refreshAlign();
 
-        init.appendChild(row("引入项目资料（md/doc）", btn("从工作区引入", async () => {
+        init.appendChild(row("引入项目资料（md/doc）", btn("引入资料（仅索引）", async () => {
           try {
-            const r = await api("POST", `/api/projects/${encodeURIComponent(state.projectId)}/intake`, {});
-            showBanner(`已引入 ${r.scanned} 个文档，生成条目 ${r.itemsCreated}；需求文档 v${r.doc?.version ?? "?"}`, "info");
+            // FR-57（2026-10-29 A）：引入**只写资料索引**，不产生需求条目 —— 文案必须说清副作用。
+            const r = await api("POST", `/api/projects/${encodeURIComponent(state.projectId)}/intake`, { mode: "doc" });
+            showBanner(`已同步资料索引：扫描 ${r.scanned} 个文档，需求文档 v${r.doc?.version ?? "?"}（${r.doc?.bytes ?? 0} 字节）；本次不生成需求条目`, "info");
             await renderConfig();
           } catch (e) { showBanner(`引入失败：${e.message}`, "error"); }
         }, "primary")));

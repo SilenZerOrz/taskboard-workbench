@@ -76,7 +76,7 @@ console.log(`[reintake] 已清理 ${removed}/${stale.length} 条旧引入条目`
 
 // 3) 重新引入
 const result = await api("POST", `/api/projects/${encodeURIComponent(project)}/intake`, {
-  include, exclude, exts, maxDepth: depth, maxFiles: 500, mode, status: "draft",
+  include, exclude, exts, maxDepth: depth, maxFiles: 500, mode,
 });
-console.log(`[reintake] 重新引入完成：扫描 ${result.scanned}，生成条目 ${result.itemsCreated}，需求文档 v${result.doc?.version ?? "?"}（${result.doc?.bytes ?? 0}B）`);
-console.log("[reintake] 生成条目均为 draft（待确认）；请在需求视图用筛选/确认/删除收敛。");
+console.log(`[reintake] 重新引入完成：扫描 ${result.scanned}，需求文档 v${result.doc?.version ?? "?"}（${result.doc?.bytes ?? 0}B）；**本次不生成需求条目**（FR-57 · 2026-10-29 A）`);
+console.log("[reintake] 引入只建资料索引；条目请走人工新建 / elaborate 候选确认 / MCP requirement_upsert。");
