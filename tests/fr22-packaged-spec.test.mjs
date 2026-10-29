@@ -22,6 +22,8 @@ test("FR-22 · 随包：`files` 含 `spec/团队agent.md`，且**不含**整目�
   assert.ok(Array.isArray(pkg.files), "files 必须是数组");
   assert.ok(pkg.files.includes("spec/团队agent.md"), "规范正本必须随包（files 含 spec/团队agent.md）");
   assert.ok(!pkg.files.includes("docs"), "不得把整个 docs/ 打进包（进度/验证/历史归档属过程证据）");
+  // P1（2026-10-29）：机器执行规范 `spec/norms/*.md` 是运行时唯一真源，必须随包
+  assert.ok(pkg.files.includes("spec/norms"), "机器规范 spec/norms 必须随包（否则装到的是空规范）");
   assert.ok(!pkg.files.some((f) => f === "docs/" || f === "docs/**"), "不得用通配把整个 docs/ 纳入包内");
 });
 
