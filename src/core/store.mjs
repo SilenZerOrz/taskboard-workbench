@@ -1704,7 +1704,15 @@ export function openStore(options = {}) {
       const item = store.requireRequirementItemRef(ref);
       noteContractUse(item.projectId, changes.contract, item.identifier);
       const sets = []; const params = [];
-      if (changes.title !== undefined) { sets.push("title = ?"); params.push(assertTitle(changes.title)); }
+      if (changes.title !== undefined) {
+        const nextTitle = assertTitle(changes.title);
+        sets.push("title = ?"); params.push(nextTitle);
+        // 卡 `-178`（2026-10-29）：改标题**必须同步去重键** `norm_title`。
+        // 此前只写 `title` ⇒ 条目改名后 `norm_title` 仍指向旧标题，而 `confirmRequirementCandidates`
+        // 是按 `norm_title` 去重的 ⇒ 同一条目会被当成「新条目」再插一次（陈旧键 = 静默重复）。
+        // 存量实测 `normTitleMismatch = 0`（`tools/audit-intake.mjs`），所以这是**防新增**而非修存量。
+        sets.push("norm_title = ?"); params.push(titleKey(nextTitle));
+      }
       if (changes.description !== undefined) { sets.push("description = ?"); params.push(normalizeDescription(changes.description)); }
       if (changes.acceptance !== undefined) { sets.push("acceptance = ?"); params.push(String(changes.acceptance)); }
       if (changes.priority !== undefined) { sets.push("priority = ?"); params.push(assertPriority(changes.priority)); }

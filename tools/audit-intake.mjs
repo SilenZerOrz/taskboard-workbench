@@ -16,7 +16,7 @@
  *   node tools/audit-intake.mjs --json               # 机器可读（默认就是 JSON）
  *   node tools/audit-intake.mjs --data-dir .data --project taskboard-workbench
  */
-import { mkdtempSync, copyFileSync, existsSync, readFileSync, readdirSync, readlinkSync, statSync } from "node:fs";
+import { mkdtempSync, copyFileSync, existsSync, readFileSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve, relative, extname } from "node:path";
@@ -27,31 +27,6 @@ import { resolveDataDir, resolveDbPath } from "../src/core/config.mjs";
 import { titleKey } from "../src/core/requirements.mjs";
 
 
-/**
- * 符号链接清单 —— 解释「真模块 387 vs 朴素遍历 388」这类差异，并暴露一个真缺陷：
- * `scanProjectMaterials` 只处理 `isDirectory()` / `isFile()`，而 `Dirent.isFile()` 对**符号链接**返回 false
- * ⇒ 软链文档被**静默跳过**（本仓 `docs/团队agent.md` → `spec/团队agent.md` 就是这么丢的）。
- */
-const SKIP_DIRS_FOR_SYMLINK = new Set(["node_modules", ".git", ".data", ".archify", ".cache", "dist", "build", "coverage", ".next", ".turbo"]);
-function findSymlinks(root) {
-  const out = [];
-  (function walk(dir) {
-    let entries; try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
-    entries.sort((a, b) => a.name.localeCompare(b.name));
-    for (const e of entries) {
-      if (e.name.startsWith(".")) continue;
-      const abs = join(dir, e.name);
-      if (e.isSymbolicLink()) {
-        let target = null, targetIsFile = false, bytes = null;
-        try { target = readlinkSync(abs); const st = statSync(abs); targetIsFile = st.isFile(); bytes = st.size; } catch { /* 断链 */ }
-        out.push({ relPath: relative(root, abs), target, targetIsFile, bytes, ext: extname(e.name).toLowerCase() });
-        continue;
-      }
-      if (e.isDirectory() && !SKIP_DIRS_FOR_SYMLINK.has(e.name)) walk(abs);
-    }
-  })(root);
-  return out;
-}
 const listSha = (items) => createHash("sha256").update([...items].sort().join("\n")).digest("hex");
 const fileSha = (path) => createHash("sha256").update(readFileSync(path)).digest("hex");
 
@@ -214,7 +189,11 @@ const main = async () => {
       // 列表指纹：任何人用另一套实现枚举后取同样的 sha256，就能证明「两个独立口径对齐」，
       // 而不必肉眼比对 387 行。stdlib 的 readdir + 扩展名过滤即可复算。
       docsListSha256: listSha(scan.files.map((f) => f.relPath)),
-      symlinksSkipped: findSymlinks(root).filter((l) => l.targetIsFile),
+      // 2026-10-29（卡 `-175`）：`scanProjectMaterials` 现已**跟随软链**并自带记账
+      // （`followed` / `skipped[{relPath,target,reason}]`）⇒ 直接用它，不再在工具里另写一份朴素遍历。
+      // 之前两份实现必然漂移：工具说「被跳过」、模块说「没看见」，谁也说不清谁对。
+      symlinksFollowed: scan.symlinks?.followed ?? 0,
+      symlinksSkipped: scan.symlinks?.skipped ?? [],
       truncated: scan.truncated,
       byExt: scan.files.reduce((acc, f) => { const e = extname(f.name).toLowerCase(); acc[e] = (acc[e] ?? 0) + 1; return acc; }, {}),
     },
