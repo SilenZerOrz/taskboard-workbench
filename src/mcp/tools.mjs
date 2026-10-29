@@ -24,6 +24,7 @@ import { fileURLToPath } from "node:url";
 import { evaluateSubmittedContract, loadNorms, NORM_IDS, sha256 } from "../core/contract.mjs";
 import { TbError } from "../core/errors.mjs";
 import { matchProjectForCwd } from "../core/binding.mjs";
+import { markAcceptance, acceptanceFlag } from "../core/acceptance.mjs";
 
 /** 包根目录（仓库里 = 仓库根；npm 包里 = package 根）。`spec/norms` 在两处都随包存在。 */
 export const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -323,7 +324,12 @@ export function requirementUpsert({ store }, args = {}) {
     for (const k of REQ_VERSION_FIELDS) if (args[k] !== undefined) patch[k] = args[k];
     if (Object.keys(patch).length === 0) throw fail("USAGE_ERROR", `没有任何可改字段（${REQ_VERSION_FIELDS.join(" / ")}）`, {});
     const updated = store.updateRequirementItem(current.identifier, { ...patch, contract: args.contract });
-    return { created: false, item: requirementSnapshot(updated), changed: Object.keys(patch), contract };
+    // 卡 `-176`/`-177`（口径 X）：`acceptanceSet` **永远**反映写入后的真实状态；
+    // 但只有这次 patch 真带了 `acceptance` 才落审计（否则 99/129 的空验收条目每改一次标题就添一行审计）。
+    const acc = patch.acceptance !== undefined
+      ? markAcceptance(store, { identifier: updated.identifier, acceptance: updated.acceptance, actor: "mcp", entry: "mcp:requirement_upsert:update", detail: { changed: Object.keys(patch) } })
+      : acceptanceFlag(updated.acceptance);
+    return { created: false, item: requirementSnapshot(updated), changed: Object.keys(patch), contract, acceptanceSet: acc.acceptanceSet };
   }
 
   const title = typeof args.title === "string" ? args.title.trim() : "";
@@ -335,9 +341,13 @@ export function requirementUpsert({ store }, args = {}) {
     acceptance: args.acceptance,
     priority: args.priority,
     status: args.status,
+    // 卡 `-176`：MCP 建的条目必须自带来源 `mcp`，否则与「人手建」在库里不可辨（审计也无从按入口统计）。
+    source: "mcp",
     contract: args.contract,
   });
-  return { created: true, item: requirementSnapshot(created), contract };
+  // 卡 `-176`（口径 X）：新建时「没给验收」= 显式缺口 —— 回包 `acceptanceSet:false` + 落 `governance_audit`。
+  const acc = markAcceptance(store, { identifier: created.identifier, acceptance: created.acceptance, actor: "mcp", entry: "mcp:requirement_upsert" });
+  return { created: true, item: requirementSnapshot(created), contract, acceptanceSet: acc.acceptanceSet };
 }
 
 /* ---------------- requirement_change（写 · 变更影响面确认门） ---------------- */

@@ -6,6 +6,40 @@
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 每个版本对应一个 annotated tag（`vX.Y.Z`）与一条 GitHub Release；npm dist-tag 与 dsh 兼容区间随版本记录。
 
+## [0.2.2] - 2026-10-29
+
+> 本版是 **0.2.1 之后的第一个小版本**（未发布 npm / 未出 Release 时为「就绪」状态）。
+> 主题：**把 0.2.1 收口时登记的四张隔离卡清掉**（软链漏扫 / 去重键陈旧 / 两条无约束写入口）。
+
+### 修复
+
+- **intake 扫描器的符号链接静默漏扫（卡 `-175`）** —— `Dirent.isFile()` 对符号链接**恒为 false**，
+  故 `walk()` 的 `isFile()/isDirectory()` 双分支把软链文档静默漏掉（本仓 `docs/团队agent.md → ../spec/团队agent.md`
+  从未进索引，`docsTotal` 少 1 且无任何读数提示）。
+  修：软链走 `stat` 跟随判类型 → `realpath` **越界判定**（必须仍在 root 内）→ **祖先链**环路保护；
+  跳过的每一条进 `symlinks.skipped[{relPath,target,reason}]`（九种 reason），跟随的计入 `followed`，`files[]` 带 `symlink:true`。
+  顺带删掉 `tools/audit-intake.mjs` 自带的 `findSymlinks()`（两份实现必然漂移，改读模块记账）。
+  **读数更正**：软链修完后 `docsTotal` 是 **391**（不是先前预估的 390）—— 用同版本差集实测钉住：
+  HEAD `390` ↔ 新版 `391`、`added=[docs/团队agent.md]`、`removed=[]`；口径漂移的原因是「390」按当时 2 份新文档算的，
+  此后又落了 1 份进度文档。**登记到 0.2.2 发布时，基线应再按当次 docs 数量复算**（本轮收尾时为 392，因又新增 1 份轮次文档）。
+- **改条目标题时 `norm_title` 不同步（卡 `-178`）** —— 标题去重键停在旧值 ⇒ 改名后
+  `confirmRequirementCandidates` 把同一条目当「新条目」再插一次。存量 `normTitleMismatch = 0`，属**防新增**。
+
+### 新增
+
+- **acceptance 显式缺口标记（卡 `-176` / `-177` · 口径 X）** —— 两条无约束写入口（MCP `requirement_upsert` 与
+  HTTP `POST/PATCH /api/requirements/items`）此前「没给验收」与「给了空串」在调用方眼里都是成功。
+  现：`acceptanceSet` 回包字段 **永远**反映写入后状态；缺省时落 `governance_audit`
+  （`action = requirement-acceptance-missing`，`reason` 记入口名）⇒「当初给没给验收」可事后 join 审计查出来。
+  **刻意不做**：不设必填、不改 schema（129 条里 99 条 `acceptance` 为空，必填会一刀切破「改标题」这类无关操作；
+  审计 join 可查，schema 迁移不可逆）。审计只在**本次写入真碰 `acceptance`** 时落，避免每次改标题都添一行。
+- **`REQUIREMENT_SOURCES` 补 `mcp`** —— MCP 建的条目不再落默认 `manual`，「人手建 / MCP 建」在库里可辨。
+
+### 已知限制（本版未做）
+
+- 前端来源标签仍无 `mcp` 分支 ⇒ 列表里 MCP 建的条目会显示成「手工」（**数据正确、标签错标**，2 行改动，待 UI 卡）。
+- MCP 回包不暴露 `source`（`requirementSnapshot` 只回内容字段）。
+
 ## [0.2.1] - 2026-10-29
 
 > 发版纪律（2026-10-29 起）：`0.2.0` 已对外冻结，**此后任何产品代码改动都要走新版本号 + 本文件**，

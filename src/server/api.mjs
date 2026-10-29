@@ -37,6 +37,8 @@ import { DIAGNOSTIC_KINDS, evaluateTaskDiagnostics, projectDiagnostics, summariz
 import { summarizeNotifyDelivery } from "../core/notify.mjs";
 import { resolveCliExecutor, executeTaskWithCli, buildTaskPrompt, cliArgsFor, claimForCliExecution, DEFAULT_TIMEOUT_MS } from "../core/executor.mjs";
 import { DEFAULT_FAILURE_LIMIT } from "../core/store.mjs";
+// 卡 `-177`（2026-10-29 · 口径 X）：acceptance 缺省口径与 MCP **共用同一份**，不在本文件另写判断。
+import { markAcceptance, acceptanceFlag } from "../core/acceptance.mjs";
 
 export const API_SCHEMA_VERSION = 2;
 
@@ -766,7 +768,13 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
           acceptance: body.acceptance, priority: body.priority, docId: body.docId,
           contract: body.contract,
         });
-        return { status: 201, payload: { item } };
+        // 卡 `-177`（口径 X）：人工建条目缺省验收 ⇒ **显式缺口**（回包 `acceptanceSet:false` + `governance_audit`）。
+        // 此前只回 `{ item }`，「没给验收」与「给了空串」在调用方眼里都是 201 成功 —— 与 MCP 侧同一个沉默。
+        const acc = markAcceptance(store, {
+          identifier: item.identifier, acceptance: item.acceptance,
+          actor: body.actor ?? "human", entry: "http:POST /api/requirements/items",
+        });
+        return { status: 201, payload: { item, acceptanceSet: acc.acceptanceSet } };
       }
       throw new TbError("USAGE_ERROR", "/api/requirements/items 仅支持 GET 或 POST");
     }
@@ -785,11 +793,20 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
           acceptance: body.acceptance, priority: body.priority, docId: body.docId,
           contract: body.contract,
         });
+        // 卡 `-177`：与 MCP 同一边界 —— `acceptanceSet` 永远反映写入后状态；
+        // **只有本次 body 真带 `acceptance` 才落审计**（否则 99/129 空验收条目每改一次标题就添一行审计）。
         // 需求终态（done/closed）落审计：谁在什么时候把哪条需求收口的（自动只给建议，终态由人定）。
         if (body.status === "done" || body.status === "closed" || item.status === "done" || item.status === "closed") {
           try { store.recordAudit({ actor: body.actor ?? "human", action: "requirement-status", target: item.identifier, allowed: true, reason: String(body.status ?? item.status), detail: body.reason ?? null }); } catch { /* ignore */ }
         }
-        return { status: 200, payload: { item } };
+        const acc = body.acceptance !== undefined
+          ? markAcceptance(store, {
+            identifier: item.identifier, acceptance: item.acceptance,
+            actor: body.actor ?? "human", entry: "http:PATCH /api/requirements/items/:ref",
+            detail: { changed: Object.keys(body).filter((k) => k !== "actor") },
+          })
+          : acceptanceFlag(item.acceptance);
+        return { status: 200, payload: { item, acceptanceSet: acc.acceptanceSet } };
       }
       if (method === "DELETE") {
         return { status: 200, payload: store.deleteRequirementItem(ref) };

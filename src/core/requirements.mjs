@@ -20,7 +20,9 @@ export const REQUIREMENT_STATUSES = Object.freeze(["draft", "open", "done", "clo
 /** 需求终态：已完成 / 已关闭（都不再产生新任务；`done` 需关联任务先收口）。 */
 export const REQUIREMENT_DONE_STATUSES = Object.freeze(["done", "closed"]);
 /** 需求条目来源：手工 / 规则解析（fallback）/ AI 拆解（首选）/ 资料引入。 */
-export const REQUIREMENT_SOURCES = Object.freeze(["manual", "elaborated-rule", "elaborated-ai", "intake"]);
+// 卡 `-176`（2026-10-29）：补 `mcp`。此前 MCP `requirement_upsert` 建条目一律落默认 `manual`
+// ⇒ 「这条是人手建的还是 MCP 建的」在库里不可辨（审计也就无从按入口统计）。
+export const REQUIREMENT_SOURCES = Object.freeze(["manual", "elaborated-rule", "elaborated-ai", "intake", "mcp"]);
 /** 可行性结论取值（追加字段）。 */
 export const FEASIBILITY_VERDICTS = Object.freeze(["feasible", "infeasible"]);
 
