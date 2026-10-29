@@ -38,9 +38,18 @@ test("createLlmElaborator：缺 provider/model/llm 返回 null；可用时聚合
   assert.equal(out[0].title, "X");
 });
 
-test("auto（无 aiElaborator）→ 规则 fallback：mode=rule", async () => {
+// 卡 `-169` P4②（2026-10-29 口径变更）：`auto` 不再静默降级 —— 无 AI 就**拒绝**。
+// 旧的「无 AI ⇒ 规则 fallback」整体退到**显式** `fallback:"rule"` 分支（见下一条用例）。
+test("auto（无 aiElaborator）→ 拒绝 AI_UNAVAILABLE（零落库）", async () => {
   const { store, call } = setup(undefined);
-  const { payload } = await call({});
+  await assert.rejects(() => call({}), (e) => e.code === "AI_UNAVAILABLE");
+  assert.equal(store.listRequirementCandidates({}).length, 0, "拒绝必须零落库");
+  store.close();
+});
+
+test("auto + fallback:rule（无 aiElaborator）→ 规则 fallback：mode=rule", async () => {
+  const { store, call } = setup(undefined);
+  const { payload } = await call({ mode: "auto", fallback: "rule" });
   assert.equal(payload.mode, "rule");
   assert.ok(payload.candidates.length >= 1);
   assert.equal(payload.candidates[0].source, "elaborated-rule");
@@ -58,10 +67,19 @@ test("auto + AI 成功 → mode=ai，条目来源 elaborated-ai", async () => {
   store.close();
 });
 
-test("auto + AI 失败 → 降级为规则，标记 degraded", async () => {
+// 口径变更（卡 `-169` P4②）：AI 失败不再被吞成"降级成功"，除非人显式要 fallback。
+test("auto + AI 失败（无 fallback）→ 拒绝，不落库", async () => {
   const ai = async () => { throw Object.assign(new Error("boom"), { code: "AI_OUTPUT_INVALID" }); };
   const { store, call } = setup(ai);
-  const { payload } = await call({ mode: "auto" });
+  await assert.rejects(() => call({ mode: "auto" }), (e) => e.code === "AI_OUTPUT_INVALID");
+  assert.equal(store.listRequirementCandidates({}).length, 0);
+  store.close();
+});
+
+test("auto + fallback:rule + AI 失败 → 降级为规则，标记 degraded", async () => {
+  const ai = async () => { throw Object.assign(new Error("boom"), { code: "AI_OUTPUT_INVALID" }); };
+  const { store, call } = setup(ai);
+  const { payload } = await call({ mode: "auto", fallback: "rule" });
   assert.equal(payload.mode, "rule");
   assert.equal(payload.degraded, true);
   assert.equal(payload.aiError, "AI_OUTPUT_INVALID");

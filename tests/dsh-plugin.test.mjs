@@ -113,7 +113,7 @@ test("C. 宿主插件注册的 handler 可直接服务 API（命名空间前缀�
   const base = `http://127.0.0.1:${port}${PREFIX}`;
 
   const health = await (await fetch(`${base}/api/health`)).json();
-  assert.equal(health.schemaVersion, 11); // FR-79/FR-82/FR-83/FR-81/FR-85b/FR-11：… + tasks.board_position（列内手工顺序）+ FR-50：team_members.executor → schema 版本 10
+  assert.equal(health.schemaVersion, 12); // 12：+ 契约快照（project_contract / flow_injections · P1） // FR-79/FR-82/FR-83/FR-81/FR-85b/FR-11：… + tasks.board_position（列内手工顺序）+ FR-50：team_members.executor → schema 版本 10
   assert.equal(health.status, "ok");
   const projects = await (await fetch(`${base}/api/projects`)).json();
   assert.equal(projects.count, 1);

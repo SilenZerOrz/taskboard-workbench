@@ -2539,13 +2539,12 @@
           try { await api("POST", "/api/requirements/items", { projectId: state.projectId, title }); showBanner("已新建需求条目", "info"); await renderConfig(); }
           catch (e) { showBanner(`新建失败：${e.message}`, "error"); }
         })));
-        req.appendChild(row("AI 拆解（auto）", btn("拆解", async () => {
+        req.appendChild(row("AI 拆解（auto · 不可用即报错）", btn("拆解", async () => {
           try {
             const docs = await api("GET", `/api/requirements/docs?project=${encodeURIComponent(state.projectId)}`);
             const doc = docs.docs[0];
             if (!doc) { showBanner("请先新建/编辑需求文档", "error"); return; }
-            const r = await api("POST", `/api/requirements/docs/${encodeURIComponent(doc.id)}/elaborate`, { mode: "auto" });
-            showBanner(`拆解：mode=${r.mode}${r.degraded ? "（降级：" + (r.aiError ?? "无AI") + "）" : ""} 候选=${r.candidates ? r.candidates.length : 0}${r.totalFound && r.totalFound > (r.candidates ? r.candidates.length : 0) ? `（共 ${r.totalFound}，已截断）` : ""}`, r.degraded ? "error" : "info");
+            await runElaborateAi(doc, { render: false });
           } catch (e) { showBanner(`拆解失败：${e.message}`, "error"); }
         })));
 
@@ -2903,6 +2902,9 @@
     // ------------------------------------------------------------ 需求视图（文档 + 条目 + 详情）
     const reqState = {
       docId: null, itemId: null, editingDoc: false, candidates: [], filter: "all", q: "", selected: new Set(),
+      // 卡 `-169` P4②（2026-10-29）：规则拆解的**预览态**（零落库）。非 null 时文档面板里渲染
+      // 一块「预览 + 确认写入 / 取消」——规则模式不再「一点就写 100 条」。
+      rulePreview: null,
       // 卡 `-160` 收尾（2026-10-27）：列表内「完成度结论」的懒取缓存 —— identifier → { at, payload }。
       // `completionInflight` 去重在途请求（同一行不重复打），`focusCompletion` 是「点胶囊 ⇒ 抽屉滚到完成度段」的一次性定位标记。
       completion: new Map(), completionInflight: new Set(), focusCompletion: false,
@@ -3096,6 +3098,76 @@
       await Promise.all(Array.from({ length: Math.min(REQ_COMPLETION_CONCURRENCY, queue.length) }, () => worker()));
     }
 
+    // ── 需求条目化：三个入口统一走这里（卡 `-169` P4② · 2026-10-29 口径变更）────────────
+    // 服务端新契约：`auto` 只用 AI，AI 不可用 ⇒ `AI_UNAVAILABLE` + **零落库**；
+    // 规则降级必须显式 `fallback:"rule"`；规则模式支持 `dryRun` 预览。
+    // 前端因此必须做两件事：① 把 `AI_UNAVAILABLE` 说成人话（不再"假装成功"）；
+    // ② 规则拆解**先预览再二次确认**（`window.confirm` 在 IAB 里会被自动拒绝 ⇒ 一律用页面内按钮，
+    //    见 06 §E3 —— 用原生弹窗会变成"点了没反应"）。
+    const elaborateUrl = (doc) => `/api/requirements/docs/${encodeURIComponent(doc.id)}/elaborate`;
+    const elaborateSummary = (r) => {
+      const n = (r.candidates ?? []).length;
+      const trunc = r.totalFound != null && r.totalFound > n ? `（共 ${r.totalFound}，本次写 ${n}）` : "";
+      const deg = r.degraded ? `（规则降级：${r.aiError ?? "无AI"}）` : "";
+      return `拆解：mode=${r.mode}${deg} 候选=${n}${trunc}`;
+    };
+    async function runElaborateAi(doc, { render = true } = {}) {
+      try {
+        const r = await api("POST", elaborateUrl(doc), { mode: "auto" });
+        reqState.candidates = r.candidates ?? [];
+        showBanner(elaborateSummary(r), "info");
+        if (render) await renderRequirements();
+      } catch (e) {
+        if (e && e.code === "AI_UNAVAILABLE") {
+          showBanner(`AI 拆解不可用：${e.message}。这次没有任何落库；要规则拆解请点「规则拆解（先预览）」。`, "error");
+        } else {
+          showBanner(`拆解失败：${e.message}`, "error");
+        }
+      }
+    }
+    async function startElaborateRulePreview(doc) {
+      try {
+        const pre = await api("POST", elaborateUrl(doc), { mode: "rule", dryRun: true });
+        reqState.rulePreview = { ...pre, docId: doc.id };
+        await renderRequirements();
+      } catch (e) { showBanner(`规则拆解预览失败：${e.message}`, "error"); }
+    }
+    async function commitElaborateRule(doc) {
+      const pv = reqState.rulePreview;
+      try {
+        const r = await api("POST", elaborateUrl(doc), { mode: "rule", limit: pv?.limit });
+        reqState.candidates = r.candidates ?? [];
+        reqState.rulePreview = null;
+        showBanner(elaborateSummary(r), "info");
+        await renderRequirements();
+      } catch (e) { showBanner(`规则拆解失败：${e.message}`, "error"); }
+    }
+    /** 预览块：把「会写多少条 / 规则会把文件清单行也当需求 / 前 10 条长什么样」摆在人眼前。 */
+    function appendElaborateRulePreview(host, doc) {
+      const pv = reqState.rulePreview;
+      if (!pv || pv.docId !== doc.id) return;
+      const box = mk("div", "req-warn");
+      box.appendChild(mk("div", null,
+        `⚠ 规则拆解预览（未落库）：共找到 ${pv.totalFound} 条`
+        + (pv.truncated ? `，本次最多写 ${pv.limit} 条（已截断）` : `，将全部写为候选（${pv.limit} 条以内）`)));
+      box.appendChild(mk("div", null,
+        "⚠ 规则拆解会把「文件清单行」也当需求 —— 一份资料索引类文档曾产出 4213 条、其中 0 条是真需求。请先扫一眼下面这些标题。"));
+      if ((pv.preview ?? []).length) {
+        const ol = mk("ol", "req-rule-preview");
+        for (const c of pv.preview) ol.appendChild(mk("li", null, c.title));
+        box.appendChild(ol);
+      } else {
+        box.appendChild(mk("div", null, "（这份文档没解析出任何候选 —— 点「取消」即可）"));
+      }
+      const bar = mk("div", "btn-row");
+      bar.append(
+        btn(`确认写入 ${pv.truncated ? pv.limit + " 条" : "全部候选"}`, () => void commitElaborateRule(doc), "primary"),
+        btn("取消", () => { reqState.rulePreview = null; void renderRequirements(); }),
+      );
+      box.appendChild(bar);
+      host.appendChild(box);
+    }
+
     async function renderRequirements() {
       reqRoot.replaceChildren(mk("p", "hint", "加载需求…"));
       try {
@@ -3137,10 +3209,9 @@
               catch (e) { showBanner(`保存失败：${e.message}`, "error"); }
             }, "primary"),
             btn("取消", () => { reqState.editingDoc = false; void renderRequirements(); }),
-            btn("AI 拆解", async () => {
-              try { const r = await api("POST", `/api/requirements/docs/${encodeURIComponent(doc.id)}/elaborate`, { mode: "auto" }); reqState.candidates = r.candidates ?? []; showBanner(`拆解：mode=${r.mode}${r.degraded ? "（降级：" + (r.aiError ?? "无AI") + "）" : ""} 候选=${reqState.candidates.length}`, r.degraded ? "error" : "info"); await renderRequirements(); }
-              catch (e) { showBanner(`拆解失败：${e.message}`, "error"); }
-            }),
+            btn("AI 拆解", () => void runElaborateAi(doc)),
+            // 编辑态下正文未保存：规则拆解基于**已保存**正文，直接切走会让人以为用的是眼前这段 ⇒ 明确拒绝
+            btn("规则拆解（先预览）", () => showBanner("请先「保存」或「取消」编辑，再用规则拆解（它读的是已保存的正文）", "error")),
           );
           docBody.append(ta, bar);
         } else {
@@ -3193,12 +3264,11 @@
           const bar = mk("div", "btn-row");
           bar.append(
             btn("编辑", () => { reqState.editingDoc = true; void renderRequirements(); }, "primary"),
-            btn("AI 拆解（auto）", async () => {
-              try { const r = await api("POST", `/api/requirements/docs/${encodeURIComponent(doc.id)}/elaborate`, { mode: "auto" }); reqState.candidates = r.candidates ?? []; showBanner(`拆解：mode=${r.mode}${r.degraded ? "（降级：" + (r.aiError ?? "无AI") + "）" : ""} 候选=${reqState.candidates.length}`, r.degraded ? "error" : "info"); await renderRequirements(); }
-              catch (e) { showBanner(`拆解失败：${e.message}`, "error"); }
-            }),
+            btn("AI 拆解（auto）", () => void runElaborateAi(doc)),
+            btn("规则拆解（先预览）", () => void startElaborateRulePreview(doc)),
           );
           docBody.appendChild(bar);
+          appendElaborateRulePreview(docBody, doc);
         }
 
         // —— 条目面板（新建 + 筛选 + 确认/删除；FR-64/65 便于人工查阅确认）

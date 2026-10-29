@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "note": "由 node tools/build-norms.mjs 生成；正文变了必须 bump version（否则 tests/norms-parity.test.mjs 报红）",
+  "norms": [
+    {
+      "norm_id": "acceptance",
+      "version": 2,
+      "updated": "2026-10-29",
+      "digest": "1d91f555c46ecfb122f85e20c3a5ca9c0f37c7f8d2422ed08ce071b25fd98613",
+      "file": "spec/norms/acceptance.md"
+    },
+    {
+      "norm_id": "card-update",
+      "version": 1,
+      "updated": "2026-10-29",
+      "digest": "1d590cbacca29765f129f742a7137c0bdc80e916b8fca69fdb05a5289b5e1f24",
+      "file": "spec/norms/card-update.md"
+    },
+    {
+      "norm_id": "doc-editing",
+      "version": 1,
+      "updated": "2026-10-29",
+      "digest": "4e3ca702e45f3dc3f1072be2f4685ca5490dea0dd9a1d753e75ae609c8beaf5f",
+      "file": "spec/norms/doc-editing.md"
+    },
+    {
+      "norm_id": "flow",
+      "version": 1,
+      "updated": "2026-10-29",
+      "digest": "3b7596bf7bd8c21367e80bc08da6fe332d35ff4faf73f570ae8982c6fdb76371",
+      "file": "spec/norms/flow.md"
+    },
+    {
+      "norm_id": "project-defaults",
+      "version": 1,
+      "updated": "2026-10-29",
+      "digest": "0afa06d35abda598cb1ef5d94d1d6cfbc061620b664e6adb279f78829ba1d1ad",
+      "file": "spec/norms/project-defaults.md"
+    }
+  ]
+}

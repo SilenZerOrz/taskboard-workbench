@@ -77,6 +77,34 @@ export function titleKey(value) {
 }
 
 /** 抽取需求文档正文里的候选条目（规则解析，非 AI）。 */
+// ---- 条目化的数量口径（卡 `-169` P4② · 2026-10-29 口径变更） -----------------
+/**
+ * 真机实证（2026-10-28）：一份「资料索引」类需求文档走**规则**条目化，产出 **4213 条**，
+ * 其中 0 条是真需求 —— 全是**文件清单行**（`- docs/a.md` 这种）。
+ * 旧口径 `limit` 默认 **100** 且 **body 传了也不生效** ⇒ 一按按钮就落 100 条 `pending` 候选，
+ * 这就是「100 条 pending」的直接来路。
+ *
+ * 新口径（本卡批准的 P4②）：
+ * 1. `limit` **默认 20**（100 → 20），**硬顶 200**，且**从 body 透传**；
+ * 2. `auto` 模式**只用 AI**，AI 不可用 ⇒ **拒绝**（`AI_UNAVAILABLE`，零落库）——
+ *    要规则降级必须**显式** `fallback:"rule"`（把「其实没 AI」从「看起来成功」改成「明确失败」）；
+ * 3. 规则模式支持 `dryRun` 预览（零落库）。
+ */
+export const DEFAULT_ELABORATE_LIMIT = 20;
+export const MAX_ELABORATE_LIMIT = 200;
+export const ELABORATE_PREVIEW_SIZE = 10;
+
+/**
+ * `limit` 归一：空 ⇒ 默认 20；非正整数 ⇒ **报错**（不静默回落 —— 否则「我传了 5 却写了 20」极难查）；
+ * 超硬顶 ⇒ 夹到 200（上限语义，夹取比报错更符合预期）。
+ */
+export function clampElaborateLimit(value) {
+  if (value === undefined || value === null || value === "") return DEFAULT_ELABORATE_LIMIT;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n <= 0) throw invalidField("limit", `limit 必须是正整数，收到：${String(value)}`);
+  return Math.min(n, MAX_ELABORATE_LIMIT);
+}
+
 export function elaborateDocument(body) {
   if (typeof body !== "string") throw invalidField("body", "需求文档正文必须是字符串");
   const candidates = [];

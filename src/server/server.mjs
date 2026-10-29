@@ -177,6 +177,9 @@ export function startServer({ dataDir, port, host = "127.0.0.1", env = process.e
   server.listen(resolvedPort, host, () => {
     const address = server.address();
     console.log(`[tb] listening on http://${host}:${address.port}${basePath}/`);
+    // 2026-10-29：把「本实例没有宿主通道」在**启动那一刻**就说清，而不是等用户点投递才撞墙。
+    // 独立进程里没有 DSH 的 ctx.sessions ⇒ /api/health 的 host.capabilities 恒为 null。
+    console.log("[tb] mode=standalone · 无 DSH 宿主会话通道（投递/建会话/派发团队不可用；需要这些能力请用 DSH 内的 /integrations/taskboard-workbench）");
     console.log(`[tb] dataDir=${store.dataDir}`);
     console.log(`[tb] db=${store.dbPath}`);
     console.log(`[tb] projects=${ensured.projects.length}${ensured.created ? " (auto-created default project)" : ""}`);

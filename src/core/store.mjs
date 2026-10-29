@@ -5,6 +5,7 @@
  * 注意：tasks_owner_idx 只在迁移函数里创建（老库建表语句是 no-op，提前建索引会因缺列失败）。
  */
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -18,12 +19,14 @@ import {
 } from "./domain.mjs";
 import { normalizeOwner, splitOwnerLabels } from "./owner.mjs";
 import { TbError, invalidField } from "./errors.mjs";
+import { computeContract, diffContract, evaluateSubmittedContract, loadNorms } from "./contract.mjs";
 import { UNTAKEN_COMMENT_MARKER, detectUntakenDelivery } from "./delivery.mjs";
 import { VERIFY_MAX_COMMAND, parseVerifyComment } from "./verify.mjs";
 import {
   assertFeasibilityVerdict, assertRequirementSource, assertSplitTasks,
   elaborateDocument, formatRequirementIdentifier, normalizeTitle, parseRequirementIdentifier,
   titleKey, assertRequirementStatus, normalizeCandidates, summarizeRequirementCompletion,
+  clampElaborateLimit, ELABORATE_PREVIEW_SIZE, DEFAULT_ELABORATE_LIMIT, MAX_ELABORATE_LIMIT,
 } from "./requirements.mjs";
 import { TEAM_WRITABLE_STATUSES } from "./team.mjs";
 import { REVIEW_SOURCE_STATUSES, REVIEW_IDLE_MS, detectReviewDeadlock, reviewReturnStatus } from "./review.mjs";
@@ -32,7 +35,10 @@ import { HUMAN_REVIEW_LABEL, assertConclusion, categoryLabel, conclusionOutcome,
 // 项目记忆（2026-10-28 拍板 D-M1）：L2 记忆条目，与内核表同库；**不是第二真源**（必带 provenance）。
 import { createMemoryApi } from "./memory.mjs";
 
-export const SCHEMA_VERSION = 11; // 11：项目记忆（memory_entries / memory_links / memory_recalls）
+export const SCHEMA_VERSION = 12; // 12：契约快照（project_contract / flow_injections · P1）
+// 条目化数量口径（卡 `-169` P4②）：定义在 requirements.mjs（纯模块），此处转发以便调用方就近取用。
+export { clampElaborateLimit, DEFAULT_ELABORATE_LIMIT, MAX_ELABORATE_LIMIT, ELABORATE_PREVIEW_SIZE };
+
 
 // ---- 任务级验收标准与复核动作（FR-94） ---------------------------------------
 /**
@@ -315,9 +321,36 @@ create table if not exists memory_recalls (
   id integer primary key autoincrement,
   session_id text, entry_id text not null, reason text, injected_chars integer, created_at text not null
 );
+-- 契约快照（P1 · 方案 §8 数据模型）：每个项目一行「上次算出来的契约」。
+-- 作用：① 让 CONTRACT_STALE 能报出「哪份文件变了」；② 让漂移盘点有基线。
+-- 注意：**只是缓存，不是真源** —— 真源永远是 requirement_docs + spec/norms/*.md，删表只丢基线。
+create table if not exists project_contract (
+  project_id text primary key references projects(id) on delete cascade,
+  contract_version text not null,
+  doc_digest text not null,
+  doc_version integer,
+  norms_json text not null default '[]',
+  gates_json text not null default '{}',
+  computed_at text not null,
+  updated_at text not null
+);
+-- 装载块注入审计（P1 建表 · D3 档 C 推迟，这里只留审计位，默认策略 off 不写）
+create table if not exists flow_injections (
+  id integer primary key autoincrement,
+  project_id text,
+  session_id text,
+  policy text not null,
+  contract_version text not null,
+  digest text,
+  injected_at text not null
+);
+create index if not exists flow_injections_project_idx on flow_injections(project_id, injected_at);
 `;
 
 const nowIso = () => new Date().toISOString();
+
+/** 包根（`src/core/` 往上两级）——机器规范默认从 `<包根>/spec/norms` 读，随包分发。 */
+const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 /**
  * FR-80：阻断路由（纯函数）。对齐 hermes `_route_block`（kanban_db.py:2955）。
@@ -812,6 +845,10 @@ export function openStore(options = {}) {
   // 797 条既有用例与真机交互一起打红；按 §17.5「先 warn 后 reject」两步走，P3 随 MCP 一起翻默认。
   const strictAttribution =
     String((options.env ?? process.env)?.TB_STRICT_ATTRIBUTION ?? "") === "1";
+  // P1 契约快照：机器规范默认随包读 `spec/norms/*.md`；测试可传 `normsDir` 或直接传 `norms`。
+  const normsDir = options.normsDir ?? path.join(PKG_ROOT, "spec", "norms");
+  const injectedNorms = Array.isArray(options.norms) ? options.norms : null;
+  const loadNormsForContract = () => injectedNorms ?? loadNorms(normsDir);
 
   let db;
   let migration;
@@ -834,6 +871,42 @@ export function openStore(options = {}) {
       /* ignore */
     }
     throw wrapped;
+  }
+
+  // ---- P1.5 · D2 `warn` 档：写路径上的契约校验（内核层，不阻断）---------------------
+  // 为什么放内核：MCP / HTTP / CLI / Web / dsh-tool 五个入口都落到这里；放在门面层就会
+  // 「六个入口两种语义」（方案 §17.3 D2 拍板 B）。warn 档只记审计，观察一周后再切 reject。
+  const CONTRACT_CHECK_TTL_MS = 20000; // 每次写都读五份规范 + 需求文档太重，短 TTL 缓存足够
+  const contractCheckCache = { at: 0, byProject: new Map() };
+  function currentContractCached(projectId) {
+    const now = Date.now();
+    if (now - contractCheckCache.at > CONTRACT_CHECK_TTL_MS) { contractCheckCache.at = now; contractCheckCache.byProject.clear(); }
+    if (!contractCheckCache.byProject.has(projectId)) {
+      try { contractCheckCache.byProject.set(projectId, store.contractSnapshot(projectId).snapshot); }
+      catch { contractCheckCache.byProject.set(projectId, null); }
+    }
+    return contractCheckCache.byProject.get(projectId);
+  }
+  /**
+   * 只有**调用方显式带 `contract`** 才校验（老客户端不带 ⇒ skipped，零打扰）。
+   * 判 `warn` **不阻断写入**，只落一条 `contract-warn` 审计；
+   * 之后可用 `GET /api/governance/audit?action=contract-warn` 查「谁在用旧规范干活」。
+   */
+  function noteContractUse(projectId, submitted, target) {
+    const current = currentContractCached(projectId);
+    const verdict = evaluateSubmittedContract(current, submitted);
+    if (verdict.verdict !== "warn") return verdict;
+    try {
+      store.recordAudit({
+        actor: String(submitted?.actor ?? "unknown"),
+        action: "contract-warn",
+        target: String(target ?? projectId),
+        allowed: true,
+        reason: "stale",
+        detail: JSON.stringify({ problems: verdict.problems, current_version: current?.contractVersion ?? null }),
+      });
+    } catch { /* 审计写失败也不能影响业务写入 */ }
+    return verdict;
   }
 
   const store = {
@@ -880,6 +953,95 @@ export function openStore(options = {}) {
       const project = store.getProject(id);
       if (!project) throw new TbError("PROJECT_NOT_FOUND", `项目不存在：${id}`, { id });
       return project;
+    },
+
+    /**
+     * P1 · 契约快照（**纯读**，不写库）。
+     *
+     * `contractVersion = f(需求文档 digest, 机器规范 digest×版本, 门配置)`；
+     * 同时把「与上次落库的基线相比哪份文件变了」一起返回 —— 这正是 `CONTRACT_STALE`
+     * 必须能报出 `changed[]` 的来源（D5 硬要求：只报「过期」不报「哪份变了」＝让人猜）。
+     */
+    contractSnapshot(projectId) {
+      const project = store.requireProject(projectId);
+      const doc = store.getRequirementDoc(projectId);
+      const norms = loadNormsForContract();
+      const gates = {
+        attribution: strictAttribution ? "reject" : "warn",
+        authorization: "hard",
+        review: "hard",
+        humanReview: "hard",
+      };
+      const snapshot = computeContract({ requirementsText: doc?.body ?? "", norms, gates, docVersion: doc?.version ?? null });
+      const stored = store.getProjectContract(projectId);
+      const changed = stored
+        ? diffContract({ contractVersion: stored.contractVersion, docDigest: stored.docDigest, norms: stored.norms, gates: stored.gates }, snapshot)
+        : null;
+      return {
+        project: { id: project.id, name: project.name },
+        normsDir,
+        snapshot,
+        baseline: stored,
+        changed,
+        stale: Boolean(changed?.versionChanged),
+      };
+    },
+
+    /** P1 · 重算并落基线（`project_contract` 唯一写入点）。只存缓存，不影响业务状态。 */
+    refreshProjectContract(projectId, { reason = null } = {}) {
+      const result = store.contractSnapshot(projectId);
+      const ts = nowIso();
+      const { snapshot } = result;
+      db.prepare(
+        `insert into project_contract (project_id, contract_version, doc_digest, doc_version, norms_json, gates_json, computed_at, updated_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?)
+         on conflict(project_id) do update set
+           contract_version = excluded.contract_version, doc_digest = excluded.doc_digest,
+           doc_version = excluded.doc_version, norms_json = excluded.norms_json,
+           gates_json = excluded.gates_json, computed_at = excluded.computed_at, updated_at = excluded.updated_at`,
+      ).run(projectId, snapshot.contractVersion, snapshot.docDigest, snapshot.docVersion ?? null,
+        JSON.stringify(snapshot.norms), JSON.stringify(snapshot.gates), ts, ts);
+      return { ...result, baseline: store.getProjectContract(projectId), reason };
+    },
+
+    getProjectContract(projectId) {
+      const row = db.prepare("select * from project_contract where project_id = ?").get(projectId);
+      if (!row) return null;
+      const parse = (text, fallback) => {
+        try { return JSON.parse(text ?? ""); } catch { return fallback; }
+      };
+      return {
+        projectId: row.project_id,
+        contractVersion: row.contract_version,
+        docDigest: row.doc_digest,
+        docVersion: row.doc_version ?? null,
+        norms: parse(row.norms_json, []),
+        gates: parse(row.gates_json, {}),
+        computedAt: row.computed_at,
+        updatedAt: row.updated_at,
+      };
+    },
+
+    /** P1 · 装载块注入审计（D3 档 C 推迟：默认策略 off，这张表只是「将来要能追」的位子）。 */
+    recordFlowInjection({ projectId = null, sessionId = null, policy = "off", contractVersion, digest = null } = {}) {
+      if (!contractVersion) throw invalidField("contractVersion", "recordFlowInjection 必须带 contractVersion");
+      const ts = nowIso();
+      const info = db.prepare(
+        "insert into flow_injections (project_id, session_id, policy, contract_version, digest, injected_at) values (?, ?, ?, ?, ?, ?)",
+      ).run(projectId, sessionId, String(policy), String(contractVersion), digest, ts);
+      return { id: Number(info.lastInsertRowid), projectId, sessionId, policy: String(policy), contractVersion, digest, injectedAt: ts };
+    },
+
+    listFlowInjections(filter = {}) {
+      const clauses = [];
+      const args = [];
+      if (filter.projectId) { clauses.push("project_id = ?"); args.push(filter.projectId); }
+      if (filter.sessionId) { clauses.push("session_id = ?"); args.push(filter.sessionId); }
+      const where = clauses.length ? ` where ${clauses.join(" and ")}` : "";
+      return db.prepare(`select * from flow_injections${where} order by id`).all(...args).map((row) => ({
+        id: row.id, projectId: row.project_id, sessionId: row.session_id, policy: row.policy,
+        contractVersion: row.contract_version, digest: row.digest, injectedAt: row.injected_at,
+      }));
     },
 
     /**
@@ -1096,7 +1258,10 @@ export function openStore(options = {}) {
       } else {
         store.recordTaskEvent(id, { type: "attribution_missing", to: status, actor: "human", detail: "建卡未归属需求条目（未声明理由）—— 启动执行/派发团队会被归因门拒绝" });
       }
-      return store.getTaskById(id);
+      const created = store.getTaskById(id);
+      // P1.5 · warn 档：审计要指到**这张卡**（不是 `task:new`）。切 reject 时必须把这行挪到 `begin` 之前。
+      noteContractUse(projectId, input.contract, created.identifier);
+      return created;
     },
 
     getTaskRef(ref) {
@@ -1195,6 +1360,7 @@ export function openStore(options = {}) {
 
     updateTask(ref, changes = {}) {
       const current = store.requireTaskRef(ref);
+      noteContractUse(current.projectId, changes.contract, current.identifier);
       const { expectedVersion } = changes;
       if (expectedVersion === undefined || expectedVersion === null) {
         throw new TbError("MISSING_VERSION", "更新必须提供 expectedVersion（我读到的版本）", { taskId: current.id, currentVersion: current.version });
@@ -1351,6 +1517,7 @@ export function openStore(options = {}) {
 
     addComment(ref, input = {}) {
       const task = store.requireTaskRef(ref);
+      noteContractUse(task.projectId, input.contract, task.identifier);
       const body = normalizeDescription(input.body);
       const id = input.id ?? randomUUID();
       const timestamp = nowIso();
@@ -1528,11 +1695,14 @@ export function openStore(options = {}) {
         if (isConstraintError(error, "requirement_items.identifier")) throw new TbError("REQ_IDENTIFIER_CONFLICT", "需求条目编号冲突，请重试", { projectId });
         throw error;
       }
-      return store.getRequirementItemById(id);
+      const createdItem = store.getRequirementItemById(id);
+      noteContractUse(projectId, input.contract, createdItem.identifier);
+      return createdItem;
     },
     /** 更新需求条目（状态/标题/说明/验收/优先级）——资料引入后的"确认/修订"。 */
     updateRequirementItem(ref, changes = {}) {
       const item = store.requireRequirementItemRef(ref);
+      noteContractUse(item.projectId, changes.contract, item.identifier);
       const sets = []; const params = [];
       if (changes.title !== undefined) { sets.push("title = ?"); params.push(assertTitle(changes.title)); }
       if (changes.description !== undefined) { sets.push("description = ?"); params.push(normalizeDescription(changes.description)); }
@@ -1582,11 +1752,25 @@ export function openStore(options = {}) {
       if (!doc) throw new TbError("REQUIREMENT_DOC_NOT_FOUND", `需求文档不存在：${options.docId ?? ref ?? options.projectId}`, { ref: options.docId ?? ref ?? options.projectId });
       // 规则解析 = fallback 路径（AI 版见切片2，或由宿主注入 aiElaborator）
       // B-2：规则条目化可能一次产出成百上千条（尤其对"资料索引"这类文档）→ 加数量上限，防"候选洪水"
-      const limit = Number.isFinite(options.limit) ? options.limit : 100;
+      // 卡 `-169` P4②（2026-10-29）：默认 100 → **20**，硬顶 200，见文件头 DEFAULT_ELABORATE_LIMIT 注释。
+      const limit = clampElaborateLimit(options.limit);
       const all = elaborateDocument(doc.body);
       const capped = all.slice(0, limit);
+      const truncated = all.length > capped.length;
+      // dryRun：**零落库**，只回预览（规则模式此前"一点就写"，人没有反悔的机会）
+      if (options.dryRun === true) {
+        const preview = capped.slice(0, ELABORATE_PREVIEW_SIZE).map((c) => ({
+          title: c.title, description: c.description, acceptance: c.acceptance, priority: c.priority,
+        }));
+        return {
+          docId: doc.id, dryRun: true, source: "elaborated-rule", mode: "rule",
+          limit, totalFound: all.length, truncated,
+          preview, previewCount: preview.length,
+          candidates: [], duplicatesSkipped: 0,
+        };
+      }
       const res = store.addRequirementCandidates(doc.id, capped, { source: "elaborated-rule" });
-      return { ...res, truncated: all.length > capped.length, totalFound: all.length };
+      return { ...res, limit, truncated, totalFound: all.length };
     },
     /** 写入一组候选条目（AI 或规则产出共用）；去重、未确认不落 requirement_items。 */
     addRequirementCandidates(ref, candidates, { source = "elaborated-rule" } = {}) {

@@ -186,7 +186,7 @@ test("FR-50 迁移：老库（team_members 无 executor 列）打开即幂等补
 
   const store = openStore({ dbPath });
   assert.equal(store.migration.addedTeamMemberExecutorColumn, true, "老库必须被补上 executor 列");
-  assert.equal(store.schemaVersion, 11); // 11：+ 项目记忆三张表
+  assert.equal(store.schemaVersion, 12); // 12：+ 契约快照两张表（P1）
   store.createProject({ id: "demo", name: "Demo" });
   const item = store.createRequirementItem({ projectId: "demo", title: "需求A" });
   const t = store.createTask({ projectId: "demo", title: "T", status: "todo" });

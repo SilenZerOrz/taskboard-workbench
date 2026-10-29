@@ -2,6 +2,7 @@
  * api.mjs —— 纯路由逻辑（不依赖 node:http）。独立服务与 DSH 宿主插件共用。
  */
 import { PRIORITIES, STATUSES } from "../core/domain.mjs";
+import { clampElaborateLimit } from "../core/requirements.mjs";
 import { EXIT, TbError, invalidField } from "../core/errors.mjs";
 import { resolveContext } from "../core/binding.mjs";
 import { scanProjectMaterials, buildMaterialIndex, collectExternalFiles } from "../core/intake.mjs";
@@ -584,6 +585,8 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
           // 中间任何失败都留一张无归因卡（2026-10-28 修 69 张，其中 56 张来源已不可考）。
           requirementId: body.requirementId ?? body.requirement,
           unattributedReason: body.unattributedReason,
+          // P1.5：契约校验在**内核**（store）里做，门面只负责把调用方的契约原样带下去。
+          contract: body.contract,
         });
         // 未归因时必须**可见**：返回体带 `attribution.warning`（CLI 侧走 stderr，Web 侧画黄条）。
         // 不写成错误是因为严格拒绝要等 P3（见 store.mjs 的 strictAttribution 注释）。
@@ -625,6 +628,7 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
       if (method === "PATCH") {
         const task = store.updateTask(ref, {
           expectedVersion: body.version ?? body.expectedVersion,
+          contract: body.contract,
           title: body.title,
           description: body.description,
           acceptance: body.acceptance,
@@ -693,23 +697,56 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
       const ref = decodeURIComponent(reqElaborateRoute[1]);
       const doc = store.getRequirementDocById(ref) ?? store.getRequirementDoc(ref);
       if (!doc) throw new TbError("REQUIREMENT_DOC_NOT_FOUND", `需求文档不存在：${ref}`, { ref });
+      // ── 条目化契约（卡 `-169` P4② · 2026-10-29 口径变更） ───────────────────────
+      // 旧口径（已废）：`auto` 在 AI 不可用时**静默跑规则并落库**，只加一个 `degraded:true` 标注。
+      //   真机后果：一份「资料索引」文档一次落 100 条 pending 候选，其中 0 条真需求。
+      // 新口径：
+      //   · `mode:"auto"` ≈ **只用 AI**；AI 不可用/失败 ⇒ **拒绝**（`AI_UNAVAILABLE`，**零落库**）；
+      //   · 要规则降级必须**显式** `fallback:"rule"`（旧行为整体退到这条分支，语义不变）；
+      //   · `mode:"rule"` 支持 `dryRun:true` ⇒ 只回预览、零落库（规则模式不再「一点就写」）；
+      //   · `limit` 从 body 透传，默认 20、硬顶 200（旧默认 100 且 body 不生效）。
       const mode = body.mode ?? "auto";
-      const runRule = () => ({ ...store.elaborateRequirementDoc(doc.id), mode: "rule" });
+      if (mode !== "auto" && mode !== "ai" && mode !== "rule") {
+        throw new TbError("USAGE_ERROR", `elaborate mode 必须是 auto/ai/rule，收到：${mode}`);
+      }
+      const fallback = body.fallback;
+      if (fallback !== undefined && fallback !== "rule") {
+        throw new TbError("USAGE_ERROR", `elaborate fallback 只能是 rule（显式规则降级），收到：${fallback}`);
+      }
+      const dryRun = body.dryRun === true;
+      if (dryRun && mode !== "rule") {
+        throw new TbError("USAGE_ERROR", `dryRun 仅适用于 mode:"rule"（AI 产出量由模型决定，没有"预演"意义），收到 mode:${mode}`);
+      }
+      const limit = clampElaborateLimit(body.limit);
+      const runRule = () => ({ ...store.elaborateRequirementDoc(doc.id, { limit, dryRun }), mode: "rule" });
       const runAi = async () => {
-        if (typeof aiElaborator !== "function") throw new TbError("AI_UNAVAILABLE", "AI 条目化不可用（当前环境未提供 LLM 直连）");
-        const candidates = await aiElaborator(doc);
+        if (typeof aiElaborator !== "function") {
+          throw new TbError("AI_UNAVAILABLE", `AI 条目化不可用（当前环境未提供 LLM 直连）：改传 mode:"rule" 或 {mode:"auto",fallback:"rule"} 走规则拆解；规则模式 limit 默认 20 条`);
+        }
+        let candidates;
+        try {
+          candidates = await aiElaborator(doc);
+        } catch (error) {
+          // AI 自己的失败也统一成可判定的错误码，不再被"降级"吞掉（除非人显式要 fallback）
+          if (error instanceof TbError) throw error;
+          // 上游已带机器可读 code（如 `AI_OUTPUT_INVALID`）时**保留它** —— 排障要能区分
+          // 「没有 AI」与「AI 回了没法解析的东西」；压成同一个码等于丢掉线索。
+          const code = typeof error?.code === "string" && error.code ? error.code : "AI_UNAVAILABLE";
+          throw new TbError(code, `AI 条目化失败：${error?.message ?? error}（本次未落库）`);
+        }
         return { ...store.addRequirementCandidates(doc.id, candidates, { source: "elaborated-ai" }), mode: "ai" };
       };
-      if (mode === "rule") return { status: 201, payload: runRule() };
+      if (mode === "rule") return { status: dryRun ? 200 : 201, payload: runRule() };
       if (mode === "ai") return { status: 201, payload: await runAi() };
-      if (mode !== "auto") throw new TbError("USAGE_ERROR", `elaborate mode 必须是 auto/ai/rule，收到：${mode}`);
+      // mode === "auto"
+      if (fallback !== "rule") return { status: 201, payload: await runAi() };
+      // 显式 fallback:"rule" ⇒ 保留旧行为：先试 AI，失败则规则降级并标注 degraded
       if (typeof aiElaborator === "function") {
         try { return { status: 201, payload: await runAi() }; }
         catch (error) {
           return { status: 201, payload: { ...runRule(), degraded: true, aiError: error?.code ?? String(error?.message ?? error) } };
         }
       }
-      // B-1：无 AI 时显式标注降级，避免用户误以为用了 AI
       return { status: 201, payload: { ...runRule(), degraded: true, aiError: "AI_UNAVAILABLE" } };
     }
 
@@ -727,6 +764,7 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
         const item = store.createRequirementItem({
           projectId: body.projectId, title: body.title, description: body.description,
           acceptance: body.acceptance, priority: body.priority, docId: body.docId,
+          contract: body.contract,
         });
         return { status: 201, payload: { item } };
       }
@@ -745,6 +783,7 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
         const item = store.updateRequirementItem(ref, {
           status: body.status, title: body.title, description: body.description,
           acceptance: body.acceptance, priority: body.priority, docId: body.docId,
+          contract: body.contract,
         });
         // 需求终态（done/closed）落审计：谁在什么时候把哪条需求收口的（自动只给建议，终态由人定）。
         if (body.status === "done" || body.status === "closed" || item.status === "done" || item.status === "closed") {
@@ -1471,7 +1510,7 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
     if (taskCommentsRoute) {
       const ref = decodeURIComponent(taskCommentsRoute[1]);
       if (method === "GET") { const task = store.requireTaskRef(ref); return { status: 200, payload: { comments: store.listComments(task.id) } }; }
-      if (method === "POST") { const task = store.requireTaskRef(ref); const c = store.addComment(task.id, { body: body.body ?? body.comment ?? "" }); emit("task.updated", { taskId: task.id, identifier: task.identifier, status: task.status }); return { status: 201, payload: { comment: c } }; }
+      if (method === "POST") { const task = store.requireTaskRef(ref); const c = store.addComment(task.id, { body: body.body ?? body.comment ?? "", contract: body.contract }); emit("task.updated", { taskId: task.id, identifier: task.identifier, status: task.status }); return { status: 201, payload: { comment: c } }; }
       throw new TbError("USAGE_ERROR", "comments 仅支持 GET 或 POST");
     }
     // FR-17：编辑一条评论（PATCH）。口径见 store.updateComment —— 乐观锁（冲突 → VERSION_CONFLICT/409）
@@ -1734,6 +1773,20 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
           })),
         },
       };
+    }
+    // ---------------- 契约快照（P1 · 方案 §6.4 / §8） ----------------
+    // 只读投影：`contractVersion = f(需求文档 digest, spec/norms digest×版本, 门配置)`。
+    // GET 不写库（重算即可）；POST …/recheck 才落基线 —— 这样「看一眼契约」永远无副作用。
+    const projectContractRoute = /^\/api\/projects\/([^/]+)\/contract(?:\/(recheck))?$/.exec(pathname);
+    if (projectContractRoute) {
+      const projectId = decodeURIComponent(projectContractRoute[1]);
+      const isRecheck = Boolean(projectContractRoute[2]);
+      if (isRecheck && method !== "POST") throw new TbError("USAGE_ERROR", "contract/recheck 仅支持 POST");
+      if (!isRecheck && method !== "GET") throw new TbError("USAGE_ERROR", "contract 仅支持 GET（重算基线用 POST …/contract/recheck）");
+      const result = isRecheck
+        ? store.refreshProjectContract(projectId, { reason: body.reason ?? null })
+        : store.contractSnapshot(projectId);
+      return { status: 200, payload: result };
     }
     // ---------------- 项目推进清单（2026-10-28 · 拍板 E1/E3） ----------------
     // E1：**纯投影**，不落表；同状态重复请求字节级一致（不含 now/minutes）。
