@@ -62,6 +62,9 @@ export const ERROR_CATEGORY = Object.freeze({
   // 人工校验任务（FR-85b）：人在环升级门的拒绝类错误
   HUMAN_REVIEW_NOT_CLAIMABLE: EXIT.CONFLICT,
   HUMAN_REVIEW_NOT_EXECUTABLE: EXIT.CONFLICT,
+  // 评审门（FR-83 补口 · 卡 `-162`）：待验收卡未评审通过就想收口 ⇒ 冲突类（可重试的同类语义：
+  // "先评审"是可走通的另一条路），显式 skipReview=true 才是合法逃生口
+  REVIEW_NOT_APPROVED: EXIT.CONFLICT,
   // 自动复核（FR-90）：项目没配工作区目录，没地方跑验证命令
   PROJECT_WORKSPACE_MISSING: EXIT.USAGE,
   HUMAN_REVIEW_ALREADY_EXISTS: EXIT.CONFLICT,

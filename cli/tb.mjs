@@ -19,11 +19,13 @@ const COMMAND_OPTIONS = new Map([
   ["project create", new Set(["name", "id", "workspace-path"])],
   ["project list", new Set()],
   ["project get", new Set()],
-  ["task create", new Set(["project", "title", "description", "description-file", "status", "priority", "labels", "owner", "parent", "actor"])],
+  ["task create", new Set(["project", "title", "description", "description-file", "status", "priority", "labels", "owner", "parent", "actor", "requirement", "unattributed-reason"])],
   ["task get", new Set()],
   ["task list", new Set(["project", "status", "priority", "label", "labels", "owner", "parent", "top-level", "sort"])],
   ["task update", new Set(["if-version", "title", "description", "description-file", "status", "priority", "labels", "add-labels", "remove-labels", "clear-labels", "owner", "clear-owner", "parent", "clear-parent", "actor"])],
   ["task delete", new Set(["if-version"])],
+  // P0：CLI 原先**完全没有**归因子命令（全文件 0 处 attribution）⇒ 出问题只能手打 HTTP。
+  ["task attribution", new Set(["requirement"])],
   ["comment add", new Set(["body", "body-file"])],
   ["comment list", new Set()],
   ["comment edit", new Set(["if-version", "body", "body-file", "actor"])],
@@ -40,7 +42,8 @@ export const USAGE = `tb —— 多项目任务工作台 CLI
   tb project get <项目id>
 
 任务
-  tb task create --project <项目id> --title <标题> [--description <md>|--description-file <文件>]
+  tb task create --project <项目id> --title <标题> [--requirement <条目>|--unattributed-reason <理由>]
+                 [--description <md>|--description-file <文件>]
                  [--status backlog|todo|in_progress|in_review|done|blocked|canceled]
                  [--priority none|low|medium|high|urgent]
                  [--labels a,b] [--owner <负责人>] [--parent <编号|id>] [--actor human|agent]
@@ -138,6 +141,7 @@ function collectLabels(options) {
 
 export async function execute(command, operands, options, context) {
   const { store } = context;
+  const stderr = context.stderr ?? process.stderr;
   switch (command) {
     case "project create": {
       if (operands.length !== 0) throw usageError("project create 不接受位置参数");
@@ -166,7 +170,18 @@ export async function execute(command, operands, options, context) {
         owner: options.owner,
         parent: options.parent,
         actor: options.actor,
+        // P0：建卡即归因（同一事务）。缺省不报错但**必须可见**——否则又是"建完才发现没归因"。
+        requirementId: options.requirement,
+        unattributedReason: options["unattributed-reason"],
       });
+      if (!task.requirementId && !options["unattributed-reason"]) {
+        // 走 stderr ⇒ 不污染 stdout 的 JSON（脚本可继续 `| jq .task.identifier`）
+        stderr.write(
+          `⚠ 任务 ${task.identifier} 未归属需求条目：启动执行/派发团队会被归因门拒绝（EXECUTION_NOT_ATTRIBUTED）。\n` +
+            `  补归因：tb task attribution ${task.identifier} --requirement <条目>\n` +
+            `  或下次建卡直接带 --requirement <条目>（确实不需要归属时用 --unattributed-reason <理由>）\n`,
+        );
+      }
       return { task };
     }
     case "task get": {
@@ -205,6 +220,12 @@ export async function execute(command, operands, options, context) {
       if (options.parent !== undefined) changes.parentId = options.parent;
       if (options["clear-parent"] === true) changes.clearParent = true;
       return { task: store.updateTask(operands[0], changes) };
+    }
+    case "task attribution": {
+      if (operands.length !== 1) throw usageError("task attribution 需要 1 个参数：<编号|id>");
+      if (!options.requirement) throw usageError("缺少必需参数 --requirement <需求条目标识>");
+      const task = store.associateRequirementTask(options.requirement, operands[0]);
+      return { task };
     }
     case "task delete": {
       if (operands.length !== 1) throw usageError("task delete 需要 1 个参数：<编号|id>");
@@ -270,7 +291,7 @@ export async function main(argv = process.argv.slice(2), io = {}) {
       env,
       policy: { enforce: options["enforce-governance"] === true },
     });
-    const payload = await execute(command, operands.slice(2), options, { store, env });
+    const payload = await execute(command, operands.slice(2), options, { store, env, stderr });
     stdout.write(`${JSON.stringify({ schemaVersion: CLI_SCHEMA_VERSION, ...payload }, null, 2)}\n`);
     return EXIT.OK;
   } catch (error) {

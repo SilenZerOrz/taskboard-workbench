@@ -67,7 +67,7 @@ test("存储：owner 字段读写与过滤（不再写进 labels）", () => {
     assert.equal(stats.ownedTasks, 0, "两个任务的 owner 都为空");
     assert.equal(stats.legacyOwnerLabels, 0);
     // FR-79/FR-82/FR-83/FR-81 + FR-50（team_members.executor）：schema 版本 10
-    assert.equal(stats.schemaVersion, 10);
+    assert.equal(stats.schemaVersion, 11); // 11：+ 项目记忆（memory_entries / memory_links / memory_recalls）
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });

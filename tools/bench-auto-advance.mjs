@@ -62,6 +62,8 @@ const call = async (method, urlPath, body) => {
   return { status: res.status, payload };
 };
 const ids = (rows) => (rows ?? []).map((x) => x?.task);
+// 错误码在回包的 `error.code`（FR-21 契约）；无错误时返回空串，便于断言里直接拼接。
+const codeOf = (r) => String(r?.payload?.error?.code ?? "");
 
 const projectId = "bench-advance";
 const created = await call("POST", "/api/projects", { id: projectId, name: "自动推进验证台", workspacePath: workspace });
@@ -137,9 +139,23 @@ check("未人工判定：B 仍不得推进（A 只是「待验收」，不算完
 check("未人工判定：A 不被重复派发（已离开 todo）", !ids(loop1b.payload?.dispatched).includes(A.identifier), `dispatched=${JSON.stringify(ids(loop1b.payload?.dispatched))}`);
 
 // ---- 人工判定 A 完成 ⇒ 下一跳自动放行 ----------------------------------------------------
+// FR-83 补口（卡 `-162`）：`in_review → done` 现在有服务端评审门。
+// 先钉**负向**：评审未通过就直接收口 ⇒ 必须被拒且零副作用（这正是"拖拽静默收口"那条旁路）。
+const vA0 = store.requireTaskRef(A.identifier).version;
+const closedBlind = await call("PATCH", `/api/tasks/${A.identifier}`, { status: "done", version: vA0 });
+const aUntouched = store.requireTaskRef(A.identifier);
+check("评审门：未评审直接 PATCH done ⇒ 拒（REVIEW_NOT_APPROVED / 409）",
+  closedBlind.status === 409 && codeOf(closedBlind) === "REVIEW_NOT_APPROVED", `status=${closedBlind.status} code=${codeOf(closedBlind)}`);
+check("评审门：被拒后**零副作用**（状态仍是待验收、版本未涨）",
+  aUntouched.status === "in_review" && aUntouched.version === vA0, `status=${aUntouched.status} version=${aUntouched.version}/${vA0}`);
+
+// 正向链路一：评审通过 → 人确认完成
+const approveA = await call("POST", `/api/tasks/${A.identifier}/review`, { action: "approve", comment: "bench：评审通过" });
+check("评审门：评审通过 200 且仍停在「待验收」（通过不自动完成）",
+  approveA.status === 200 && approveA.payload?.task?.status === "in_review", `status=${approveA.status} task=${approveA.payload?.task?.status}`);
 const vA = store.requireTaskRef(A.identifier).version;
 const doneA = await call("PATCH", `/api/tasks/${A.identifier}`, { status: "done", version: vA });
-check("人工把 A 判 done（完成只能人置）", doneA.status === 200 && doneA.payload?.task?.status === "done", `status=${doneA.status} task=${doneA.payload?.task?.status}`);
+check("人工把 A 判 done（评审通过后收口）", doneA.status === 200 && doneA.payload?.task?.status === "done", `status=${doneA.status} task=${doneA.payload?.task?.status}`);
 const loop2 = await call("POST", `/api/projects/${projectId}/execution-loop`, {});
 const d2 = ids(loop2.payload?.dispatched);
 check("人工判 done 后：链中 B 被自动派发（自动推进下一条）", d2.includes(B.identifier), `dispatched=${JSON.stringify(d2)}`);
@@ -147,9 +163,12 @@ check("人工判 done 后：链尾 C 仍在 B 之后受阻", (loop2.payload?.blo
 
 const bAfter = await waitFor(B.identifier, (t) => t.status === "in_review");
 check("链中 B 跑完 → 停在「待验收」", bAfter?.status === "in_review", `status=${bAfter?.status}`);
+// 正向链路二：**显式跳过评审**（逃生口）——`skipReview: true` 才放行，且必须留痕
 const vB = store.requireTaskRef(B.identifier).version;
-const doneB = await call("PATCH", `/api/tasks/${B.identifier}`, { status: "done", version: vB });
-check("人工把 B 判 done", doneB.status === 200 && doneB.payload?.task?.status === "done", `status=${doneB.status}`);
+const doneB = await call("PATCH", `/api/tasks/${B.identifier}`, { status: "done", version: vB, skipReview: true });
+check("人工把 B 判 done（显式 skipReview 跳过评审）", doneB.status === 200 && doneB.payload?.task?.status === "done", `status=${doneB.status}`);
+check("逃生口留痕：B 的事件流里有 review_skipped",
+  store.listTaskEvents(B.identifier).some((e) => e.type === "review_skipped"), JSON.stringify(store.listTaskEvents(B.identifier).map((e) => e.type)));
 const loop3 = await call("POST", `/api/projects/${projectId}/execution-loop`, {});
 const d3 = ids(loop3.payload?.dispatched);
 check("再判一次 done 后：链尾 C 被自动派发（链条推进到底）", d3.includes(C.identifier), `dispatched=${JSON.stringify(d3)}`);

@@ -98,6 +98,23 @@ export function elaborateDocument(body) {
 }
 
 /** 校验分拆产出的任务数组（FR-38）。 */
+/** 分拆任务的 kind 取值（2026-10-28 补：此前**收到就丢**，界面承诺了却落不了库）。 */
+export const SPLIT_KINDS = Object.freeze(["work", "review"]);
+
+/**
+ * kind 归一：空 → null；已知值 → 原值；**未知值直接报错**。
+ *
+ * 为什么"未知值报错"而不是静默丢成 null：2026-10-28 真机排查发现旧实现把 `kind` 整个丢弃
+ * （`assertSplitTasks` 只保留 6 个字段），用户在界面填 `review` **看起来生效、实际什么都没有** ——
+ * 这正是"界面承诺 ≠ 实现"的典型。宁可当场报错，也不许再出现"填了等于没填"。
+ */
+export function normalizeSplitKind(value) {
+  const text = String(value ?? "").trim().toLowerCase();
+  if (text === "") return null;
+  if (!SPLIT_KINDS.includes(text)) throw invalidField("tasks[].kind", `kind 只能是 ${SPLIT_KINDS.join(" / ")}，收到：${value}`);
+  return text;
+}
+
 export function assertSplitTasks(tasks) {
   if (!Array.isArray(tasks)) throw invalidField("tasks", "分拆产出必须是任务数组");
   const out = [];
@@ -110,6 +127,8 @@ export function assertSplitTasks(tasks) {
       title,
       description: t.description === undefined || t.description === null ? "" : String(t.description),
       owner: t.owner === undefined || t.owner === null ? null : String(t.owner),
+      // 2026-10-28：kind 必须**穿过**校验层（旧实现丢字段 ⇒ 界面填了等于没填）
+      kind: normalizeSplitKind(t.kind),
       priority: t.priority ?? "none",
       labels: normalizeLabels(t.labels ?? []),
       dependsOn,

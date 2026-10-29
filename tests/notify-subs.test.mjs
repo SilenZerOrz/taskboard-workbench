@@ -232,7 +232,7 @@ test("旧库迁移：新增 notify_subs 不破坏老库，重开幂等且可立�
     const t = first.createTask({ projectId: "p1", title: "旧库任务", status: "in_progress" });
     first.close();
     const again = openStore({ dbPath });
-    assert.equal(again.stats().schemaVersion, 10);
+    assert.equal(again.stats().schemaVersion, 11); // 11：+ 项目记忆三张表
     const sub = again.createNotifySubscription({ projectId: "p1", taskRef: t.identifier, sessionId: "s1", mode: "notify+wake" });
     finishRun(again, again.getTaskRef(t.identifier));
     assert.equal(again.notifySubPending(sub.id).count, 1, "重开后的老库要能立即用订阅");

@@ -29,8 +29,10 @@ import { TEAM_WRITABLE_STATUSES } from "./team.mjs";
 import { REVIEW_SOURCE_STATUSES, REVIEW_IDLE_MS, detectReviewDeadlock, reviewReturnStatus } from "./review.mjs";
 import { NOTIFY_DELIVERY_MODES, buildNotifyMessage, normalizeDeliveryMode, selectNotifyEvents } from "./notify.mjs";
 import { HUMAN_REVIEW_LABEL, assertConclusion, categoryLabel, conclusionOutcome, isHumanReviewTask, validateHumanReviewDraft } from "./human-review.mjs";
+// 项目记忆（2026-10-28 拍板 D-M1）：L2 记忆条目，与内核表同库；**不是第二真源**（必带 provenance）。
+import { createMemoryApi } from "./memory.mjs";
 
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11; // 11：项目记忆（memory_entries / memory_links / memory_recalls）
 
 // ---- 任务级验收标准与复核动作（FR-94） ---------------------------------------
 /**
@@ -288,6 +290,31 @@ create table if not exists notify_subs (
 );
 create unique index if not exists notify_subs_uniq_idx on notify_subs(project_id, ifnull(task_id, ''), session_id, mode);
 create index if not exists notify_subs_project_idx on notify_subs(project_id, active);
+-- 项目记忆（2026-10-28 · D-M1/D-M2/D-M5）：结论条目 + 挂载关系 + 召回审计。
+-- 铁律：**不是第二真源** —— 每条必带 provenance 指回 task_events/文档/会话；唯一索引去重。
+create table if not exists memory_entries (
+  id text primary key,
+  scope text not null,                -- project | agent | org
+  project_id text, agent_id text,
+  kind text not null,                 -- convention | decision | pitfall | fact | procedure
+  title text not null, body text not null, tags text not null default '[]',
+  provenance text not null,           -- event:<cursor> | doc:<path>#<anchor> | session:<id> | run:<id>
+  confidence text not null default 'proposed',   -- proposed | accepted
+  visibility text not null default 'shared',     -- private | shared | org
+  verified_at text, ttl_days integer,            -- kind=fact 必填 verified_at；过期即不召回
+  supersedes text,                               -- 被本条目取代的旧条目（**不删只取代**）
+  created_by text not null, created_at text not null, updated_at text not null
+);
+create unique index if not exists memory_dedupe_idx on memory_entries(scope, kind, title, provenance);
+create index if not exists memory_scope_idx on memory_entries(scope, project_id, confidence);
+create table if not exists memory_links (
+  entry_id text not null, entity_type text not null, entity_id text not null,
+  primary key (entry_id, entity_type, entity_id)
+);
+create table if not exists memory_recalls (
+  id integer primary key autoincrement,
+  session_id text, entry_id text not null, reason text, injected_chars integer, created_at text not null
+);
 `;
 
 const nowIso = () => new Date().toISOString();
@@ -761,10 +788,30 @@ function applyBoardOrder(db, ordered) {
   ordered.forEach((id, i) => write.run(i, id));
 }
 
+/**
+ * 归一「不归因理由」（P0 / D1 的逃生口）。
+ * 缺口径：给了就必须**非空**（空字符串等于没给），上限 500 字防灌水；没给返回 `null`。
+ */
+function normalizeUnattributedReason(value) {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  if (text === "") {
+    throw new TbError("USAGE_ERROR", "unattributedReason 不能是空字符串：要么不传，要么给一句真实理由（会落审计）");
+  }
+  if (text.length > 500) throw new TbError("USAGE_ERROR", "unattributedReason 过长（上限 500 字）");
+  return text;
+}
+
 export function openStore(options = {}) {
   const dataDir = resolveDataDir({ dataDir: options.dataDir, env: options.env });
   const dbPath = options.dbPath ?? resolveDbPath(dataDir);
   const policy = { ...GOVERNANCE_DEFAULTS, ...(options.policy ?? {}) };
+  // P0 归因门（D1 拍板「硬门 + 逃生口」）的**上线闸门**：默认 warn（建卡成功但返回可见警告 +
+  // 落 `attribution_missing` 事件），设 `TB_STRICT_ATTRIBUTION=1` 时才拒绝（`REQUIREMENT_REQUIRED`）。
+  // 为什么不一上来就拒：现有 Web 新建对话框 / seed / 部分团队路径还没有条目字段，直接拒会把
+  // 797 条既有用例与真机交互一起打红；按 §17.5「先 warn 后 reject」两步走，P3 随 MCP 一起翻默认。
+  const strictAttribution =
+    String((options.env ?? process.env)?.TB_STRICT_ATTRIBUTION ?? "") === "1";
 
   let db;
   let migration;
@@ -991,6 +1038,22 @@ export function openStore(options = {}) {
       const id = input.id ?? randomUUID();
       const timestamp = nowIso();
 
+      // ---- P0：归因在**建卡事务内**完成（本轮拍板 D1）----------------------------------
+      // 为什么必须在事务内：`POST /api/tasks` + 事后 `/attribution` 是两步，中间任何失败都会留
+      // 一张无归因卡；2026-10-28 一次全量修补 69 张，其中 56 张真实来源**已不可考**，只能挂兜底条目。
+      // 形状：requirement（归因）与 unattributedReason（显式声明不归因）**二选一**，都给是用法错误。
+      const requirementRefRaw = input.requirementId ?? input.requirement ?? null;
+      const requirementRef = requirementRefRaw == null ? "" : String(requirementRefRaw).trim();
+      const unattributedReason = normalizeUnattributedReason(input.unattributedReason);
+      if (requirementRef !== "" && unattributedReason) {
+        throw new TbError("USAGE_ERROR", "requirement 与 unattributedReason 不能同时给：要么归属需求条目，要么显式声明不归因");
+      }
+      if (requirementRef === "" && !unattributedReason && strictAttribution) {
+        throw new TbError("REQUIREMENT_REQUIRED", "建卡必须归属需求条目：请给 requirement <条目>；确实不需要归属时用 unattributedReason <理由> 显式声明（会落审计）", { projectId });
+      }
+
+      let requirementId = null; // 事务内解析、事务外留痕（故声明在 try 之外）
+
       db.exec("begin immediate");
       try {
         let parentId = null;
@@ -1000,14 +1063,23 @@ export function openStore(options = {}) {
           assertNoCycle(id, parent.id, (candidate) => store.getTaskById(candidate));
           parentId = parent.id;
         }
+        // 归因校验必须在**同一事务内**：条目不存在 / 跨项目 ⇒ 整笔回滚（连 next_seq 一起回滚，
+        // 不留编号空洞、不留孤儿卡）。
+        if (requirementRef !== "") {
+          const item = store.requireRequirementItemRef(requirementRef);
+          if (item.projectId !== projectId) {
+            throw new TbError("DEPENDENCY_CROSS_PROJECT", `条目与任务必须同项目（条目 ${item.projectId}，任务 ${projectId}）`, { requirementProjectId: item.projectId, taskProjectId: projectId });
+          }
+          requirementId = item.id;
+        }
         const project = db.prepare("select * from projects where id = ?").get(projectId);
         const sequence = project.next_seq;
         const identifier = formatIdentifier(projectId, sequence);
         db.prepare("update projects set next_seq = ?, updated_at = ? where id = ?").run(sequence + 1, timestamp, projectId);
         db.prepare(
-          `insert into tasks (id, identifier, project_id, title, description, acceptance, verify_command, status, priority, labels, owner, parent_id, version, created_at, updated_at)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
-        ).run(id, identifier, projectId, title, description, acceptance, verifyCommand, status, priority, JSON.stringify(labels), owner, parentId, timestamp, timestamp);
+          `insert into tasks (id, identifier, project_id, title, description, acceptance, verify_command, status, priority, labels, owner, parent_id, requirement_id, version, created_at, updated_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+        ).run(id, identifier, projectId, title, description, acceptance, verifyCommand, status, priority, JSON.stringify(labels), owner, parentId, requirementId, timestamp, timestamp);
         db.exec("commit");
       } catch (error) {
         db.exec("rollback");
@@ -1016,6 +1088,14 @@ export function openStore(options = {}) {
       }
       // FR-82：任务生命周期变化写入追加式事件流（详情 / 看护 / 通知共同消费）
       store.recordTaskEvent(id, { type: "created", to: status, actor: "human", detail: `创建任务（${status}）` });
+      // P0 归因留痕：三种落法都要能事后盘点（这是「逃生口」与「漏填」的唯一区别所在）
+      if (requirementId) {
+        store.recordTaskEvent(id, { type: "attributed", to: status, actor: "human", detail: `建卡即归属需求条目（${requirementId}）` });
+      } else if (unattributedReason) {
+        store.recordTaskEvent(id, { type: "attribution_skipped", to: status, actor: "human", detail: `建卡未归属需求条目（显式声明：${unattributedReason}）` });
+      } else {
+        store.recordTaskEvent(id, { type: "attribution_missing", to: status, actor: "human", detail: "建卡未归属需求条目（未声明理由）—— 启动执行/派发团队会被归因门拒绝" });
+      }
       return store.getTaskById(id);
     },
 
@@ -1134,14 +1214,33 @@ export function openStore(options = {}) {
         try { store.recordAudit({ actor, action: "set-status", target: current.identifier, allowed: false, reason: "human-review-cannot-done", detail: "人工校验任务不得置 done，请用人工结论入口" }); } catch { /* ignore */ }
         throw new TbError("HUMAN_REVIEW_CANNOT_DONE", `任务 ${current.identifier} 是人工校验任务：不得置「完成」，请用人工结论入口（continue / change-requirement / close）`, { identifier: current.identifier });
       }
-      // 注（2026-10-27 · 卡 `-158`）：这里**刻意不加**「`in_review → done` 必须评审已通过」的门。
-      // 现象上它确实缺一道门（`PATCH /api/tasks/:ref` 对评审态无任何校验，「下一列」可绕过评审直接收口），
-      // 但它不是本卡的口径，且**加门会改变产品工作流**：`tools/bench-auto-advance.mjs` 把「人工把
-      // `in_review` 卡直接判 done」当作**合法人工动作**（完成只能人确认，人有权跳过评审），加门会打断
-      // 该既有链路（实测 4 条断言变红）。FR-83 的验收原文只约束「评审通过**不自动**置完成」（红线是
-      // **不得自动化**），并未要求「完成必须先评审通过」⇒ 属**口径选择**。
-      // 按本仓纪律（`docs/进度/当前状态.md`：口径选择只登记不擅改）**只登记、不擅改**，
-      // 已登记为待裁定项 `taskboard-workbench-162`。
+      // FR-83 补口（2026-10-27 · 卡 `-162`，人拍板口径 **C：门 + 显式逃生口**）：
+      // `in_review → done` 必须**评审通过**，默认拒（退出码 5 冲突类，**零副作用** —— 门在 `begin` 之前）。
+      //
+      // 原先为何没有这道门（-158 的登记理由仍成立，只是裁定改了）：FR-83 验收原文只约束「评审通过
+      // **不自动**置完成」（红线是**不得自动化**），并未要求「完成必须先评审通过」⇒ 属口径选择。
+      // 裁定前 `PATCH /api/tasks/:ref` 对评审态**无任何校验**：拖拽落到「完成」列就能把未评审的卡静默收口
+      // （卡片「→」/ 抽屉「下一列」已由 -158 收敛，拖拽是剩下的那条）。
+      //
+      // 口径边界（三条，刻意如此）：
+      //   · **只约束「从待验收收口」**：从未请求过评审的卡（`todo → done`）照旧可完成；
+      //     `in_review → blocked/canceled/todo`（受阻、取消、退回返工）不受影响 —— 它们不是收口。
+      //   · **逃生口是显式的**：`skipReview === true`（严格布尔；字符串 `"true"` 一律不算）才放行。
+      //     人有权跳过评审（完成只能人确认），但必须是**明示的一次决定**，不能是位移动作的副作用；
+      //     放行后落审计 + 事件留痕（`review_skipped`），事后可回看。
+      //   · **不看 `actor`**：这道门只问"这张卡的评审态够不够格收口"；"自动化不得写 done"的红线在
+      //     `governance` 与 `teamSetTaskStatus` 里，两件事不混。
+      const skipReview = changes.skipReview === true;
+      const closingWithoutApproval = nextStatus === "done" && nextStatus !== current.status
+        && current.status === "in_review" && current.reviewState !== "approved";
+      if (closingWithoutApproval && !skipReview) {
+        try { store.recordAudit({ actor, action: "set-status", target: current.identifier, allowed: false, reason: "review-not-approved", detail: `review_state=${current.reviewState ?? "null"} → done 被拒` }); } catch { /* ignore */ }
+        throw new TbError(
+          "REVIEW_NOT_APPROVED",
+          `任务 ${current.identifier} 还在「待验收」且评审未通过（review_state=${current.reviewState ?? "pending"}）：请先「评审通过」再置「完成」；确需跳过评审，请显式提交 skipReview=true`,
+          { identifier: current.identifier, reviewState: current.reviewState ?? null, status: current.status, nextStatus },
+        );
+      }
       const nextPriority = changes.priority === undefined ? current.priority : assertPriority(changes.priority);
       const nextTitle = changes.title === undefined ? current.title : assertTitle(changes.title);
       const nextDescription = changes.description === undefined ? current.description : normalizeDescription(changes.description);
@@ -1222,6 +1321,15 @@ export function openStore(options = {}) {
         // FR-82：状态变化 → 事件流追加（不再让各处各自造"状态历史"）。
         // 注意：**纯列内排序不写任何事件** —— 版式调整不是任务生命周期事件，塞进去只会污染事件流与通知口径。
         store.recordTaskEvent(current.id, { type: "status_changed", from: current.status, to: nextStatus, actor: changes.actor ?? "human" });
+      }
+      // FR-83 补口（卡 `-162`）：逃生口放行后必须**可回看** —— 这是"人显式决定跳过评审"的取证点，
+      // 否则事后只看到一张 done 卡，分不清"评审通过后收口"与"跳过评审收口"。
+      if (closingWithoutApproval && skipReview) {
+        store.recordTaskEvent(current.id, {
+          type: "review_skipped", from: "in_review", to: "done", actor,
+          detail: `跳过评审直接完成（review_state=${current.reviewState ?? "null"}）`,
+        });
+        try { store.recordAudit({ actor, action: "set-status", target: current.identifier, allowed: true, reason: "review-skipped", detail: `skipReview=true（review_state=${current.reviewState ?? "null"}）` }); } catch { /* ignore */ }
       }
       // 返回形状与其它路径一致（就是任务本身；`boardPosition` 是它的一个正式字段，前端重取即见）。
       return store.getTaskById(current.id);
@@ -1622,9 +1730,13 @@ export function openStore(options = {}) {
       const created = [];
       const byTitle = new Map();
       for (const t of list) {
+        // 2026-10-28：`kind` 落到标签 `kind/work` / `kind/review`（任务表没有 kind 列，也不值得为此加列）。
+        // 用标签而不是拼进描述：卡片与抽屉都能直接看到，且可按标签筛。
+        const labels = [...(Array.isArray(t.labels) ? t.labels : [])];
+        if (t.kind) labels.push(`kind/${t.kind}`);
         const task = store.createTask({
           projectId: item.projectId, title: t.title, description: t.description,
-          owner: t.owner, priority: t.priority, labels: t.labels, status: "backlog",
+          owner: t.owner, priority: t.priority, labels, status: "backlog",
         });
         const linked = store.associateRequirementTask(item.id, task.id);
         created.push(linked);
@@ -1663,16 +1775,58 @@ export function openStore(options = {}) {
       return { item, ...summarizeRequirementCompletion(tasks) };
     },
     /** 只读：条目的技术任务 DAG（任务节点 + 依赖边），供 UI 展示。 */
+    /**
+     * 需求条目的「任务 DAG」投影（FR-91 补口 · 2026-10-29 二轮优化）。
+     *
+     * 三条口径（都是真机读出来的，不是设计想象）：
+     *   ① **前置在上**：按依赖做**稳定拓扑序**（Kahn；同层保持 `created_at, rowid`）。人从上往下读就是执行顺序。
+     *      环在 `addTaskDependency` 已被 reach 检查拒掉，这里仍防御一次：排不进去的尾巴按原序追加，**绝不丢节点**。
+     *   ② **每个节点带 `blockedBy`**：前端不必自己反算边，节点上就能写「⬅ 前置 A、B」——
+     *      真机批注只看到「⛔ 受阻」四个字，等于让人自己去猜"卡在谁身上"。
+     *   ③ **每条边带 `reason`**：`task_dependencies.reason` 本来就是"为什么卡住"的原文（如「停写窗口未确认」），
+     *      投影里丢掉它，等于把最有用的那句话留在库里。
+     */
     requirementTaskGraph(ref) {
       const item = store.requireRequirementItemRef(ref);
       const tasks = db.prepare("select * from tasks where requirement_id = ? order by created_at, rowid").all(item.id).map(rowToTask);
       const byId = new Map(tasks.map((t) => [t.id, t]));
-      const rows = db.prepare("select blocker_id, blocked_id from task_dependencies").all()
+      const rows = db.prepare("select blocker_id, blocked_id, reason from task_dependencies").all()
         .filter((r) => byId.has(r.blocker_id) && byId.has(r.blocked_id));
+      // ---- ① 稳定拓扑序 ----
+      const indeg = new Map(tasks.map((t) => [t.id, 0]));
+      const downstream = new Map(tasks.map((t) => [t.id, []]));
+      for (const r of rows) {
+        indeg.set(r.blocked_id, (indeg.get(r.blocked_id) ?? 0) + 1);
+        downstream.get(r.blocker_id).push(r.blocked_id);
+      }
+      const queue = tasks.filter((t) => (indeg.get(t.id) ?? 0) === 0).map((t) => t.id);
+      const ordered = [];
+      const placed = new Set();
+      while (queue.length) {
+        const id = queue.shift();
+        ordered.push(id);
+        placed.add(id);
+        for (const nextId of downstream.get(id) ?? []) {
+          const left = (indeg.get(nextId) ?? 0) - 1;
+          indeg.set(nextId, left);
+          if (left === 0) queue.push(nextId);
+        }
+      }
+      for (const t of tasks) if (!placed.has(t.id)) ordered.push(t.id); // 防御：环残留按原序追加
+      // ---- ② 每个节点的「被谁卡住」 ----
+      const blockedBy = new Map(tasks.map((t) => [t.id, []]));
+      for (const r of rows) {
+        const blocker = byId.get(r.blocker_id);
+        blockedBy.get(r.blocked_id).push({ identifier: blocker.identifier, title: blocker.title, status: blocker.status, reason: r.reason ?? null });
+      }
       return {
         item: { id: item.id, identifier: item.identifier, title: item.title, feasibility: item.feasibility },
-        nodes: tasks.map((t) => ({ id: t.id, identifier: t.identifier, title: t.title, status: t.status })),
-        edges: rows.map((r) => ({ blocker: byId.get(r.blocker_id).identifier, blocked: byId.get(r.blocked_id).identifier })),
+        nodes: ordered.map((id) => {
+          const t = byId.get(id);
+          return { id: t.id, identifier: t.identifier, title: t.title, status: t.status, blockedBy: blockedBy.get(id) };
+        }),
+        // ---- ③ 边上带原始 reason ----
+        edges: rows.map((r) => ({ blocker: byId.get(r.blocker_id).identifier, blocked: byId.get(r.blocked_id).identifier, reason: r.reason ?? null })),
       };
     },
     // ---------------------------------------------------------------- 执行（FR-40 启动 / FR-41 跟踪与失败）
@@ -2941,6 +3095,9 @@ export function openStore(options = {}) {
       };
     },
   };
+
+  // 项目记忆：同库、同事务语义，但**不感知** MCP/CLI/Web（只是用例层的又一扇门）。
+  Object.assign(store, createMemoryApi({ db, nowIso, randomUUID }));
 
   return store;
 }

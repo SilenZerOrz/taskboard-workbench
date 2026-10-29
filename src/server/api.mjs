@@ -12,13 +12,26 @@ import { assertTeamTemplate, assertQualityGates, planTeamMembers } from "../core
 import { assessTaskRef, projectWatchdog } from "../core/watchdog.mjs";
 import { isHumanReviewTask, planHumanReview } from "../core/human-review.mjs";
 import { deriveNextStep } from "../core/next-step.mjs";
+/**
+ * 能力缺失的统一措辞（真机 2026-10-29 · `:47830`「未能投递：host-unavailable · 检查宿主会话通道后重试」）。
+ *
+ * 旧文案把**能力缺失**说成了**临时故障** —— 人会一直重试一个永远不会成立的条件。
+ * 真实情况：独立进程实例（`node src/server/server.mjs`，没有 DSH 宿主）的 `host.capabilities` 恒为 `null`，
+ * 这类动作在该进程上**做不到**，正确出路是"换到 DSH 内的任务工作台"或"把 prompt 粘到会话里手工投递"。
+ */
+const HOST_UNAVAILABLE_NEXT = "该实例没有宿主会话通道（独立进程，/api/health 的 host.capabilities 为 null）：改到 DSH 内的任务工作台操作，或把返回的 prompt 直接粘到会话里手工投递";
+
 import { buildDebugDispatchPrompt } from "../core/debug-dispatch.mjs";
+import { buildSplitAskPrompt } from "../core/split-ask.mjs";
 import { buildReviewEvidence, formatVerifyComment, normalizeVerifyCommand, summarizeVerifyOutput, VERIFY_DEFAULT_COMMAND } from "../core/verify.mjs";
 import { evaluateKickoff } from "../core/kickoff.mjs";
 import { deriveEmptyState } from "../core/empty-state.mjs";
+// 2026-10-28 拍板 E1–E3 / D-M1–D-M5：项目推进清单（纯投影 + 幂等回写）与项目记忆（L2 条目 + L3 召回）。
+import { buildAdvance, renderAdvanceBlock, applyDecision } from "../core/advance.mjs";
+import { renderMemoryBlock } from "../core/memory.mjs";
 import { taskSessionTitle, projectMainSessionTitle } from "../core/session-naming.mjs";
 import { collectKickoffFacts, hasEngineerExecutor, hasReviewerRole } from "./kickoff.mjs";
-import { runVerifyCommand } from "./verify.mjs";
+import { runVerifyCommand, probeVerifyApplicability } from "./verify.mjs";
 import { DIAGNOSTIC_KINDS, evaluateTaskDiagnostics, projectDiagnostics, summarizeDiagnostics, resolveSessionRef, humanReviewProbe, humanReviewAnsweredBy } from "../core/diagnostics.mjs";
 import { summarizeNotifyDelivery } from "../core/notify.mjs";
 import { resolveCliExecutor, executeTaskWithCli, buildTaskPrompt, cliArgsFor, claimForCliExecution, DEFAULT_TIMEOUT_MS } from "../core/executor.mjs";
@@ -174,6 +187,14 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
         createSession: Boolean(port?.available),
         sendPrompt: has(port?.sendPrompt),
         openSession: has(port?.openSession),
+        // 2026-10-29（二轮复核）：**按"真正依赖的能力"报**，不要拿 createSession 当万能代理 ——
+        // FR-84 的「改绑已有会话 / 改指本任务」恰恰在**建会话不可用**时是保底出口（`sessionExists`/`listSessions`
+        // 在、`createSession` 不在），拿 createSession 去置灰它们会把唯一的出路也焊死。
+        listSessions: has(port?.listSessions),
+        sessionExists: has(port?.sessionExists),
+        sessionOrigin: has(port?.sessionOrigin),
+        renameSession: has(port?.renameSession),
+        sessionState: has(port?.sessionState),
         capabilities: (() => { try { return port?.capabilities?.() ?? null; } catch { return null; } })(),
       };
       return { status: 200, payload: { status: "ok", host, ...store.stats() } };
@@ -565,8 +586,22 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
           priority: body.priority,
           labels: body.labels ?? [],
           owner: body.owner,
+          // P0：归因在**建卡事务内**完成。旧口径是「先建卡、再 POST /attribution」两步 ——
+          // 中间任何失败都留一张无归因卡（2026-10-28 修 69 张，其中 56 张来源已不可考）。
+          requirementId: body.requirementId ?? body.requirement,
+          unattributedReason: body.unattributedReason,
         });
-        return { status: 201, payload: { task } };
+        // 未归因时必须**可见**：返回体带 `attribution.warning`（CLI 侧走 stderr，Web 侧画黄条）。
+        // 不写成错误是因为严格拒绝要等 P3（见 store.mjs 的 strictAttribution 注释）。
+        const attribution = task.requirementId
+          ? { attributed: true, requirementId: task.requirementId, warning: null }
+          : {
+              attributed: false,
+              requirementId: null,
+              warning:
+                "该任务未归属需求条目：启动执行/派发团队会被归因门拒绝（EXECUTION_NOT_ATTRIBUTED）。补归因：POST /api/tasks/<ref>/attribution，或建卡时带 requirement；确实不需要归属请带 unattributedReason。",
+            };
+        return { status: 201, payload: { task, attribution } };
       }
       throw new TbError("USAGE_ERROR", "/api/tasks 仅支持 GET 或 POST");
     }
@@ -605,11 +640,14 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
           labels: body.labels,
           owner: body.owner,
           // FR-11：拖拽落点。三形态：`{before: <编号>}` 锚点（前端用，筛选下唯一正确）、整数下标、`null` = 列尾。
-          // **走同一条 PATCH**：授权门 / 归因门 / 人工校验门 / 治理门都在 store.updateTask 里，
+          // **走同一条 PATCH**：评审门 / 授权门 / 归因门 / 人工校验门 / 治理门都在 store.updateTask 里，
           // 拖拽因此与「上一列 / 下一列」按钮**完全同门**，不存在任何旁路。
           // 与筛选共存口径：`boardPosition` 只定**持久顺序**，不因筛选改变；筛选只影响此刻可见集，
           // 前端把落点按"可见邻居"折成锚点提交 ⇒ 隐藏卡在整列里的相对位置不受影响（详见 store.resolveBoardOrder）。
           boardPosition: body.boardPosition,
+          // FR-83 补口（卡 `-162`）：**显式跳过评审**的逃生口。只有前端在人确认「将跳过评审」时才带 true；
+          // 漏带/带字符串一律按"没批准"处理（store 侧严格 `=== true`）⇒ 拖拽/脚本的静默收口必然被拒。
+          skipReview: body.skipReview,
         });
         return { status: 200, payload: { task } };
       }
@@ -742,6 +780,57 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
       const result = store.splitRequirement(ref, { tasks: body.tasks });
       return { status: 201, payload: result };
     }
+    // 2026-10-28 真机批注：「生成看板任务（分拆）」此前**只有人工 textarea**，没有"自动生成"也没有修订回路。
+    // 人拍口径 = **方案 C：走项目主会话** —— 不新增第二条 LLM 通道，把「先出草稿」交给项目主会话里的 agent
+    // （它本就有仓库上下文与 `taskboard_*` 工具）。本端点**只投递一条指令**：
+    // **不建卡、不改条目状态、不写评论**，唯一落盘是治理审计（`requirement-split-ask`）。
+    // 因此它可以安全地反复点（"按意见重生成"＝再投一次，带上上一版草稿与意见）。
+    const reqSplitAskRoute = /^\/api\/requirements\/items\/([^/]+)\/split-ask$/.exec(pathname);
+    if (reqSplitAskRoute) {
+      if (method !== "POST") throw new TbError("USAGE_ERROR", "split-ask 仅支持 POST");
+      const item = store.requireRequirementItemRef(decodeURIComponent(reqSplitAskRoute[1]));
+      // 与 split 同门：不可行条目连草稿都不出（避免"先拆一堆再告诉你不可行"）。
+      if (item.feasibility === "infeasible") throw new TbError("FEASIBILITY_INFEASIBLE", "条目标记为不可行，不得分拆技术任务", { ref: item.identifier });
+      const project = store.requireProject(item.projectId);
+      // 会话解析**复用** diagnostics 的三级回落（任务级 → 项目主会话 → 已绑定会话），
+      // 条目没有任务级会话，故传 sessionId:null 走后两级。
+      const resolved = resolveSessionRef(store, { projectId: item.projectId, sessionId: null });
+      const sid = resolved.sessionId ?? null;
+      if (!sid) {
+        return { status: 200, payload: { delivered: false, sessionId: null, source: null, reason: "no-session", nextAction: "先在项目里重建并绑定主会话" } };
+      }
+      const liveness = await sessionStateOf(sid);
+      if (liveness.exists === false) {
+        return { status: 200, payload: { delivered: false, sessionId: sid, source: resolved.source, reason: "session-gone", stale: true, liveness, nextAction: "重建并绑定项目主会话" } };
+      }
+      const prompt = buildSplitAskPrompt({
+        item, project,
+        feedback: body?.feedback ?? null,
+        previous: Array.isArray(body?.previous) ? body.previous : null,
+        maxTasks: body?.maxTasks,
+      });
+      // 能力判定放在**构建之后**：`host-unavailable` 不是"这个请求有问题"，而是"这个实例没有宿主"——
+      // 此时把 prompt 一并回带，人至少能自己粘到会话里（真机 2026-10-29：`:47830` 独立进程上
+      // 只会得到一句「未能投递：host-unavailable · 检查宿主会话通道后重试」，而重试永远不会成立）。
+      const port = store.hostSessionPort;
+      if (!port || typeof port.sendPrompt !== "function") {
+        return { status: 200, payload: { delivered: false, sessionId: sid, source: resolved.source, reason: "host-unavailable", hostCapabilities: null, nextAction: HOST_UNAVAILABLE_NEXT, prompt } };
+      }
+      let result = null;
+      try { result = await port.sendPrompt(sid, prompt); }
+      catch (error) {
+        const reason = error?.code ?? String(error?.message ?? error);
+        try { store.recordAudit({ actor: "board", action: "requirement-split-ask", target: item.identifier, allowed: false, reason, detail: `投递失败 session=${sid}` }); } catch { /* ignore */ }
+        return { status: 200, payload: { delivered: false, sessionId: sid, source: resolved.source, reason, nextAction: "查看主会话状态后重试" } };
+      }
+      const delivered = Boolean(result?.sent ?? result?.delivered ?? false);
+      const reason2 = result?.reason ?? null;
+      try {
+        store.recordAudit({ actor: "board", action: "requirement-split-ask", target: item.identifier, allowed: true, reason: reason2 ?? "delivered", detail: `session=${sid} source=${resolved.source ?? "null"} feedback=${body?.feedback ? "yes" : "no"} previous=${Array.isArray(body?.previous) ? body.previous.length : 0}` });
+      } catch { /* ignore */ }
+      return { status: 200, payload: { delivered, sessionId: sid, source: resolved.source, reason: reason2, stale: false, liveness, prompt } };
+    }
+
     const reqGraphRoute = /^\/api\/requirements\/items\/([^/]+)\/graph$/.exec(pathname);
     if (reqGraphRoute) {
       if (method !== "GET") throw new TbError("USAGE_ERROR", "graph 仅支持 GET");
@@ -1085,7 +1174,7 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
         return { status: 200, payload: { opened: false, sessionId: sid, source, reason: "session-other-workspace", stale: false, liveness, origin } };
       }
       const port = store.hostSessionPort;
-      if (!port || typeof port.openSession !== "function") return { status: 200, payload: { opened: false, sessionId: sid, source, reason: "host-unavailable", stale: false, liveness, origin } };
+      if (!port || typeof port.openSession !== "function") return { status: 200, payload: { opened: false, sessionId: sid, source, reason: "host-unavailable", hostCapabilities: null, nextAction: HOST_UNAVAILABLE_NEXT, stale: false, liveness, origin } };
       try { const r = await port.openSession(sid); return { status: 200, payload: { opened: Boolean(r?.opened), sessionId: sid, source, reason: r?.reason ?? null, stale: false, liveness, origin } }; }
       catch (error) { return { status: 200, payload: { opened: false, sessionId: sid, source, reason: error?.code ?? String(error?.message ?? error), stale: false, liveness, origin } }; }
     }
@@ -1115,16 +1204,16 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
       if (liveness.exists === false) {
         return { status: 200, payload: { delivered: false, sessionId: sid, source, reason: "session-gone", nextAction: "重建并绑定项目主会话", stale: true, liveness } };
       }
-      const port = store.hostSessionPort;
-      if (!port || typeof port.sendPrompt !== "function") {
-        return { status: 200, payload: { delivered: false, sessionId: sid, source, reason: "host-unavailable", nextAction: "检查宿主会话通道后重试" } };
-      }
       const prompt = buildDebugDispatchPrompt({
         task,
         project,
         note: body?.note ?? null,
         nextStep: body?.nextStep ?? null,
       });
+      const port = store.hostSessionPort;
+      if (!port || typeof port.sendPrompt !== "function") {
+        return { status: 200, payload: { delivered: false, sessionId: sid, source, reason: "host-unavailable", hostCapabilities: null, nextAction: HOST_UNAVAILABLE_NEXT, prompt } };
+      }
       let result = null;
       try { result = await port.sendPrompt(sid, prompt); }
       catch (error) {
@@ -1456,15 +1545,28 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
       }
       const settings = store.getProjectSettings(task.projectId);
       // FR-94：复核动作的回落链 —— 本次显式指定 → **本卡复核动作** → 项目设置 → 内置默认。
-      const command = normalizeVerifyCommand(body.command ?? task.verifyCommand ?? settings?.envConfig?.verifyCommand ?? VERIFY_DEFAULT_COMMAND);
+      const configured = body.command ?? task.verifyCommand ?? settings?.envConfig?.verifyCommand ?? null;
+      const command = normalizeVerifyCommand(configured ?? VERIFY_DEFAULT_COMMAND);
       const acceptance = String(task.acceptance ?? "");
-      const result = await runVerifyCommand({ command, cwd });
+      // 真机报障（2026-10-28 · hydro-two-ticket 的 T7-B）：**没人配过命令**时回落到内置 `npm test`，
+      // 而该工作区是 Java 工程 ⇒ `ENOENT package.json` ⇒ 退出码 254 ⇒ 结论「失败」。
+      // 这是「命令不适用」，不是「测试失败」：不跑这条注定报错的命令，落一个**第三态**（不适用）+
+      // 一条明路（去填本卡复核动作）。人配过的命令（`configured` 非空）一律照跑，不替他判断。
+      const probe = configured ? { applicable: true, reason: null } : await probeVerifyApplicability({ command, cwd });
+      const skipReason = probe.applicable ? null : probe.reason;
+      const result = skipReason
+        ? { exitCode: null, timedOut: false, durationMs: 0, tail: `未执行：${skipReason}。\n请在任务「编辑 → 复核动作」（或项目设置 envConfig.verifyCommand）里填本项目的复核命令后重跑，例如 Java 工程填 \`mvn -q test\`。` }
+        : await runVerifyCommand({ command, cwd });
       // FR-90 强化（真机反馈 2026-10-22：「执行结果只返回一个结果，应该在自动复核证据内自动填入
       // 复核总结证据及结论」）：除机器头外，再把**总结 / 失败点**一并落成证据，并回传前端供自动填入。
-      const summary = summarizeVerifyOutput(result);
-      const comment = store.addComment(task.id, { body: formatVerifyComment({ command, ...result, ...summary, acceptance }) });
+      // 「不适用」不给测试计数（没跑），也不编造总结：只把原因原样写成一句结论。
+      const summary = skipReason
+        ? { summary: `未执行命令（${skipReason}）：这不是测试失败，请先配置本项目的复核命令`, failures: [], counts: { tests: null, passed: null, failed: null, durationMs: null } }
+        : summarizeVerifyOutput(result);
+      const comment = store.addComment(task.id, { body: formatVerifyComment({ command, ...result, ...summary, acceptance, skipReason }) });
       emit("task.updated", { taskId: task.id, identifier: task.identifier, status: task.status });
-      return { status: 201, payload: { command, cwd, ...result, verdict: result.timedOut ? "超时未完成" : (result.exitCode === 0 ? "通过" : `失败（退出码 ${result.exitCode}）`), summary: summary.summary, failures: summary.failures, counts: summary.counts, commentId: comment.id } };
+      const verdict = result.timedOut ? "超时未完成" : (skipReason ? `不适用（${skipReason}）` : (result.exitCode === 0 ? "通过" : `失败（退出码 ${result.exitCode}）`));
+      return { status: 201, payload: { command, cwd, ...result, applicable: !skipReason, skipReason, verdict, summary: summary.summary, failures: summary.failures, counts: summary.counts, commentId: comment.id } };
     }
     // ---- 团队执行记录（FR-42）/ 治理（FR-43） ----
     if (pathname === "/api/teams") {
@@ -1638,6 +1740,87 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
           })),
         },
       };
+    }
+    // ---------------- 项目推进清单（2026-10-28 · 拍板 E1/E3） ----------------
+    // E1：**纯投影**，不落表；同状态重复请求字节级一致（不含 now/minutes）。
+    const projectAdvanceRoute = /^\/api\/projects\/([^/]+)\/advance$/.exec(pathname);
+    if (projectAdvanceRoute) {
+      if (method !== "GET") throw new TbError("USAGE_ERROR", "推进清单仅支持 GET（要投给主会话用 POST …/advance/announce）");
+      const project = store.requireProject(decodeURIComponent(projectAdvanceRoute[1]));
+      const list = buildAdvance(store, project.id);
+      const payload = { ...list };
+      // P-B：`?format=block` 直接给可投递的指令装载块（含【项目记忆】段）
+      if (String(searchParams.get("format") ?? "") === "block") {
+        const recall = store.recallMemory({ projectId: project.id });
+        payload.block = [renderAdvanceBlock(list), renderMemoryBlock(recall, { projectName: project.name })].join("\n\n");
+        payload.memory = { count: recall.count, ids: recall.entries.map((e) => e.id) };
+      }
+      return { status: 200, payload };
+    }
+    // P-B：把清单 + 项目记忆拼成**一段**装载块投给主会话（复用既有 sendPrompt，不新增投递通道）
+    const projectAdvanceAnnounceRoute = /^\/api\/projects\/([^/]+)\/advance\/announce$/.exec(pathname);
+    if (projectAdvanceAnnounceRoute) {
+      if (method !== "POST") throw new TbError("USAGE_ERROR", "advance/announce 仅支持 POST");
+      const project = store.requireProject(decodeURIComponent(projectAdvanceAnnounceRoute[1]));
+      const sid = body.sessionId ? String(body.sessionId) : (project.initialSessionId ?? null);
+      if (!sid) throw new TbError("NO_MAIN_SESSION", "该项目还没有主会话：先在开局流程绑主会话，或用 body.sessionId 指定", { projectId: project.id });
+      const hostPort = store.hostSessionPort;
+      if (!hostPort || typeof hostPort.sendPrompt !== "function") throw new TbError("HOST_UNAVAILABLE", "宿主会话通道不可用，无法投递装载块", { projectId: project.id });
+      const list = buildAdvance(store, project.id);
+      const recall = store.recallMemory({ projectId: project.id });
+      const blockText = [renderAdvanceBlock(list), renderMemoryBlock(recall, { projectName: project.name })].join("\n\n");
+      let sent = null;
+      try { sent = await hostPort.sendPrompt(sid, blockText); } catch (e) { sent = { sent: false, reason: e?.message ?? "error" }; }
+      store.recordMemoryRecalls({ sessionId: sid, entries: recall.entries, reason: "advance-announce" });
+      try {
+        store.recordAudit({ actor: body.actor ?? "board", action: "advance-announce", target: project.id, allowed: Boolean(sent?.sent), reason: sent?.reason ?? "delivered", detail: `session=${sid} items=${list.count} memory=${recall.count}` });
+      } catch { /* 审计失败不阻断投递结果如实回包 */ }
+      return { status: 200, payload: { project: project.id, sessionId: sid, delivered: Boolean(sent?.sent), reason: sent?.reason ?? null, items: list.count, memory: recall.count, block: blockText } };
+    }
+    // P-C：决定回写（**幂等**：同 decisionId 第二次只返回首次结果；accept/complete 仅人）
+    const projectDecideRoute = /^\/api\/projects\/([^/]+)\/advance\/([^/]+)\/decide$/.exec(pathname);
+    if (projectDecideRoute) {
+      if (method !== "POST") throw new TbError("USAGE_ERROR", "decide 仅支持 POST");
+      const project = store.requireProject(decodeURIComponent(projectDecideRoute[1]));
+      const decisionId = decodeURIComponent(projectDecideRoute[2]);
+      const result = applyDecision(store, project.id, decisionId, { choice: body.choice, note: body.note ?? null, actor: body.actor ?? "human" });
+      try {
+        store.recordAudit({ actor: body.actor ?? "human", action: "advance-decide", target: decisionId, allowed: true, reason: result.replay ? "replay" : String(result.choice ?? ""), detail: `kind=${result.kind ?? result.applied?.kind ?? "?"} task=${result.taskRef ?? result.applied?.taskRef ?? "?"}` });
+      } catch { /* 同上 */ }
+      return { status: 200, payload: result };
+    }
+    // ---------------- 项目记忆（2026-10-28 · 拍板 D-M1/D-M2/D-M5） ----------------
+    const projectMemoryRoute = /^\/api\/projects\/([^/]+)\/memory$/.exec(pathname);
+    if (projectMemoryRoute) {
+      const project = store.requireProject(decodeURIComponent(projectMemoryRoute[1]));
+      if (method === "GET") {
+        const entries = store.listMemoryEntries({
+          projectId: project.id,
+          scope: searchParams.get("scope") ?? null,
+          kind: searchParams.get("kind") ?? null,
+          includeProposed: String(searchParams.get("includeProposed") ?? "") === "1",
+        });
+        const recall = store.recallMemory({ projectId: project.id });
+        return { status: 200, payload: { project: project.id, count: entries.length, entries, recall: { count: recall.count, ids: recall.entries.map((e) => e.id), chars: recall.chars } } };
+      }
+      if (method === "POST") {
+        // D-M2：写入即 **proposed**，人 accept 后才会被召回
+        const { entry, created } = store.upsertMemoryEntry({
+          ...body,
+          projectId: body?.projectId ?? project.id,
+          createdBy: body?.createdBy ?? "agent:board",
+        });
+        try { store.recordAudit({ actor: body?.createdBy ?? "agent:board", action: "memory-upsert", target: project.id, allowed: true, reason: created ? "created" : "updated", detail: `${entry.id} ${entry.scope}/${entry.kind} ${entry.provenance}` }); } catch { /* ignore */ }
+        return { status: created ? 201 : 200, payload: { entry, created, note: entry.confidence === "proposed" ? "已写入待确认（proposed）：人 accept 后才会被召回" : null } };
+      }
+      throw new TbError("USAGE_ERROR", "memory 仅支持 GET（列表+召回预览）/ POST（propose 一条）");
+    }
+    const projectMemoryAcceptRoute = /^\/api\/projects\/([^/]+)\/memory\/([^/]+)\/accept$/.exec(pathname);
+    if (projectMemoryAcceptRoute) {
+      if (method !== "POST") throw new TbError("USAGE_ERROR", "memory accept 仅支持 POST");
+      store.requireProject(decodeURIComponent(projectMemoryAcceptRoute[1]));
+      const result = store.acceptMemoryEntry(decodeURIComponent(projectMemoryAcceptRoute[2]), { actor: body?.actor ?? "human" });
+      return { status: 200, payload: result };
     }
     // FR-82：项目事件流（跨任务按全库游标；FR-81 的订阅推送数据源）
     const projectEventsRoute = /^\/api\/projects\/([^/]+)\/events$/.exec(pathname);

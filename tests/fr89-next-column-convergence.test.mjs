@@ -134,7 +134,10 @@ test("FR-89②：「下一步」区自身的「完成」入口保持不变（收
   // 前端「完成」处理器仍在且仍走 moveTask + 关抽屉（FR-89：写入成功要有可见反馈并关抽屉）
   const at = source.indexOf('"complete": async () => {');
   assert.ok(at > 0, "前端必须接「完成」动作");
-  const zone = source.slice(at, at + 700);
+  // 切片按**下一个动作处理器**收边（-162 给「完成」加了评审态分支与注释，固定字节窗会被撑破；
+  // 用边界切才不会被后续注释长度影响，也不会把别的处理器内容混进断言）
+  const nextAt = source.indexOf('"dispatch-main-session":', at);
+  const zone = source.slice(at, nextAt > at ? nextAt : at + 1500);
   assert.match(zone, /moveTask\(t, "done"\)/, "「完成」仍走 moveTask(done)");
   assert.match(zone, /closeDrawer\(\)/, "「完成」写入成功后仍关抽屉");
 });

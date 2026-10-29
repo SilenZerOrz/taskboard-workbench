@@ -227,7 +227,7 @@ test("FR-20：提示条是**独立常驻**元素（不得复用会定时消失�
   );
   assert.match(
     SOURCE,
-    /shell\.append\(header, toolbar, banner, connNotice, boardScroll/,
+    /shell\.append\(header, toolbar, banner, connNotice, hostNotice, boardScroll/,
     "connNotice 必须真的挂进页面（否则再怎么写文案都不可见）",
   );
   const region = sseRegion();

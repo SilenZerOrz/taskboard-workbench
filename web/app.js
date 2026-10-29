@@ -150,6 +150,26 @@
     if (isHumanReviewTask(task)) return "human-review";
     return task.requirementId ? "start" : "attribute";
   };
+
+  /**
+   * FR-83 补口（卡 `-162`，口径 C：门 + 显式逃生口）：把「未评审就收口」从**静默旁路**变成**明示决定**。
+   *
+   * 服务端 `in_review → done` 现在默认拒（`REVIEW_NOT_APPROVED`，退出码 5，零副作用），
+   * 只有显式 `skipReview === true` 才放行。`skipReview: true` 的**唯一出处**就是这里：
+   * 人点了一个说明白「将跳过评审」的确认框，调用方才会把它带进 PATCH。
+   * 本谓词是判据的唯一来源（拖拽落「完成」列、抽屉「下一步」区的「完成」都调它），
+   * 保证两条入口对"什么算未评审收口"给出**同一个答案**。
+   */
+  const needsReviewSkip = (task, status) =>
+    status === "done" && task?.status === "in_review" && task?.reviewState !== "approved";
+
+  /** 跳过评审的确认框（**唯一实现**）。返回 true 才允许带 `skipReview: true` 提交。 */
+  const confirmReviewSkip = (task) => window.confirm(
+    `本卡（${task.identifier}）还在「待验收」且评审未通过（${task.reviewState ?? "pending"}）。\n\n`
+    + "继续会跳过评审直接置「完成」——服务端会记一条 review_skipped 事件与审计，事后可查。\n\n"
+    + "建议先点「评审通过」（评审通过后仍需你确认才完成）。确认跳过评审直接完成？",
+  );
+
   // FR-86 / FR-70：执行循环的**裁剪原因**文案（让行 / 关键阻塞 / 上限 / 守卫）。
   const LOOP_STOP_LABELS = {
     "shared-file-conflict": "共享文件冲突（让行）",
@@ -517,7 +537,7 @@
     // FR-28：会话内**默认按本会话收敛**（档位＝`session:<本会话标识>`，可用「全部」一键切回）；
     // 拿不到 sessionId（非会话作用域入口）时保持「全部」，并由工具栏明写降级文案（见 NO_SESSION_NOTICE）。
     const defaultSessionScope = sessionId ? `${SESSION_SCOPE_CURRENT_PREFIX}${sessionId}` : "";
-    const state = { statuses: [], priorities: [], projects: [], tasks: [], projectId: "", priority: "", label: "", sessionScope: defaultSessionScope, session: sessionId, keyword: "", loop: {}, binding: { projectId: null, bound: true, mainSessionId: null, association: null }, showArchived: false, collapsedSections: [], touchedSections: [], emptyState: null, dragTask: null, dragEl: null };
+    const state = { statuses: [], priorities: [], projects: [], tasks: [], projectId: "", priority: "", label: "", sessionScope: defaultSessionScope, session: sessionId, keyword: "", loop: {}, host: null, binding: { projectId: null, bound: true, mainSessionId: null, association: null }, showArchived: false, collapsedSections: [], touchedSections: [], emptyState: null, dragTask: null, dragEl: null };
     let editing = null;
     let destroyed = false;
 
@@ -561,12 +581,16 @@
     reqToggle.type = "button";
     const teamToggle = mk("button", "ghost", "团队");
     teamToggle.type = "button";
+    // FR-99：推进清单（五类待办 + 待确认记忆）；放在「团队」「配置」之间，因为它才是"今天该干什么"
+    const advanceToggle = mk("button", "ghost", "推进");
+    advanceToggle.type = "button";
+    advanceToggle.title = "推进清单：五类待办（待人定 / 受阻 / 待评审 / 待收口 / 可开工）+ 待确认记忆";
     const configToggle = mk("button", "ghost", "配置");
     configToggle.type = "button";
     const refreshButton = mk("button", "ghost", "刷新");
     refreshButton.type = "button";
-    const navButtons = { board: boardToggle, req: reqToggle, team: teamToggle, config: configToggle };
-    header.append(titleBox, spacer, boardToggle, reqToggle, teamToggle, configToggle, themeToggle, refreshButton);
+    const navButtons = { board: boardToggle, req: reqToggle, team: teamToggle, advance: advanceToggle, config: configToggle };
+    header.append(titleBox, spacer, boardToggle, reqToggle, teamToggle, advanceToggle, configToggle, themeToggle, refreshButton);
 
     const toolbar = mk("div", "toolbar");
     const projectSelect = mk("select");
@@ -654,6 +678,11 @@
     const connNotice = mk("div", "banner error");
     connNotice.hidden = true;
     connNotice.setAttribute("role", "status");
+    // 能力边界提示（真机 2026-10-29 · `:47830`）：**常驻**（不是 5s 就消失的一次性 banner）——
+    // 它描述的是"这个实例能做什么"，不是某一次操作的结果。
+    const hostNotice = mk("div", "banner warn");
+    hostNotice.hidden = true;
+    hostNotice.setAttribute("role", "status");
     const boardScroll = mk("main", "board-scroll");
     const board = mk("div", "board");
     board.setAttribute("aria-label", "任务看板（按状态分列）");
@@ -674,7 +703,12 @@
     gateScroll.hidden = true;
     const gateRoot = mk("div", "requirements-view");
     gateScroll.appendChild(gateRoot);
-    shell.append(header, toolbar, banner, connNotice, boardScroll, reqScroll, teamScroll, configScroll, gateScroll);
+    // FR-99 / FR-100：推进清单 + 待确认记忆（与看板/需求/团队/配置并列的一个视图，不抢它们的布局）
+    const advanceScroll = mk("main", "board-scroll");
+    advanceScroll.hidden = true;
+    const advanceRoot = mk("div", "advance-view");
+    advanceScroll.appendChild(advanceRoot);
+    shell.append(header, toolbar, banner, connNotice, hostNotice, boardScroll, reqScroll, teamScroll, configScroll, gateScroll, advanceScroll);
 
     // 任务详情抽屉（含"归属团队 / 执行会话"关联）
     const drawerBackdrop = mk("div", "tb-drawer-backdrop");
@@ -875,6 +909,12 @@
     fVerifyCommand.type = "text";
     fVerifyCommand.id = "tb-f-verify";
     fVerifyCommand.placeholder = "留空＝回落项目设置（配置页 envConfig.verifyCommand，默认 npm test）";
+    // 归因（真机批注 2026-10-28「很多卡片未关联项目需求」）：新建/编辑对话框此前**没有**条目字段，
+    // 从界面建的卡必然无归因（服务端只回 warning）⇒ 归因只能事后进抽屉补，漏一次就留一张裸卡。
+    // 口径：**补入口，不改门** —— 不选仍然放行（服务端 warning + 卡面「未归因」标记照旧）；
+    // 编辑态**只回显、不改绑**（改绑走抽屉的「改绑需求条目」，避免顺手改掉归属）。
+    const fRequirement = mk("select");
+    fRequirement.id = "tb-f-requirement";
     const fStatus = mk("select");
     fStatus.id = "tb-f-status";
     const fPriority = mk("select");
@@ -897,6 +937,7 @@
       field("描述（Markdown，可留空）", fDescription, fDescription.id),
       field("完成验收标准（怎么算做完，可留空）", fAcceptance, fAcceptance.id),
       field("复核动作（本卡复核命令，可留空）", fVerifyCommand, fVerifyCommand.id),
+      field("需求条目（归因；留空＝不归因，执行/派发会被归因门拦下）", fRequirement, fRequirement.id),
       field("状态", fStatus, fStatus.id),
       field("优先级", fPriority, fPriority.id),
       field("负责人 / 角色", fOwner, fOwner.id),
@@ -934,6 +975,68 @@
     };
     const hideBanner = () => { banner.hidden = true; clearTimeout(bannerTimer); };
     let bannerTimer = null;
+
+    /**
+     * 能力边界（真机 2026-10-29 · `:47830`「未能投递：host-unavailable」+「无法自动打开…」连撞两次）。
+     *
+     * 那个实例是**独立进程**（`node src/server/server.mjs`，没有 DSH 宿主），`/api/health` 里
+     * `host.capabilities = null`、`createSession/sendPrompt/openSession` 全 `false` ——
+     * 「投给主会话 / 打开会话 / 派发团队」这类动作在那里**注定失败**，服务端也如实回了 `host-unavailable`。
+     * 但前端从来没读过这个能力位 ⇒ 按钮照常亮着可点，人只会一遍遍撞同一堵墙。
+     *
+     * 口径：**「按钮在」≠「功能可用」**。能力位缺失时**置灰 + 指路**，比让人反复失败更诚实；
+     * 能力位**未知**（health 还没回来 / 老宿主不报）时**不擅自禁用** —— 那时交给服务端如实拒绝。
+     */
+    const hostCaps = () => state.host ?? null;
+    const needsHost = (el, cap) => { if (el) el.dataset.needsHost = cap; return el; };
+    const HOST_CAP_LABEL = {
+      sendPrompt: "投给主会话",
+      openSession: "打开会话",
+      createSession: "新建会话",
+      sessionExists: "改绑/改指会话",
+      listSessions: "列出会话",
+    };
+    /** 兜底表：经诊断动作等"按 label 现造"的按钮无法逐个加标记时，按文案认回来（守卫测试会核对文案仍在）。 */
+    const HOST_BUTTON_LABELS = new Map([
+      ["投给主会话", "sendPrompt"],
+      ["自动生成（交主会话）", "sendPrompt"],
+      ["按意见重生成", "sendPrompt"],
+      ["打开执行会话", "openSession"],
+      ["打开会话", "openSession"],
+      ["派发团队", "createSession"],
+      ["再派发一队", "createSession"],
+      // 会话重建/改绑（2026-10-29 二轮复核补齐）：这两族依赖**不同的**宿主能力，不能混为一谈 ——
+      // 「重建」要建会话（`createSession`）；「改绑/改指到已有会话」只要查得到会话（`sessionExists`），
+      // 而后者的保底价值恰恰在"建会话不可用"时（FR-84），故不跟着 createSession 一起置灰。
+      ["重建并绑定主会话", "createSession"],
+      ["重建并绑定项目主会话", "createSession"],
+      ["重建主会话并把本任务改指过去", "createSession"],
+      ["改绑为主会话", "sessionExists"],
+      ["用当前会话作为项目主会话", "sessionExists"],
+      ["改指到项目主会话（本任务）", "sessionExists"],
+    ]);
+    function applyHostGate() {
+      const caps = hostCaps();
+      if (!caps) return;
+      const mark = (el, cap) => {
+        const missing = !caps[cap];
+        if (el.disabled !== missing) el.disabled = missing;
+        const hint = `当前实例无宿主会话通道（独立进程）：${HOST_CAP_LABEL[cap] ?? "该动作"}不可用 —— 请到 DSH 内的任务工作台操作`;
+        if (missing) { if (el.title !== hint) el.title = hint; } else if (el.title === hint) el.title = "";
+      };
+      for (const el of doc.querySelectorAll("[data-needs-host]")) mark(el, el.dataset.needsHost);
+      for (const el of doc.querySelectorAll("button:not([data-needs-host])")) {
+        const cap = HOST_BUTTON_LABELS.get((el.textContent ?? "").trim());
+        if (cap) { el.dataset.needsHost = cap; mark(el, cap); }
+      }
+    }
+    function renderHostNotice() {
+      const caps = hostCaps();
+      const need = ["sendPrompt", "openSession", "createSession", "sessionExists", "listSessions"];
+      if (!caps || need.every((cap) => caps[cap])) { hostNotice.hidden = true; return; }
+      hostNotice.textContent = "本实例是独立进程，没有 DSH 宿主会话通道：「投给主会话 / 打开会话 / 派发团队」这类动作在这里不可用（相关按钮已置灰）。看板、建卡、改状态、评审、人工收口都照常可用；要投递或派发，请到 DSH 内的任务工作台（地址以 /integrations/taskboard-workbench 结尾的那个页面）操作。";
+      hostNotice.hidden = false;
+    }
     /**
      * FR-84 补口（2026-10-18 真机）：`navigator.clipboard.writeText()` 返回 **Promise**，
      * 权限被拒或非安全上下文时是 **rejection** —— 老写法 `try { writeText(x) } catch {}` **抓不到**，
@@ -1442,6 +1545,28 @@
       fillSelect(fOwner, owners.map((v) => [v, OWNER_LABELS[v] ?? v]), task ? ownerOf(task) : "", "（未指派）");
     }
 
+    /**
+     * 需求条目下拉：新建时按本项目条目补齐（值＝条目 uuid，服务端建卡事务内直接归因）；
+     * 编辑时只回显当前绑定并禁用（改绑走抽屉，口径见 `POST /api/tasks/:ref/attribution`）。
+     * 条目取不到就只留「不归因」一项 —— 不阻断建卡，也不假装已归因。
+     */
+    async function fillRequirementOptions(task) {
+      const SKIP = ["", "（不归因 —— 执行/派发会被归因门拦下）"];
+      if (task) {
+        fRequirement.disabled = true;
+        fillSelect(fRequirement, [[task.requirementId ?? "", task.requirementId ? "（保持现有归因；改绑请用抽屉）" : "（未归因）"]], task.requirementId ?? "");
+        return;
+      }
+      fRequirement.disabled = false;
+      fillSelect(fRequirement, [SKIP], "");
+      try {
+        const payload = await api("GET", `/api/requirements/items?project=${encodeURIComponent(state.projectId)}`);
+        if (editing) return; // 取数期间已改成编辑态 ⇒ 本次填充作废
+        const items = payload?.items ?? [];
+        fillSelect(fRequirement, [SKIP, ...items.map((it) => [it.id, `${it.identifier} · ${it.title ?? ""}`.trim()])], "");
+      } catch { /* 条目取不到：保持「不归因」一项，不阻断建卡 */ }
+    }
+
     async function loadTasks() {
       const params = new URLSearchParams();
       if (state.projectId) params.set("project", state.projectId);
@@ -1582,6 +1707,9 @@
     }
 
     async function bootstrap() {
+      // 先读能力位再渲染：否则首屏会先画出"能点"的按钮、几百毫秒后再置灰（闪一下更困惑）。
+      try { const h = await api("GET", "/api/health"); state.host = h?.host ?? null; } catch { state.host = null; }
+      renderHostNotice();
       const meta = await api("GET", "/api/meta");
       state.statuses = meta.statuses;
       state.priorities = meta.priorities;
@@ -1664,12 +1792,162 @@
       gateRoot.replaceChildren(wrap);
       summary.textContent = "未绑定 · 可申请关联 / 新建项目";
     }
+    // ------------------------------------------- 推进清单 / 待确认记忆（FR-99 / FR-100 · 2026-10-28 实装）
+    // 口径：清单是**纯投影**（服务端每次现算，同状态字节级一致），本视图只负责「给人看见 + 点一下」。
+    // 红线：`accept` 类的「完成」**只能人点** —— 这里提交时 `actor` 固定 `"human"`（确实是人在点），
+    //       服务端仍二次校验（机器调用一律 409 `HUMAN_CONFIRM_REQUIRED`）。
+    const ADVANCE_KIND_LABEL = { decide: "待人定", blocked: "受阻", review: "待评审", accept: "待收口", dispatch: "可开工" };
+    const ADVANCE_ACTION_LABEL = { complete: "完成（人工确认）", approve: "评审通过", changes: "返工", retry: "重试", attribute: "去补归因", choose: "给结论", dispatch: "去派发" };
+
+    async function renderAdvance() {
+      if (!state.projectId) { advanceRoot.replaceChildren(mk("p", "hint", "先在上方选择一个项目")); return; }
+      advanceRoot.replaceChildren(mk("p", "hint", "加载推进清单…"));
+      const q = encodeURIComponent(state.projectId);
+      let list = null;
+      let mem = null;
+      try {
+        list = await api("GET", `/api/projects/${q}/advance?format=block`);
+        mem = await api("GET", `/api/projects/${q}/memory?includeProposed=1`).catch(() => ({ entries: [], recall: { count: 0 } }));
+      } catch (e) {
+        advanceRoot.replaceChildren(mk("p", "hint", `推进清单加载失败：${e.message}${e.code ? `（${e.code}）` : ""}`));
+        return;
+      }
+      const wrap = mk("div", "advance-view");
+
+      /** 一条决定回写（幂等由服务端保证：重复点只会重放，不会二次副作用）。 */
+      const decide = async (item, choice, note = null) => {
+        try {
+          const r = await api("POST", `/api/projects/${q}/advance/${encodeURIComponent(item.id)}/decide`, { choice, note, actor: "human" });
+          showBanner(`已处理 #${item.taskRef}（${choice}）${r?.replay ? " · 幂等重放（此前已生效）" : ""} · 剩余 ${r?.remaining ?? "?"} 项`, "info");
+          void loadTasks();
+          await renderAdvance();
+        } catch (e) {
+          showBanner(`处理失败：${e.message}${e.code ? `（${e.code}）` : ""}`, "error");
+        }
+      };
+
+      const rowActions = (item) => {
+        const box = mk("div", "advance-actions");
+        for (const action of (item.actions ?? [])) {
+          box.appendChild(btn(ADVANCE_ACTION_LABEL[action.code] ?? action.code, () => {
+            if (action.code === "complete") { void decide(item, "complete"); return; }
+            if (action.code === "approve") { void decide(item, "approve"); return; }
+            if (action.code === "retry") { void decide(item, "retry"); return; }
+            if (action.code === "changes") {
+              const note = window.prompt(`#${item.taskRef} 返工说明（会写进事件流）`, "") ?? null;
+              if (note === null) return;
+              void decide(item, "changes", note);
+              return;
+            }
+            if (action.code === "choose") {
+              const conclusion = window.prompt(`#${item.taskRef} 的结论（一句话）`, "") ?? null;
+              if (conclusion === null || !conclusion.trim()) return;
+              void decide(item, conclusion.trim(), item.why);
+              return;
+            }
+            // attribute / dispatch：不在本页代做，指回既有入口（不造第二条写路径）
+            setView(action.code === "attribute" ? "req" : "board");
+            showBanner(action.code === "attribute"
+              ? `#${item.taskRef} 需补需求条目：在需求页挂上条目后，清单会把它从「受阻」移到「可开工」`
+              : `#${item.taskRef} 请在看板上点「启动执行 / 派发团队」`, "info");
+          }, action.code === "complete" ? "primary" : "ghost"));
+        }
+        return box;
+      };
+
+      const p1 = panelEl(`推进清单 · ${list.count} 项`,
+        btn("刷新", () => void renderAdvance()),
+        hostBtn("投给主会话", async () => {
+          try {
+            const r = await api("POST", `/api/projects/${q}/advance/announce`, {});
+            showBanner(r?.delivered
+              ? `已投给主会话（${r.sessionId}）：${r.items} 项待办 + ${r.memory} 条记忆，一段装载块`
+              : `投递失败：${r?.reason ?? "宿主会话通道不可用"}（清单仍可在此页直接处理）`, r?.delivered ? "info" : "error");
+          } catch (e) { showBanner(`投递失败：${e.message}${e.code ? `（${e.code}）` : ""}`, "error"); }
+        }, "primary"));
+      if (list.count === 0) {
+        p1.body.appendChild(mk("p", "hint empty-hint", "当前无待办：没有可派发的卡，也没有等人决定的卡。"));
+      } else {
+        const tally = Object.entries(list.counts ?? {}).filter(([, n]) => n > 0).map(([k, n]) => `${ADVANCE_KIND_LABEL[k] ?? k} ${n}`).join(" · ");
+        p1.body.appendChild(mk("p", "hint", `${tally}（排序：先解锁再推进）`));
+        const rows = mk("div", "advance-rows");
+        for (const item of list.items) {
+          const row = mk("div", "advance-row");
+          row.dataset.kind = item.kind;
+          row.dataset.taskRef = item.taskRef;
+          row.appendChild(mk("span", `advance-kind k-${item.kind}`, ADVANCE_KIND_LABEL[item.kind] ?? item.kind));
+          const mid = mk("div", "advance-mid");
+          const titleLine = mk("div", "advance-title");
+          titleLine.append(mk("span", "advance-ref mono", `#${item.taskRef}`), mk("span", null, item.title));
+          mid.append(titleLine, mk("div", "advance-why", item.why));
+          row.appendChild(mid);
+          row.appendChild(rowActions(item));
+          rows.appendChild(row);
+        }
+        p1.body.appendChild(rows);
+      }
+      wrap.appendChild(p1.panel);
+
+      // 面板 2：待确认记忆（D-M2：agent 只能 propose，人 accept 后才进召回）
+      const entries = mem?.entries ?? [];
+      const proposed = entries.filter((e) => e.confidence === "proposed");
+      const accepted = entries.filter((e) => e.confidence === "accepted");
+      const p2 = panelEl(`待确认记忆 · ${proposed.length} 条`,
+        btn("刷新", () => void renderAdvance()));
+      p2.body.appendChild(mk("p", "hint", `已确认可召回 ${mem?.recall?.count ?? 0} 条 · 待确认 ${proposed.length} 条 · 召回预算 6 条 / 3000 字（超出的不会进装载块）`));
+      if (!proposed.length) {
+        p2.body.appendChild(mk("p", "hint empty-hint", "没有待确认记忆。agent 提议的结论会出现在这里，确认后才会被下一轮装载块召回。"));
+      } else {
+        const rows = mk("div", "advance-rows");
+        for (const entry of proposed) {
+          const row = mk("div", "advance-row");
+          row.dataset.kind = "memory";
+          row.dataset.memoryId = entry.id;
+          row.appendChild(mk("span", `advance-kind k-mem`, entry.kind));
+          const mid = mk("div", "advance-mid");
+          mid.append(mk("div", "advance-title", entry.title), mk("div", "advance-why mono", `${entry.provenance} · ${entry.id}`));
+          row.appendChild(mid);
+          const actions = mk("div", "advance-actions");
+          actions.appendChild(btn("确认入库", async () => {
+            try {
+              await api("POST", `/api/projects/${q}/memory/${encodeURIComponent(entry.id)}/accept`, { actor: "human" });
+              showBanner(`已确认记忆：${entry.title}`, "info");
+              await renderAdvance();
+            } catch (e) { showBanner(`确认失败：${e.message}`, "error"); }
+          }, "primary"));
+          row.appendChild(actions);
+          rows.appendChild(row);
+        }
+        p2.body.appendChild(rows);
+      }
+      if (accepted.length) {
+        const det = mk("details", "advance-accepted");
+        det.appendChild(mk("summary", null, `已确认（可召回）${accepted.length} 条`));
+        const ul = mk("ul", "advance-mem-list");
+        for (const entry of accepted) ul.appendChild(mk("li", "mono", `[${entry.kind}] ${entry.title} — ${entry.provenance}`));
+        det.appendChild(ul);
+        p2.body.appendChild(det);
+      }
+      wrap.appendChild(p2.panel);
+
+      if (list.block) {
+        const det = mk("details", "advance-block");
+        det.appendChild(mk("summary", null, "装载块原文（点「投给主会话」时投的就是这一段）"));
+        const pre = mk("pre", "advance-block-pre", list.block);
+        det.appendChild(pre);
+        wrap.appendChild(det);
+      }
+      advanceRoot.replaceChildren(wrap);
+      summary.textContent = `推进清单 ${list.count} 项 · 待确认记忆 ${proposed.length} 条 · 项目 ${state.projectId || "-"}`;
+    }
+
     function renderCurrentView() {
       if (isBlocked()) { void showBlockedGate(); return; }
       hideGate();
       if (view === "req") void renderRequirements();
       else if (view === "team") void renderTeamView();
       else if (view === "config") void renderConfig();
+      else if (view === "advance") void renderAdvance();
       else void loadTasks();
     }
 
@@ -1684,6 +1962,7 @@
       fVerifyCommand.value = task?.verifyCommand ?? "";
       fLabels.value = task ? task.labels.join(", ") : "";
       fillDialogSelects(task);
+      void fillRequirementOptions(task);
       dialog.showModal();
       fTitle.focus();
     }
@@ -1695,16 +1974,28 @@
      * 真机反馈 2026-10-22：抽屉里点「完成」其实写成功了（事件流有 `status_changed human`），但成功路径只
      * `hideBanner()`、不刷新抽屉 ⇒ 界面看不出任何变化，被读成"点击后无反应"。故改为回传成功与否。
      */
-    async function moveTask(task, status) {
+    async function moveTask(task, status, { skipReview = false } = {}) {
       if (!status) return false;
+      // FR-83 补口（卡 `-162`）：服务端对 `in_review → done` 有评审门。没显式带 `skipReview`
+      // 就是**注定的 409** —— 与其让人点下去才看错误，不如在这里先把话说清楚并交出唯一出口。
+      if (!skipReview && needsReviewSkip(task, status)) {
+        if (!confirmReviewSkip(task)) {
+          showBanner(`已取消：本卡（${task.identifier}）评审未通过，未收口。请先「评审通过」，或再次操作并确认「跳过评审」。`, "info");
+          await loadTasks();
+          return false;
+        }
+        skipReview = true;
+      }
       let ok = true;
       try {
-        await api("PATCH", `/api/tasks/${encodeURIComponent(task.identifier)}`, { version: task.version, status });
+        await api("PATCH", `/api/tasks/${encodeURIComponent(task.identifier)}`, { version: task.version, status, ...(skipReview ? { skipReview: true } : {}) });
         hideBanner();
       } catch (error) {
         ok = false;
         if (error.code === "VERSION_CONFLICT") {
           showBanner(`任务已被他人修改（你读到 v${error.details?.expectedVersion}，当前 v${error.details?.currentVersion}），已刷新。`, "error");
+        } else if (error.code === "REVIEW_NOT_APPROVED") {
+          showBanner(`本卡还在「待验收」且评审未通过：请先在「下一步」区点「评审通过」，再确认完成；确需跳过评审，请在确认框里选「确认」。`, "error");
         } else {
           showBanner(`改状态失败：${error.message}`, "error");
         }
@@ -1756,10 +2047,22 @@
 
     /**
      * 拖拽落点提交：**走既有 PATCH 入口**（`status` + `boardPosition`），不新增任何旁路 ——
-     * 授权门 / 归因门 / 人工校验门 / 治理门全在 `store.updateTask` 里，与「上一列 / 下一列」完全同门。
+     * 评审门 / 授权门 / 归因门 / 人工校验门 / 治理门全在 `store.updateTask` 里，与「上一列 / 下一列」完全同门。
+     *
+     * FR-83 补口（卡 `-162`）：拖拽是把未评审卡**静默收口**的最后一条路（卡片「→」/ 抽屉「下一列」已由 -158
+     * 收敛）。这里在**发请求之前**用同一份谓词 `needsReviewSkip` 问一次人 —— 不确认就**一个字段都不提交**
+     * （卡留在「待验收」），确认才带 `skipReview: true`。服务端仍是唯一裁决者，前端只是不制造静默旁路。
      */
     async function dropTask(task, status, anchor) {
       const body = { version: task.version };
+      const crossingDone = status !== task.status && needsReviewSkip(task, status);
+      if (crossingDone) {
+        if (!confirmReviewSkip(task)) {
+          showBanner(`已取消拖拽：本卡（${task.identifier}）评审未通过，未收口。请先「评审通过」，或再次拖动并确认「跳过评审」。`, "info");
+          return false;
+        }
+        body.skipReview = true;
+      }
       if (status !== task.status) body.status = status;
       if (anchor !== null) body.boardPosition = anchor;
       if (body.status === undefined && body.boardPosition === undefined) return true; // 原地放下：什么都不用做
@@ -1769,7 +2072,9 @@
       } catch (error) {
         showBanner(error.code === "VERSION_CONFLICT"
           ? `任务已被他人修改（你读到 v${error.details?.expectedVersion}，当前 v${error.details?.currentVersion}），已刷新。`
-          : `拖拽失败：${error.message}${error.code ? `（${error.code}）` : ""}`, "error");
+          : error.code === "REVIEW_NOT_APPROVED"
+            ? `拖拽被拒：本卡还在「待验收」且评审未通过。请先「评审通过」，或重新拖动并在确认框里选「确认」以跳过评审。`
+            : `拖拽失败：${error.message}${error.code ? `（${error.code}）` : ""}`, "error");
         await loadTasks();
         return false;
       }
@@ -1821,6 +2126,9 @@
         priority: fPriority.value,
         owner: fOwner.value === "" ? null : fOwner.value,
         labels: labelsFromForm(),
+        // 归因随建卡事务一次写入（服务端 `POST /api/tasks` 读 `requirementId`）；
+        // 编辑态不在这里带 —— 改绑有专门入口，避免「改标题顺手把归属改了」。
+        requirementId: editing ? undefined : (fRequirement.value || undefined),
       };
       try {
         if (editing) await api("PATCH", `/api/tasks/${encodeURIComponent(editing.identifier)}`, { ...body, version: editing.version });
@@ -1928,6 +2236,9 @@
       }
     });
 
+    // 能力门是**渲染后**才知道要不要置灰的（区块/抽屉随时新建）⇒ 观察 DOM 变化，把新出现的宿主依赖按钮一并置灰。
+    // 只观察 childList（不观察 attributes），故 `disabled/title` 的写入不会再触发自己。
+    try { new MutationObserver(() => { try { applyHostGate(); } catch { /* ignore */ } }).observe(doc.body, { childList: true, subtree: true }); } catch { /* ignore */ }
     bootstrap().catch((error) => showBanner(`初始化失败：${error.message}`, "error"));
 
     // FR-41：进度可见（SSE 失效信号 → 重取）
@@ -2012,6 +2323,7 @@
       reqScroll.hidden = next !== "req";
       teamScroll.hidden = next !== "team";
       configScroll.hidden = next !== "config";
+      advanceScroll.hidden = next !== "advance";
       toolbar.hidden = false; // 项目选择器在所有视图可见：明确"当前配置/操作的是哪个项目"
       newTask.hidden = next !== "board"; // 真机 2026-10-23：「新建任务」只在看板视图有意义
       for (const [name, button] of Object.entries(navButtons)) button.classList.toggle("is-active", name === next);
@@ -2021,6 +2333,7 @@
     reqToggle.addEventListener("click", () => setView("req"));
     teamToggle.addEventListener("click", () => setView("team"));
     configToggle.addEventListener("click", () => setView("config"));
+    advanceToggle.addEventListener("click", () => setView("advance"));
 
     // ------------------------------------------------------------ 通用小组件
     function fmtTime(value) {
@@ -2042,6 +2355,11 @@
       node.type = "button";
       node.addEventListener("click", onClick);
       return node;
+    }
+    /** 依赖宿主会话通道的按钮：创建时就打上能力标记（`applyHostGate` 据此置灰）。 */
+    function hostBtn(label, onClick, cls = "ghost", cap) {
+      // 能力位缺省时按文案查兜底表（`打开执行会话` ⇒ openSession），查不到才落到 sendPrompt。
+      return needsHost(btn(label, onClick, cls), cap ?? HOST_BUTTON_LABELS.get(label) ?? "sendPrompt");
     }
     function panelEl(title, ...actions) {
       const panel = mk("section", "panel");
@@ -2582,7 +2900,12 @@
     }
 
     // ------------------------------------------------------------ 需求视图（文档 + 条目 + 详情）
-    const reqState = { docId: null, itemId: null, editingDoc: false, candidates: [], filter: "all", q: "", selected: new Set() };
+    const reqState = {
+      docId: null, itemId: null, editingDoc: false, candidates: [], filter: "all", q: "", selected: new Set(),
+      // 卡 `-160` 收尾（2026-10-27）：列表内「完成度结论」的懒取缓存 —— identifier → { at, payload }。
+      // `completionInflight` 去重在途请求（同一行不重复打），`focusCompletion` 是「点胶囊 ⇒ 抽屉滚到完成度段」的一次性定位标记。
+      completion: new Map(), completionInflight: new Set(), focusCompletion: false,
+    };
     const AI_PROMPT = "请阅读「需求文档」中的资料，把项目需求梳理成「需求条目」：\n- 每条：标题 + 说明 + 验收要点 + 优先级；\n- 归并同类、剔除纯资料索引项；\n- 产出候选项，供人工逐条确认。";
     const TEAM_ENGINES = [
       { id: "official", label: "DSH 官方自带（智能体团队/编队）", tools: "spawn_teammate · team_task_*", note: "由 Lead 用 spawn_teammate 召集成员；编队 UI 是它" },
@@ -2688,6 +3011,88 @@
     /** FR-96：一键展开 / 收起本区块内的所有文件夹。 */
     function setAllFolders(sectionEl, open) {
       for (const d of sectionEl.querySelectorAll("details.req-folder")) d.open = Boolean(open);
+    }
+
+    // ---- 卡 `-160` 收尾（2026-10-27）：需求条目**列表内**的「完成度结论」
+    // 验收原文第二条：「Given 任一条目，Then 列表内**直接可见**其状态与**完成度结论入口**，不必逐条打开详情」。
+    // 上一轮只把终态做显式化，完成度仍只在抽屉里 ⇒ 本轮把结论搬到行上。
+    // 取数**复用既有只读端点** `GET /api/requirements/items/:ref/completion`（FR-91 已落地）——
+    // **不新增取数通道**、不改后端：逐行懒取 + TTL 缓存 + 并发上限 + 在途去重，取到后**原地更新**该行胶囊
+    // （不整表重渲染，避免闪烁、滚动位置丢失与请求风暴）。
+    const REQ_COMPLETION_TTL = 20000;         // 缓存新鲜度：20s 内复用，过期只重取不先清空（先显示旧值再刷新）
+    const REQ_COMPLETION_CONCURRENCY = 4;     // 并发上限：122 条真机数据下也不会一次打满
+    /** 一句话结论（压缩到能放进一行定宽胶囊；完整 `text` 进 title / 抽屉）。 */
+    const reqCompletionLabel = (c) => {
+      if (!c) return "…";
+      if (c.verdict === "no-tasks") return "无任务";
+      if (c.ready) return "可收口";
+      if (c.verdict === "blocked") return `受阻 ${c.counts?.blocked ?? 0}`;
+      if (c.verdict === "in-review") return `待验收 ${c.counts?.in_review ?? 0}`;
+      return `${c.closed ?? 0}/${c.total ?? 0} 收口`;
+    };
+    /** 四档配色类名（与 `is-done` / `is-closed` 的终态色同一套变量）。 */
+    const reqVerdictClass = (c) => (c?.ready ? "is-ready"
+      : c?.verdict === "blocked" ? "is-blocked"
+        : c?.verdict === "in-review" ? "is-review"
+          : c?.verdict === "no-tasks" ? "is-none" : "is-progress");
+    const reqCompletionChip = (it, c) => {
+      const chip = mk("button", `chip req-completion-chip ${reqVerdictClass(c)}${c ? "" : " is-loading"}`);
+      chip.type = "button";
+      chip.dataset.reqCompletion = it.identifier;
+      chip.textContent = reqCompletionLabel(c);
+      if (c) chip.dataset.verdict = c.verdict;
+      chip.title = c
+        ? `完成度：${c.text}（点此打开详情看关联任务）`
+        : "完成度读取中…（复用既有 GET /api/requirements/items/:ref/completion，不新增取数通道）";
+      chip.setAttribute("aria-label", `完成度：${reqCompletionLabel(c)}`);
+      chip.addEventListener("click", (e) => {
+        e.stopPropagation();   // 行点击也会开抽屉，这里显式先定位到「关联任务完成情况」
+        reqState.itemId = it.identifier;
+        reqState.focusCompletion = true;
+        void renderRequirements();
+      });
+      return chip;
+    };
+    const reqCompletionNode = (identifier) => {
+      const escaped = window.CSS?.escape ? window.CSS.escape(identifier) : String(identifier).replace(/["\\]/g, "\\$&");
+      return reqRoot.querySelector(`.req-completion-chip[data-req-completion="${escaped}"]`);
+    };
+    /** 原地刷新**一行**的完成度胶囊（顺带写回缓存）。 */
+    const paintReqCompletion = (it, payload) => {
+      if (!payload) return;
+      reqState.completion.set(it.identifier, { at: Date.now(), payload });
+      const chip = reqCompletionNode(it.identifier);
+      if (!chip) return;   // 列表已重渲染 ⇒ 新行会从缓存直接画出，无需在这里补
+      chip.textContent = reqCompletionLabel(payload);
+      chip.dataset.verdict = payload.verdict;
+      chip.className = `chip req-completion-chip ${reqVerdictClass(payload)}`;
+      chip.title = `完成度：${payload.text}（点此打开详情看关联任务）`;
+      chip.setAttribute("aria-label", `完成度：${reqCompletionLabel(payload)}`);
+    };
+    /** 按并发上限逐行懒取；每条取完即 `onChange()`（用于面板头「可收口 N」计数）。 */
+    async function hydrateReqCompletions(items, onChange) {
+      const queue = items.filter((it) => {
+        const hit = reqState.completion.get(it.identifier);
+        const fresh = hit && Date.now() - hit.at < REQ_COMPLETION_TTL;
+        return !fresh && !reqState.completionInflight.has(it.identifier);
+      });
+      if (!queue.length) { onChange?.(); return; }
+      for (const it of queue) reqState.completionInflight.add(it.identifier);
+      let cursor = 0;
+      const worker = async () => {
+        while (cursor < queue.length) {
+          const it = queue[cursor++];
+          try {
+            const payload = await api("GET", `/api/requirements/items/${encodeURIComponent(it.identifier)}/completion`);
+            paintReqCompletion(it, payload);
+          } catch { /* 单条失败不打断整页：胶囊留「…」，点开详情会重新取（详情端点自带 completion） */ }
+          finally {
+            reqState.completionInflight.delete(it.identifier);
+            onChange?.();
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(REQ_COMPLETION_CONCURRENCY, queue.length) }, () => worker()));
     }
 
     async function renderRequirements() {
@@ -2805,24 +3210,42 @@
         const openCount = countByStatus("open");
         const doneCount = countByStatus("done");
         const closedCount = countByStatus("closed");
+        // 卡 `-160` 收尾：面板头再加一条「可收口 N」—— 完成度结论的**面板级**入口（行内另有逐条胶囊）。
+        const readyCount = mk("span", "hint req-ready-count");
+        readyCount.textContent = "完成度取数 0/0";
         const reqCounts = mk("span", "hint req-counts");
         reqCounts.append(
           mk("span", "req-count req-count-draft", `待确认 ${draftCount}`),
           mk("span", "req-count req-count-open", `在办 ${openCount}`),
           mk("span", "req-count req-count-done", `已完成 ${doneCount}`),
           mk("span", "req-count req-count-closed", `已关闭 ${closedCount}`),
+          readyCount,
         );
         const { panel: itemPanel, body: itemBody } = panelEl(`需求条目（${allItems.length}）`, reqCounts);
         const newTitle = mk("input");
         newTitle.type = "text";
         newTitle.placeholder = "新条目标题";
         const createRow = mk("div", "field-inline");
-        createRow.append(newTitle, btn("新建条目", async () => {
+        // 真机批注 2026-10-28「新建条目点击无效」：此前标题为空时**静默 return** —— 点了没反应、
+        // 也没有任何提示，被读成按钮坏了。口径：空标题必须**当场说话**并把焦点送回输入框；
+        // 另外支持回车提交（填完标题顺手敲回车是常态）。
+        const createItem = async () => {
           const title = newTitle.value.trim();
-          if (!title) return;
-          try { await api("POST", "/api/requirements/items", { projectId: state.projectId, docId: reqState.docId, title }); showBanner("已新建需求条目", "info"); await renderRequirements(); }
-          catch (e) { showBanner(`新建失败：${e.message}`, "error"); }
-        }, "primary"));
+          if (!title) { showBanner("请先输入条目标题，再点「新建条目」", "error"); newTitle.focus(); return; }
+          try {
+            await api("POST", "/api/requirements/items", { projectId: state.projectId, docId: reqState.docId, title });
+            newTitle.value = "";
+            showBanner(`已新建需求条目「${title}」`, "info");
+            await renderRequirements();
+          } catch (e) { showBanner(`新建失败：${e.message}`, "error"); }
+        };
+        const createBtn = btn("新建条目", createItem, "primary");
+        createRow.append(newTitle, createBtn);
+        newTitle.addEventListener("keydown", (event) => {
+          if (event.key !== "Enter") return;
+          event.preventDefault();
+          void createItem();
+        });
         itemBody.appendChild(createRow);
         const filt = mk("select");
         // FR-91：新增「已完成 / 已关闭」——需求层此前没有"做完了没有"的落点
@@ -2866,6 +3289,24 @@
         const normQ = (s) => String(s ?? "").toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]+/g, "");
         const visible = allItems.filter((it) => (reqState.filter === "all" || it.status === reqState.filter)
           && (!reqState.q || normQ(`${it.identifier} ${it.title}`).includes(normQ(reqState.q))));
+        /** 面板头「可收口 N / 完成度取数 M/N」：随懒取进度刷新（旧闭包在重渲染后自动作废）。 */
+        const refreshReadyCount = () => {
+          if (!readyCount.isConnected) return;
+          const total = visible.length;
+          const readyIds = [];
+          let fetched = 0;
+          for (const it of visible) {
+            const hit = reqState.completion.get(it.identifier);
+            if (!hit) continue;
+            fetched += 1;
+            // 已达完成标准且**尚未**收口的才算「可收口」；已 done / closed 的不再计入（否则数字没意义）。
+            if (hit.payload?.ready && it.status !== "done" && it.status !== "closed") readyIds.push(it.identifier);
+          }
+          readyCount.textContent = fetched === total ? `可收口 ${readyIds.length}` : `完成度取数 ${fetched}/${total}`;
+          readyCount.title = readyIds.length
+            ? `关联任务已全部收口、可人工判「已完成」的需求：${readyIds.join("、")}（自动只给建议，完成 / 关闭仍由人点）`
+            : "逐行从既有 GET /api/requirements/items/:ref/completion 取数：关联任务全部收口的需求会显示「可收口」";
+        };
         // 批量工具条（默认多选 → 批量生成任务）
         const bulkBar = mk("div", "field-inline");
         bulkBar.append(
@@ -2875,22 +3316,30 @@
           btn("批量确认", async () => {
             const ids = [...reqState.selected].filter((id) => allItems.find((x) => x.identifier === id && x.status === "draft"));
             if (!ids.length) { showBanner("请先勾选「待确认」条目", "error"); return; }
-            for (const id of ids) await api("PATCH", `/api/requirements/items/${encodeURIComponent(id)}`, { status: "open" }).catch(() => {});
-            showBanner(`已确认 ${ids.length} 条`, "info"); await renderRequirements();
+            // 真机批注 2026-10-28「检查所有失效按钮」：批量动作此前**吞掉每条的错误**却照报总数，
+            // 一条都没成功也显示「已确认 N 条」—— 比报错更坏。改为真实计数并区分色。
+            let ok = 0; const failed = [];
+            for (const id of ids) { try { await api("PATCH", `/api/requirements/items/${encodeURIComponent(id)}`, { status: "open" }); ok += 1; } catch (e) { failed.push(`${id}:${e.message}`); } }
+            showBanner(failed.length ? `已确认 ${ok} 条，失败 ${failed.length} 条（首条：${failed[0]}）` : `已确认 ${ok} 条`, failed.length ? "error" : "info");
+            await renderRequirements();
           }),
           btn("批量生成任务", async () => {
             const ids = [...reqState.selected].filter((id) => { const x = allItems.find((y) => y.identifier === id); return x && x.status !== "draft"; });
             if (!ids.length) { showBanner("请先勾选「已确认」条目", "error"); return; }
-            let n = 0;
-            for (const id of ids) { const x = allItems.find((y) => y.identifier === id); try { await api("POST", `/api/requirements/items/${encodeURIComponent(id)}/split`, { tasks: [{ title: x.title, kind: "work" }] }); n += 1; } catch (_) { /* 跳过 */ } }
-            showBanner(`已批量生成 ${n} 个看板任务（待办池，需授权开工）`, "info"); setView("board");
+            let n = 0; const failed = [];
+            for (const id of ids) { const x = allItems.find((y) => y.identifier === id); try { await api("POST", `/api/requirements/items/${encodeURIComponent(id)}/split`, { tasks: [{ title: x.title, kind: "work" }] }); n += 1; } catch (e) { failed.push(`${id}:${e.message}`); } }
+            showBanner(failed.length ? `已生成 ${n} 个任务，失败 ${failed.length} 条（首条：${failed[0]}）` : `已批量生成 ${n} 个看板任务（待办池，需授权开工）`, failed.length ? "error" : "info");
+            setView("board");
           }, "primary"),
           btn("批量删除", async () => {
             const ids = [...reqState.selected];
             if (!ids.length) { showBanner("请先勾选条目", "error"); return; }
             if (!window.confirm(`删除 ${ids.length} 条需求条目？`)) return;
-            for (const id of ids) await api("DELETE", `/api/requirements/items/${encodeURIComponent(id)}`).catch(() => {});
-            reqState.selected.clear(); showBanner(`已删除 ${ids.length} 条`, "info"); await renderRequirements();
+            let ok = 0; const failed = [];
+            for (const id of ids) { try { await api("DELETE", `/api/requirements/items/${encodeURIComponent(id)}`); ok += 1; } catch (e) { failed.push(`${id}:${e.message}`); } }
+            reqState.selected.clear();
+            showBanner(failed.length ? `已删除 ${ok} 条，失败 ${failed.length} 条（首条：${failed[0]}）` : `已删除 ${ok} 条`, failed.length ? "error" : "info");
+            await renderRequirements();
           }),
         );
         itemBody.appendChild(bulkBar);
@@ -2911,10 +3360,13 @@
           // 卡 `-160`：状态抽成**独立定宽一列**（`req-status-chip`），不再和「来源 / 不可行」挤在同一排小胶囊里 ——
           // 状态是这一行最该先读到的东西，且四态各有自己的色（此前 `closed` 走默认灰胶囊，与来源胶囊看不出区别）。
           const statusChip = mk("span", `chip req-status-chip is-${it.status}`, statusTxt);
+          // 卡 `-160` 收尾：**完成度结论**（关联任务的收口情况）也做成独立一列 —— 先画缓存（有就立刻可读），
+          // 没有则「…」，由列表渲染后的 hydrateReqCompletions 原地补上（不整表重渲染）。
+          const completionChip = reqCompletionChip(it, reqState.completion.get(it.identifier)?.payload ?? null);
           const meta = mk("div", "req-item-meta");
           meta.append(pill(srcLabel, it.source === "intake" ? "" : "accent"));
           if (it.feasibility === "infeasible") meta.append(pill("不可行", "danger"));
-          li.append(main, statusChip, meta);
+          li.append(main, statusChip, completionChip, meta);
           const acts = mk("div", "req-item-actions");
           if (it.status === "draft") acts.appendChild(btn("确认", (e) => { e.stopPropagation(); void (async () => { try { await api("PATCH", `/api/requirements/items/${encodeURIComponent(it.identifier)}`, { status: "open" }); await renderRequirements(); } catch (err) { showBanner(err.message, "error"); } })(); }));
           // FR-91：需求终态由**人**点（自动只给建议，见详情页「关联任务完成情况」）
@@ -2936,6 +3388,10 @@
         }
         if (visible.length === 0) itemBody.appendChild(mk("div", "empty-note", allItems.length ? "当前筛选无条目" : "暂无条目"));
         itemBody.appendChild(ul);
+        // 卡 `-160` 收尾：行内完成度逐条懒取（**复用既有** `/completion` 端点）+ 面板头「可收口」计数。
+        // 先画一次计数（缓存里已有的立刻体现），再异步补齐；每取到一条原地刷新对应的胶囊与计数。
+        refreshReadyCount();
+        void hydrateReqCompletions(visible, refreshReadyCount);
 
         // —— 详情面板
         // 2026-10-27 真机批注：「需求条目」方块改列表、**点一条用抽屉看详情**（不再常驻占位）。
@@ -2947,10 +3403,73 @@
         const detailClose = mk("button", "ghost", "✕");
         detailClose.title = "关闭";
         detailClose.addEventListener("click", () => { reqState.itemId = null; void renderRequirements(); });
-        detailHead.append(detailHeadMain, detailClose);
+        /* 2026-10-28 真机批注（「详情太过靠右，内容过长不便查看」）：需求详情抽屉此前**只有 560px
+           死宽、没有拖拽、没有全屏**，长描述只能一行一行挤。这里给它补上与任务抽屉同款的
+           「左缘拖拽调宽 + 一键全屏」，宽度落到行内 `--drawer-width`，记忆键**独立**
+           （`tb.reqDrawer.width`）—— 两个抽屉各自记各自的宽度，互不覆盖。 */
+        const REQ_DRAWER_WIDTH_KEY = "tb.reqDrawer.width";
+        const REQ_DRAWER_WIDTH_FULL = 0;
+        const readReqDrawerWidth = () => {
+          try {
+            const raw = drawerWin?.localStorage?.getItem(REQ_DRAWER_WIDTH_KEY);
+            if (raw === null || raw === undefined || raw === "") return null;
+            const value = Number(raw);
+            return Number.isFinite(value) && value >= REQ_DRAWER_WIDTH_FULL ? value : null;
+          } catch (_) { return null; }
+        };
+        const writeReqDrawerWidth = (value) => {
+          try {
+            if (value === null) drawerWin?.localStorage?.removeItem(REQ_DRAWER_WIDTH_KEY);
+            else drawerWin?.localStorage?.setItem(REQ_DRAWER_WIDTH_KEY, String(value));
+          } catch (_) { /* 存储不可用只丢记忆，不影响布局 */ }
+        };
+        const detailFull = mk("button", "ghost", "全屏");
+        detailFull.type = "button";
+        detailFull.title = "详情铺满窗口（再点一下还原为默认宽度）";
+        const syncReqDrawerWidth = () => {
+          const stored = readReqDrawerWidth();
+          if (stored === null) detailPanel.style.removeProperty("--drawer-width");
+          else if (stored === REQ_DRAWER_WIDTH_FULL) detailPanel.style.setProperty("--drawer-width", `${drawerMaxWidth()}px`);
+          else detailPanel.style.setProperty("--drawer-width", `${clampDrawerWidth(stored)}px`);
+          detailFull.textContent = stored === REQ_DRAWER_WIDTH_FULL ? "还原" : "全屏";
+        };
+        detailFull.addEventListener("click", () => {
+          const cur = readReqDrawerWidth();
+          const nowFull = cur !== REQ_DRAWER_WIDTH_FULL;
+          writeReqDrawerWidth(nowFull ? REQ_DRAWER_WIDTH_FULL : null);
+          syncReqDrawerWidth();
+        });
+        const reqDrawerResize = mk("div", "tb-drawer-resize");
+        reqDrawerResize.title = "拖动调整详情宽度（双击还原）";
+        reqDrawerResize.addEventListener("pointerdown", (event) => {
+          if (!event || event.button !== 0) return;
+          const startX = event.clientX;
+          const startWidth = detailPanel.getBoundingClientRect?.().width ?? 0;
+          detailPanel.classList.add("dragging");
+          try { reqDrawerResize.setPointerCapture?.(event.pointerId); } catch (_) { /* 捕获失败也能靠层内事件继续 */ }
+          const onMove = (moveEvent) => {
+            detailPanel.style.setProperty("--drawer-width", `${clampDrawerWidth(startWidth + (startX - moveEvent.clientX))}px`);
+          };
+          const onUp = () => {
+            reqDrawerResize.removeEventListener("pointermove", onMove);
+            reqDrawerResize.removeEventListener("pointerup", onUp);
+            reqDrawerResize.removeEventListener("pointercancel", onUp);
+            detailPanel.classList.remove("dragging");
+            const finalWidth = Math.round(detailPanel.getBoundingClientRect?.().width ?? 0);
+            writeReqDrawerWidth(finalWidth >= drawerMaxWidth() - 1 ? REQ_DRAWER_WIDTH_FULL : clampDrawerWidth(finalWidth));
+            syncReqDrawerWidth();
+          };
+          reqDrawerResize.addEventListener("pointermove", onMove);
+          reqDrawerResize.addEventListener("pointerup", onUp);
+          reqDrawerResize.addEventListener("pointercancel", onUp);
+          event.preventDefault?.();
+        });
+        reqDrawerResize.addEventListener("dblclick", () => { writeReqDrawerWidth(null); syncReqDrawerWidth(); });
+        syncReqDrawerWidth();
+        detailHead.append(detailHeadMain, mk("div", "spacer"), detailFull, detailClose);
         const detailBody = mk("div", "tb-drawer-body");
         detailBody.id = "tb-req-detail";
-        detailPanel.append(detailHead, detailBody);
+        detailPanel.append(reqDrawerResize, detailHead, detailBody);
 
         box.append(docPanel, itemPanel);
         reqRoot.replaceChildren(box, reqBackdrop, detailPanel);
@@ -2970,10 +3489,17 @@
     async function renderItemDetail(identifier) {
       const host = reqRoot.querySelector("#tb-req-detail");
       if (!host) return;
+      // 卡 `-160` 收尾：点行内「完成度胶囊」进来时，允许这一次渲染滚到「关联任务完成情况」段。
+      // 一次性消费（避免之后任何一次详情刷新都抢滚动位置）。
+      const focusCompletion = reqState.focusCompletion;
+      reqState.focusCompletion = false;
       host.replaceChildren(mk("p", "hint", "加载条目…"));
       try {
         const ref = encodeURIComponent(identifier);
         const { item, completion } = await api("GET", `/api/requirements/items/${ref}`);
+        // 详情端点本身就带 completion（既有 FR-91 口径，不改后端）—— 顺带回写列表缓存，
+        // 免得刚看完详情回到列表还读到 20s 前的旧结论。
+        if (completion) reqState.completion.set(identifier, { at: Date.now(), payload: completion });
         const graph = await api("GET", `/api/requirements/items/${ref}/graph`).catch(() => ({ nodes: [], edges: [] }));
         host.replaceChildren();
         const head = mk("div", "req-detail-head");
@@ -3021,7 +3547,7 @@
             if (t.reviewState) li.appendChild(pill(`评审:${t.reviewState}`, t.reviewState === "changes_requested" ? "warn" : "accent"));
             const openT = mk("button", "ghost", "打开任务");
             openT.type = "button";
-            openT.addEventListener("click", () => { const fresh = (state.tasks ?? []).find((x) => x.identifier === t.identifier); if (fresh) void openTaskDetail(fresh); else showBanner("该任务不在当前列表（可能已归档）", "error"); });
+            openT.addEventListener("click", () => void openTaskByRef(t.identifier));
             li.appendChild(openT);
             tul.appendChild(li);
           }
@@ -3043,7 +3569,10 @@
           }
           sec2.appendChild(hbar);
           sec2.appendChild(mk("p", "hint", "红线：自动只给结论，需求的「完成 / 关闭」由人确认（与任务「完成只能人点」同口径）。"));
+          // 卡 `-160` 收尾：行内「完成度胶囊」即这条结论的**入口** —— 点它开抽屉并直接定位到这一段。
+          sec2.dataset.reqSection = "completion";
           host.appendChild(sec2);
+          if (focusCompletion) requestAnimationFrame(() => sec2.scrollIntoView({ block: "start" }));
         }
 
         const feas = mk("section", "req-section");
@@ -3063,35 +3592,119 @@
         if (item.feasibilityReason) feas.appendChild(mk("p", "hint", `结论说明：${item.feasibilityReason}`));
         host.appendChild(feas);
 
+        /* 2026-10-28 真机批注：「生成看板任务（分拆）」此前**只有人工 textarea** ——
+           没有建议、没有草稿、没有修订回路。按人拍口径 **方案 C（走项目主会话）** 补两件事：
+           ① 「自动生成（交主会话）」＝ 投一条指令给项目主会话，让它先出**建议**（不建卡）；
+           ② 「按意见重生成」＝ 带上上一版草稿 + 人的修改意见再投一次（同一端点，无状态）；
+           ③ 人把主会话回帖里的任务行粘回下面的框 → 点「生成任务 + 依赖」才**真落库**。
+           顺带修掉两个"界面承诺 ≠ 实现"：`kind` 不再被丢（落标签 `kind/work|review`）、
+           依赖列终于有输入口（`依赖` 填前置**序号**，多个用逗号）。 */
         const split = mk("section", "req-section req-split-collapsed");
         split.appendChild(mk("h3", null, "生成看板任务（分拆）"));
+        const splitHint = mk("p", "hint", "草稿 → 修订 → 落库：先让主会话出建议，改到满意再粘回来生成。生成的是「待办池」卡，另需授权开工。");
+        split.appendChild(splitHint);
         const ta = mk("textarea", "req-editor");
-        ta.placeholder = "每行一个任务：标题 | 负责人(planner/engineer/tester/reviewer/archivist，可空) | kind(work/review，可空)";
+        ta.placeholder = "每行一个任务：序号 | 标题 | 负责人(planner/engineer/tester/reviewer/archivist，可空) | kind(work/review，可空) | 依赖(前置序号，如 1,2，可空)\n例：1 | 补抽屉宽度 | engineer | work |\n    2 | 真机复验 | tester | review | 1";
         split.appendChild(ta);
+        const feedback = mk("textarea", "req-editor");
+        feedback.placeholder = "修改意见（可选）：例如「测试那条拆细成单测+真机两行」「去掉归档任务」「依赖要显式写出来」";
+        split.appendChild(feedback);
+        const splitActions = mk("div", "btn-row");
+        let lastLines = [];
+        const splitAsk = async (kindLabel) => {
+          const rows = ta.value.split("\n").map((l) => l.trim()).filter(Boolean);
+          const note = feedback.value.trim();
+          if (kindLabel === "revise" && !note) { showBanner("先写一句修改意见，再点「按意见重生成」", "error"); return; }
+          try {
+            const r = await api("POST", `/api/requirements/items/${ref}/split-ask`, {
+              feedback: note || null,
+              previous: kindLabel === "revise" ? (lastLines.length ? lastLines : rows) : rows,
+            });
+            if (!r.delivered) { showBanner(`没投出去（${r.reason ?? "原因不明"}）：${r.nextAction ?? ""}`, "error"); return; }
+            lastLines = rows; // 下一轮「按意见重生成」把它作为"上一版草稿"带过去
+            showBanner(`已投给项目主会话（${String(r.sessionId ?? "").slice(0, 8)}…）：去会话看建议，把其中的任务行粘回上面的框，再点「生成任务 + 依赖」落库。`, "info");
+          } catch (e) {
+            // 新端点是**服务端路由**：宿主未重载时这里会 404（旧插件不认识这条路径）。
+            // 如实指路，而不是让人对着「投递失败：HTTP 404」猜。
+            const notFound = e.code === "NOT_FOUND" || /HTTP 404|not found/i.test(String(e.message ?? ""));
+            showBanner(notFound
+              ? "当前运行的插件还没有这个端点（需要重载宿主插件后才生效）。可直接把修改意见写在聊天里让主会话协助拆分，或找队长做一次宿主重载。"
+              : `投递失败：${e.message}`, notFound ? "info" : "error");
+          }
+        };
+        splitActions.append(
+          hostBtn("自动生成（交主会话）", () => void splitAsk("draft"), "primary"),
+          hostBtn("按意见重生成", () => void splitAsk("revise")),
+        );
+        split.appendChild(splitActions);
         split.appendChild(btn("生成任务 + 依赖", async () => {
-          const tasks = ta.value.split("\n").map((line) => line.trim()).filter(Boolean).map((line) => {
-            const [title, owner, kind] = line.split("|").map((s) => (s ?? "").trim());
-            return { title, owner: owner || null, kind: kind || "work" };
-          });
+          const parsed = parseSplitLines(ta.value);
+          const tasks = parsed
+            ? parsed.tasks
+            : ta.value.split("\n").map((line) => line.trim()).filter(Boolean).map((line) => {
+              const [title, owner, kind] = line.split("|").map((s) => (s ?? "").trim());
+              return { title, owner: owner || null, kind: kind || null };
+            });
           if (!tasks.length) { showBanner("请先填写任务行", "error"); return; }
+          if (parsed && parsed.problems.length) showBanner(`有 ${parsed.problems.length} 处没解析上（已按能认的生成）：${parsed.problems.slice(0, 3).join("；")}`, "error");
           try { const r = await api("POST", `/api/requirements/items/${ref}/split`, { tasks }); showBanner(`已生成 ${(r.tasks || []).length} 个任务：${(r.tasks || []).map((t) => t.identifier).join("、")}（待办池，需授权开工）`, "info"); await renderItemDetail(identifier); }
           catch (e) { showBanner(`分拆失败：${e.message}`, "error"); }
         }, "primary"));
         host.appendChild(split);
 
         host.appendChild(mk("h3", null, `任务 DAG（${graph.nodes.length} 节点 / ${graph.edges.length} 依赖）`));
+        if (graph.nodes.length > 0) host.appendChild(mk("p", "hint", "按依赖顺序排列（前置在上）；点任意节点打开该任务，悬停前置胶囊可看原因"));
         const dag = mk("div", "req-dag");
         for (const n of graph.nodes) {
-          const node = mk("div", "req-node");
-          node.append(statusPill(n.status), mk("span", null, `${n.identifier} ${n.title}`));
+          // 真机批注 2026-10-29：DAG 节点原来只是纯展示的 div（"受阻 dag 提醒点不进去"）——
+          // 与「关联任务完成情况」里那行是同一张卡，这里必须同样能打开；用 button 顺带拿到键盘可达。
+          const node = mk("button", "req-node");
+          node.type = "button";
+          node.title = `打开任务 ${n.identifier}`;
+          node.addEventListener("click", () => void openTaskByRef(n.identifier));
+          node.append(statusPill(n.status), mk("span", "req-node-title", `${n.identifier} ${n.title}`));
+          // 二轮优化（同日）：「⛔ 受阻」四个字只说明"卡住了"，不说明"卡在谁身上"——
+          // 把前置写成节点上的胶囊，原因进 title（不占行宽，也不丢信息）。
+          const blockedBy = Array.isArray(n.blockedBy) ? n.blockedBy : [];
+          if (blockedBy.length) {
+            const chip = mk("span", "req-node-blocked-by", `⬅ 前置 ${blockedBy.map((b) => b.identifier).join("、")}`);
+            chip.title = blockedBy.map((b) => `${b.identifier} ${b.title ?? ""}${b.reason ? `（${b.reason}）` : ""}`).join("\n");
+            node.appendChild(chip);
+          }
           dag.appendChild(node);
         }
-        for (const e of graph.edges) dag.appendChild(mk("div", "req-edge", `${e.blocker} → ${e.blocked}`));
         if (graph.nodes.length === 0) dag.appendChild(mk("div", "empty-note", "该条目尚无技术任务"));
+        // 依赖明细默认收起：节点上已有「前置」结论，逐条 `A → B` 常驻只是占屏（真机偏好：清单常驻太挤）。
+        if (graph.edges.length) {
+          const more = mk("details", "req-dag-edges");
+          more.appendChild(mk("summary", null, `依赖明细（${graph.edges.length}）`));
+          for (const e of graph.edges) more.appendChild(mk("div", "req-edge", `${e.blocker} → ${e.blocked}${e.reason ? `（${e.reason}）` : ""}`));
+          dag.appendChild(more);
+        }
         host.appendChild(dag);
       } catch (error) {
         host.replaceChildren(mk("p", "hint", `加载失败：${error.message}`));
       }
+    }
+
+    /**
+     * 按编号打开任务详情（真机批注 2026-10-29「需求条目里看到受阻任务，点不进去」）。
+     *
+     * 口径：**列表里没有不等于不存在** —— 以前用 `state.tasks.find(...)` 找不到就提示"可能已归档"，
+     * 而抽屉里的关联任务/DAG 节点本来就在讲某张具体的卡，点不开等于没有这个入口。
+     * 现在：先在当前列表里找，找不到就**按编号现取一张**（GET /api/tasks/:ref），仍拿不到才报错。
+     */
+    async function openTaskByRef(identifier) {
+      const ref = String(identifier ?? "").trim();
+      if (!ref) return;
+      const fresh = (state.tasks ?? []).find((x) => x.identifier === ref);
+      if (fresh) { void openTaskDetail(fresh); return; }
+      try {
+        const payload = await api("GET", `/api/tasks/${encodeURIComponent(ref)}`);
+        const t = payload?.task;
+        if (t) { void openTaskDetail(t); return; }
+      } catch { /* 落到下面统一提示 */ }
+      showBanner(`打不开任务 ${ref}：可能已被删除，或不属于当前项目`, "error");
     }
 
     // ------------------------------------------------------------ 归属团队 / 执行会话（任务 ↔ 团队关联呈现）
@@ -3388,20 +4001,44 @@
               hsec.appendChild(mk("p", "hint", "口径：`继续`=原任务退回「可开工」重派并放行直接下游（其余前置须已完成/已取消）；`变更需求`/`关闭`=不放行下游。结论给出后这扇门即消耗（本卡转「已取消」），不可重复结论。"));
             }
           } else {
-            hsec.appendChild(mkRich("p", "hint", "本任务不是人工校验任务。四类自动化无法自决的情形（真实 bug 阻塞／需求异化／技术架构变化／与上游需求不符）由系统自动升级为人工校验任务；也可在此按**现有可核验痕迹**手工申报（判不准即拒绝，绝不臆断）。"));
+            hsec.appendChild(mkRich("p", "hint", "本任务不是人工校验任务。四类自动化无法自决的情形（真实 bug 阻塞／需求异化／技术架构变化／与上游需求不符）由系统自动升级为人工校验任务；也可在此按**现有可核验痕迹**手工申报（判不准即拒绝，绝不臆断）。**注意**：下面的「申报」按钮走的就是这套判定 —— 四类判据都不成立时它会**拒绝**并列出缺哪一条，结论直接显示在按钮下方。"));
             const bar = mk("div", "review-actions");
+            // 真机报障（2026-10-28）：「申报人工校验」点了像没反应。真相两层：
+            // ① 这个按钮**按现有可核验痕迹**判定，四类判据都不成立时必然返回 `HUMAN_REVIEW_NOT_CONFIDENT`
+            //   （「判不准就不升级」是设计），所以「没成功」本身是正常结果，不是按钮坏了；
+            // ② 失败原因原先只走全局 banner，而 banner 被抽屉盖住（见 tokens.css 的 `.banner` 注释）⇒ 用户零反馈。
+            // 现在：原因**就地**显示在按钮下方（横幅仍然弹，两条腿走路，任何一条看得见就够）。
+            const applyResult = mk("p", "hint hr-apply-result");
+            applyResult.hidden = true;
+            applyResult.setAttribute("role", "status");
+            const sayApply = (text, ok) => {
+              applyResult.hidden = !text;
+              applyResult.textContent = text;
+              applyResult.dataset.kind = ok ? "ok" : "error";
+              // 抽屉是长内容（两栏 + 滚动），结论写在按钮下方时经常落在视口之外 ⇒ 主动滚进来。
+              // 探针实测（2026-10-28）：修前该行 `applyInViewport=false`，用户等于没看见。
+              if (text) { try { applyResult.scrollIntoView({ block: "nearest" }); } catch { /* ignore */ } }
+            };
             bar.appendChild(btn("申报人工校验（按现有证据判定）", async () => {
+              sayApply("正在按现有可核验痕迹判定…", true);
               try {
                 const r = await api("POST", `/api/tasks/${ref}/human-review`, { actor: "human" });
-                showBanner(`已派发人工校验任务 ${r?.task?.identifier ?? "-"}（类别 ${hrCategoryLabel(r?.classification?.category)}）· 原任务已停手等人`, "info");
+                const ok = `已派发人工校验任务 ${r?.task?.identifier ?? "-"}（类别 ${hrCategoryLabel(r?.classification?.category)}）· 原任务已停手等人`;
+                sayApply(ok, true);
+                showBanner(ok, "info");
                 await loadTasks();
-              } catch (e) { showBanner(`未派发：${e.message}${e.code ? `（${e.code}）` : ""}`, "error"); }
+              } catch (e) {
+                const msg = `未派发：${e.message}${e.code ? `（${e.code}）` : ""}`;
+                sayApply(msg, false);
+                showBanner(msg, "error");
+              }
             }));
             bar.appendChild(btn("复制申报标记（先贴评论再申报）", () => {
               const text = "【人工校验申报】类别=与上游需求不符；证据=<请填可核验证据：日志/诊断/尝试记录>；候选处置=<可选>";
               void copyText(text).then((ok) => showBanner(ok ? "已复制申报标记：贴到本任务评论后再点「申报人工校验」即可成立" : "复制失败：浏览器拒绝了剪贴板写入，请手动复制", ok ? "info" : "error"));
             }));
             hsec.appendChild(bar);
+            hsec.appendChild(applyResult);
             hsec.appendChild(mk("p", "hint", "红线：人工校验任务归人 —— 执行侧不得认领、不得置 done；未结论前被它挡住的下游一律不推进。"));
           }
           drawerBody.appendChild(hsec);
@@ -3429,8 +4066,13 @@
             const ev = mk("div", "review-evidence");
             ev.appendChild(mk("h3", null, "自动复核证据"));
             if (auto) {
-              ev.appendChild(mk("div", `review-evidence-verdict ${auto.timedOut ? "warn" : (auto.exitCode === 0 ? "ok" : "bad")}`, `最近一次自动复核：${auto.verdict}`));
-              ev.appendChild(mk("p", "hint", `命令：${auto.command} · 退出码：${auto.timedOut ? "（超时未完成）" : auto.exitCode} · 耗时：${(Number(auto.durationMs) / 1000).toFixed(1)}s${auto.at ? ` · ${fmtTime(auto.at)}` : ""}`));
+              // 第三态（真机 2026-10-28 · hydro-two-ticket T7-B）：默认 `npm test` 在非 Node 工作区里
+              // 必然 ENOENT（退出码 254），原先把「命令不适用」画成红色「失败」⇒ 评委误判。现在单独一档。
+              const autoSkip = auto.applicable === false;
+              ev.appendChild(mk("div", `review-evidence-verdict ${autoSkip ? "skip" : (auto.timedOut ? "warn" : (auto.exitCode === 0 ? "ok" : "bad"))}`, `最近一次自动复核：${auto.verdict}`));
+              ev.appendChild(mk("p", "hint", `命令：${auto.command} · 退出码：${auto.timedOut ? "（超时未完成）" : (auto.exitCode === null ? "（未执行）" : auto.exitCode)} · 耗时：${(Number(auto.durationMs) / 1000).toFixed(1)}s${auto.at ? ` · ${fmtTime(auto.at)}` : ""}`));
+              // 给一条明路：不适用时告诉人去哪儿填命令，而不是让人对着红字猜哪里坏了。
+              if (autoSkip) ev.appendChild(mk("p", "hint", `⚠ 这条命令在本项目工作区不适用（${auto.skipReason ?? "未配置复核命令"}）—— **这不是测试失败**。请在本卡「编辑 → 复核动作」里填本项目的复核命令（Java 工程可填 \`mvn -q test\`）后重跑。`));
               // FR-90 强化：证据里带上**总结与失败点**（真机反馈：「只返回一个结果，应该在自动复核证据内
               // 自动填入复核总结证据及结论」）。老证据评论没有这些行 → 不渲染，不臆造。
               if (auto.summary) ev.appendChild(mk("p", "review-evidence-summary", `复核总结：${auto.summary}`));
@@ -3469,7 +4111,8 @@
               runReview.textContent = "复核中…（跑命令，可能要几十秒）";
               try {
                 const r = await api("POST", `/api/tasks/${ref}/auto-review`, {});
-                showBanner(`自动复核：${r.verdict}（${r.command} · ${(Number(r.durationMs) / 1000).toFixed(1)}s${r.timedOut ? "，已超时" : ""}）`, r.exitCode === 0 ? "info" : "error");
+                const notApplicable = r.applicable === false;
+                showBanner(`自动复核：${r.verdict}（${r.command} · ${(Number(r.durationMs) / 1000).toFixed(1)}s${r.timedOut ? "，已超时" : ""}）${notApplicable ? " · 未执行，请先在本卡「复核动作」里配置命令" : ""}`, (notApplicable || r.exitCode === 0) ? "info" : "error");
                 // 把「结论 + 总结 + 失败点」自动填进评审说明，评审人不必手抄机器输出（真机反馈 2026-10-22）。
                 const bits = [`自动复核结论：${r.verdict}（命令 ${r.command}，耗时 ${(Number(r.durationMs) / 1000).toFixed(1)}s${r.timedOut ? "，已超时" : ""}）`];
                 if (r.summary) bits.push(`复核总结：${r.summary}`);
@@ -3794,7 +4437,7 @@
         }
         const execBar = mk("div", "btn-row");
         if (refSessionId) {
-          execBar.appendChild(btn("打开执行会话", async () => {
+          execBar.appendChild(hostBtn("打开执行会话", async () => {
             // 1) 服务端先给口径（FR-84）：同一入口负责回落解析 + 存活判定，
             //    session-gone / no-session 时**明确告知**，且绝不复制空标识（真机事故："已复制会话标识：-"）。
             let verdict = null;
@@ -4273,9 +4916,15 @@
             },
             "open-session": () => { if (openSessionBtn) openSessionBtn.click(); else showBanner("本卡尚无执行会话可打开", "error"); },
             "complete": async () => {
-              if (!window.confirm(`确认把 ${t.identifier} 置为「完成」？完成只有人能确认，且不会自动回退。`)) return;
-              if (!(await moveTask(t, "done"))) return; // 失败横幅由 moveTask 负责，成功则必须自己报出来
-              showBanner(`已把 ${t.identifier} 置为「完成」——完成只能由人确认，且不会自动回退。`, "info");
+              // FR-83 补口（卡 `-162`）：「下一步」区的「完成」是**处置区的正规入口**，也是唯一还能
+              // 主动收口的地方。评审未通过的卡在这里走**跳过评审**这条显式路线（`moveTask` 内部出确认框、
+              // 确认后才带 `skipReview: true`）；评审已通过的卡维持原确认文案。
+              const skippingReview = needsReviewSkip(t, "done");
+              if (!skippingReview && !window.confirm(`确认把 ${t.identifier} 置为「完成」？完成只有人能确认，且不会自动回退。`)) return;
+              if (!(await moveTask(t, "done"))) return; // 失败横幅 / 取消提示均由 moveTask 负责，成功则必须自己报出来
+              showBanner(skippingReview
+                ? `已把 ${t.identifier} 置为「完成」——本次跳过评审，已在事件流与审计里留痕（review_skipped）。`
+                : `已把 ${t.identifier} 置为「完成」——完成只能由人确认，且不会自动回退。`, "info");
               // 用户 2026-10-22 约束①「任务执行正常的，确认后即关闭」：收口即关抽屉（卡片已进「完成」列），
               // 需要复核时再点开卡片 —— 那时抽屉是收口版布局（处置区默认收起，可一键展开）。
               closeDrawer();
@@ -4518,7 +5167,59 @@
     };
   }
 
-  window.__TB_BOARD__ = { createBoard, version: 2 };
+
+  /**
+   * 解析人粘回来的任务行 → `{ tasks, problems }`（2026-10-28）。
+   *
+   * 为什么这段在**前端**而不是 `src/core/split-ask.mjs`：服务端只吃结构化 `tasks`（同一条 `/split`），
+   * 需要"读懂人贴进来的文本"的只有浏览器。放在这里的好处是零构建、可直接被验证台调用；
+   * 单元测试用 `vm` 加载本文件后调 `window.__TB_BOARD__.parseSplitLines`（见 tests/fr-req-split-ask.test.mjs）。
+   *
+   * 容错口径：允许行首序号列（`3` / `3.` / `3、`）与全角 `｜`、允许缺列、允许 ``` 围栏；
+   * **解析不上的行不静默丢** —— 收进 `problems` 交回界面显形。
+   */
+  function parseSplitLines(text) {
+    const tasks = [];
+    const problems = [];
+    const rows = String(text == null ? "" : text).split("\n").map((l) => l.trim()).filter(Boolean);
+    const numOf = new Map();
+    const pendingDeps = [];
+    for (const raw of rows) {
+      if (/^```/.test(raw)) continue;
+      const cells = raw.replace(/\uFF5C/g, "|").split("|").map((c) => c.trim());
+      let seq = null;
+      if (cells.length > 1 && /^\d+[.、)]?$/.test(cells[0])) { seq = Number(cells[0].replace(/[.、)]/g, "")); cells.shift(); }
+      const title = String(cells[0] || "").replace(/^[-*]\s+/, "").trim();
+      if (!title) { problems.push(`空标题：${raw}`); continue; }
+      const owner = cells[1] ? cells[1] : null;
+      const kindRaw = cells[2] ? String(cells[2]).toLowerCase() : "";
+      const depRaw = cells[3] || "";
+      let kind = null;
+      if (kindRaw) {
+        if (kindRaw === "work" || kindRaw === "review") kind = kindRaw;
+        else problems.push(`kind 非法（已忽略）：${raw}`);
+      }
+      const index = tasks.length;
+      tasks.push(Object.assign({ title }, owner ? { owner } : {}, kind ? { kind } : {}));
+      if (seq !== null) numOf.set(seq, title);
+      const refs = String(depRaw).split(/[,，\s]+/).map((x) => x.trim()).filter(Boolean);
+      if (refs.length) pendingDeps.push({ index, refs });
+    }
+    for (const item of pendingDeps) {
+      const deps = [];
+      for (const ref of item.refs) {
+        const bySeq = numOf.get(Number(ref));
+        const byTitle = tasks.some((t) => t.title === ref);
+        if (bySeq) deps.push(bySeq);
+        else if (byTitle) deps.push(ref);
+        else problems.push(`依赖目标找不到（已忽略）：${ref}`);
+      }
+      if (deps.length) tasks[item.index].dependsOn = deps;
+    }
+    return { tasks, problems };
+  }
+
+  window.__TB_BOARD__ = { createBoard, version: 3, parseSplitLines };
 
   // 独立验证台：index.html 提供 #tb-app 容器时自动挂载
   function autoMount() {

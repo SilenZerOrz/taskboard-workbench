@@ -113,7 +113,7 @@ test("C. 宿主插件注册的 handler 可直接服务 API（命名空间前缀�
   const base = `http://127.0.0.1:${port}${PREFIX}`;
 
   const health = await (await fetch(`${base}/api/health`)).json();
-  assert.equal(health.schemaVersion, 10); // FR-79/FR-82/FR-83/FR-81/FR-85b/FR-11：… + tasks.board_position（列内手工顺序）+ FR-50：team_members.executor → schema 版本 10
+  assert.equal(health.schemaVersion, 11); // FR-79/FR-82/FR-83/FR-81/FR-85b/FR-11：… + tasks.board_position（列内手工顺序）+ FR-50：team_members.executor → schema 版本 10
   assert.equal(health.status, "ok");
   const projects = await (await fetch(`${base}/api/projects`)).json();
   assert.equal(projects.count, 1);
@@ -219,7 +219,8 @@ test("D2. 样式自愈：只改 tokens.css 时也必须能换新 ?v= 重挂（`-
 test("E. web/app.js：工厂化 + 独立页自动挂载；七状态与卡片结构完好", () => {
   const source = read("web/app.js");
   assert.match(source, /function createBoard\(options = \{\}\)/);
-  assert.match(source, /window\.__TB_BOARD__ = \{ createBoard, version: 2 \}/);
+  // 2026-10-28：`parseSplitLines` 随「分拆草稿」出口一起暴露（供验证台/单测调用）；版本号 2 → 3。
+  assert.match(source, /window\.__TB_BOARD__ = \{ createBoard, version: 3, parseSplitLines \}/);
   assert.match(source, /function autoMount\(\)/);
   assert.match(source, /createBoard\(\{ root: host, apiBase: "" \}\)/);
   for (const status of ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "canceled"]) {
@@ -763,16 +764,21 @@ test("N. 「下一步」的人工「完成」不许静默：写成功后必须�
   // 真机反馈 2026-10-22：点「完成（仅人工可确认）」"无反应" —— 查事件流其实写成功了
   // （`status_changed human`），但成功路径只 `hideBanner()`、抽屉不刷新，界面零变化。
   // 断言分两半：① `moveTask` 必须回传成功与否；② `complete` 必须在成功后报横幅 + 重开抽屉。
-  const moveAt = source.indexOf("async function moveTask(task, status)");
+  const moveAt = source.indexOf("async function moveTask(");
   assert.ok(moveAt > 0, "必须能定位 moveTask");
-  const moveFn = source.slice(moveAt, moveAt + 900);
+  // 按**下一个函数**收边（-162 给 moveTask 加了评审门与 REVIEW_NOT_APPROVED 分支，固定字节窗会被撑破）
+  const moveEnd = source.indexOf("// ------------------------------------------------------------------ FR-11 拖拽", moveAt);
+  const moveFn = source.slice(moveAt, moveEnd > moveAt ? moveEnd : moveAt + 2600);
   assert.match(moveFn, /let ok = true;/, "moveTask 必须有成功/失败标记");
   assert.match(moveFn, /return ok;/, "moveTask 必须回传成功与否（否则调用方无法给反馈）");
   assert.match(moveFn, /ok = false;/, "失败分支必须置为失败");
 
   const doneAt = source.indexOf('"complete": async');
   assert.ok(doneAt > 0, "必须能定位 next-step 的 complete 动作处理器");
-  const doneFn = source.slice(doneAt, doneAt + 700);
+  // 按**下一个动作处理器**收边：固定 700 字节窗会把相邻处理器内容混进来（-162 的评审态分支撑破了旧窗，
+  // 而下一个处理器里就有 `await reopen()`，混进来会误判本条的负向断言）。
+  const doneEnd = source.indexOf('"dispatch-main-session":', doneAt);
+  const doneFn = source.slice(doneAt, doneEnd > doneAt ? doneEnd : doneAt + 1500);
   assert.match(doneFn, /window\.confirm\(/, "置「完成」前必须人工确认");
   assert.match(doneFn, /if \(!\(await moveTask\(t, "done"\)\)\) return;/, "失败时不得再报成功");
   assert.match(doneFn, /showBanner\(/, "成功后必须给可见反馈（否则＝点了没反应）");

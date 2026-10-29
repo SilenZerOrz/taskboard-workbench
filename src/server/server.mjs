@@ -187,6 +187,18 @@ export function startServer({ dataDir, port, host = "127.0.0.1", env = process.e
       store.close();
       process.exit(0);
     });
+    // 优雅重启必须真的退出（P1-4，2026-10-29 修）。
+    // 根因：前端常开 `new EventSource('/api/events')`（SSE 长连接），而 `server.close(cb)` 只停止接受
+    // 新连接、要等**既有连接全部结束**才回调 => 只要有一个页面开着，回调永不触发 => SIGTERM 之后进程
+    // 挂着不退，继续持有 SQLite，下一个实例起来就形成同库双写者，再下次重启还要撞 EADDRINUSE。
+    // 真机事故：孤儿 52278（2026-10-28）与 41116（2026-10-29）都是这一条留下的。
+    // closeAllConnections 强制断开 SSE 与 keep-alive（Node >= 18.2；本包 engines 要求 >= 22.5）。
+    server.closeAllConnections?.();
+    // 兜底：即便运行环境没有 closeAllConnections，也必须在 3s 内退出 —— 不许再留孤儿。
+    setTimeout(() => {
+      try { store.close(); } catch { /* ignore */ }
+      process.exit(0);
+    }, 3000).unref();
   };
   process.once("SIGINT", close);
   process.once("SIGTERM", close);

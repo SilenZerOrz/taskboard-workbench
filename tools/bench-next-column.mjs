@@ -55,6 +55,12 @@ const CHROME_CANDIDATES = [
   "/usr/bin/chromium-browser",
 ].filter(Boolean);
 const chromeBin = CHROME_CANDIDATES.find((p) => existsSync(p));
+// 沙箱内启动 GUI 浏览器必崩（mach 服务被拒）⇒ 提前退出，不刷崩溃报告（见 AGENTS.md §7）
+if (process.env.CODEX_SANDBOX) {
+  console.log("SKIP  当前在 Codex 沙箱内（CODEX_SANDBOX 已设置）：GUI 浏览器启动必崩，本台不产证据，退出码 2");
+  console.log('      正路：以 sandbox_permissions="require_escalated" 重跑本脚本（沙箱外应全绿）');
+  process.exit(2);
+}
 if (!chromeBin) {
   console.log("SKIP  未找到 Chrome（可用 TB_CHROME=<路径> 指定）——本台不产证据，退出码 2");
   process.exit(2);

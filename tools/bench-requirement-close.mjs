@@ -129,9 +129,12 @@ try {
 
   // ---- 4. 人工验收：把任务点 done ⇒ 完成度置 all-closed / ready=true ---------------------
   // 产品口径：任务更新走**乐观并发**（`MISSING_VERSION` 拒绝无版本的写入）—— 人点 done 也必须带 version。
-  const liveVersion = afterRun.payload?.task?.version;
+  // FR-83 补口（卡 `-162`）：待验收卡收口前必须先「评审通过」（或显式 skipReview），否则 409 REVIEW_NOT_APPROVED。
+  const approve = await call("POST", `/api/tasks/${task.identifier}/review`, { action: "approve", comment: "bench：评审通过" });
+  check("评审门：评审通过 200 且不自动完成", approve.status === 200 && approve.payload?.task?.status === "in_review", `status=${approve.status} task=${approve.payload?.task?.status}`);
+  const liveVersion = approve.payload?.task?.version;
   const done = await call("PATCH", `/api/tasks/${task.identifier}`, { status: "done", version: liveVersion });
-  check("人点任务 done（PATCH 200 · 带 expectedVersion）", done.status === 200 && done.payload?.task?.status === "done", `status=${done.status} code=${codeOf(done)} version=${liveVersion}`);
+  check("人点任务 done（评审通过后 · PATCH 200 · 带 expectedVersion）", done.status === 200 && done.payload?.task?.status === "done", `status=${done.status} code=${codeOf(done)} version=${liveVersion}`);
   comp = await call("GET", `/api/requirements/items/${item.identifier}/completion`);
   check("关联任务全收口 ⇒ 完成度 all-closed / ready=true（可判定需求完成）", comp.payload?.verdict === "all-closed" && comp.payload?.ready === true, `verdict=${comp.payload?.verdict} ready=${comp.payload?.ready}`);
 
@@ -173,9 +176,11 @@ try {
   check("派发路径：T3 停「待验收」（CLI 真跑完）", t3after?.status === "in_review", `status=${t3after?.status}`);
   const c3a = await call("GET", `/api/requirements/items/${item3.identifier}/completion`);
   check("派发路径：in_review ⇒ 完成度 in-review / ready=false", c3a.payload?.verdict === "in-review" && c3a.payload?.ready === false, `verdict=${c3a.payload?.verdict}`);
-  const done3 = await call("PATCH", `/api/tasks/${task3.identifier}`, { status: "done", version: t3after?.version });
+  // FR-83 补口（卡 `-162`）：派发路径的卡同样要先评审通过才收口
+  const approve3 = await call("POST", `/api/tasks/${task3.identifier}/review`, { action: "approve", comment: "bench：派发路径评审通过" });
+  const done3 = await call("PATCH", `/api/tasks/${task3.identifier}`, { status: "done", version: approve3.payload?.task?.version });
   const c3b = await call("GET", `/api/requirements/items/${item3.identifier}/completion`);
-  check("派发路径：人点 T3 done ⇒ 完成度 all-closed / ready=true", done3.status === 200 && c3b.payload?.verdict === "all-closed" && c3b.payload?.ready === true, `done=${done3.status} verdict=${c3b.payload?.verdict}`);
+  check("派发路径：评审通过后人点 T3 done ⇒ 完成度 all-closed / ready=true", done3.status === 200 && c3b.payload?.verdict === "all-closed" && c3b.payload?.ready === true, `done=${done3.status} code=${codeOf(done3)} verdict=${c3b.payload?.verdict}`);
   const close3 = await call("PATCH", `/api/requirements/items/${item3.identifier}`, { status: "done", actor: "human", reason: "派发路径复证：关联任务已收口" });
   check("派发路径：需求条目置 done 200", close3.status === 200 && close3.payload?.item?.status === "done", `status=${close3.status}`);
 } catch (error) {

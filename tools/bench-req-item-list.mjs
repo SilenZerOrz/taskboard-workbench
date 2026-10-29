@@ -20,8 +20,13 @@
  *      （同时要求动作层真实宽度 > 100px —— 证明它确实存在、本来是会吃掉宽度的）；
  *   H. 动作**能显形**：禁 transition 后给行加 `is-active` ⇒ 动作层 `opacity = 1`，且**显形前后行宽不变**；
  *   I. 窄视口（900，`Emulation` 改视口）回落**单列**且**仍无横向溢出**；
- *   J. **反向对照**：注入「改动前」口径的覆盖样式后，C / E / F / G 必须**转红**
- *      （证明这些读数真的在区分新旧，不是恒真）。
+ *   J. **反向对照**：注入「改动前」口径的覆盖样式后，C / E / F / G / K 必须**转红**
+ *      （证明这些读数真的在区分新旧，不是恒真）；
+ *   K. 列表内**逐行完成度结论**（无任务 / 1/2 收口 / 待验收 1 / 受阻 1 / 可收口）与种子期望逐条一致；
+ *   K2. 面板头「可收口 N」＝「达标且尚未收口」的条目数（完成度结论的面板级入口）；
+ *   L. 完成度列**定宽逐行对齐**、列表无横向滚动、行高仍紧凑（加一列不许把行撑宽/撑高）；
+ *   M. 点完成度胶囊 ⇒ 抽屉打开并**真滚到**「关联任务完成情况」段（用超长验收要点把该段顶出一屏，
+ *      判据含 `scrollTop > 0`，避免"反正一开始就看得见"的假绿）。
  *
  * ## 隔离边界
  * 临时 `dataDir` + 临时 Chrome profile + 随机端口 + 独立进程，跑完即删。
@@ -65,6 +70,12 @@ const CHROME_CANDIDATES = [
   "/usr/bin/chromium-browser",
 ].filter(Boolean);
 const chromeBin = CHROME_CANDIDATES.find((p) => existsSync(p));
+// 沙箱内启动 GUI 浏览器必崩（mach 服务被拒）⇒ 提前退出，不刷崩溃报告（见 AGENTS.md §7）
+if (process.env.CODEX_SANDBOX) {
+  console.log("SKIP  当前在 Codex 沙箱内（CODEX_SANDBOX 已设置）：GUI 浏览器启动必崩，本台不产证据，退出码 2");
+  console.log('      正路：以 sandbox_permissions="require_escalated" 重跑本脚本（沙箱外应全绿）');
+  process.exit(2);
+}
 if (!chromeBin) {
   console.log("SKIP  未找到 Chrome（可用 TB_CHROME=<路径> 指定）——本台不产证据，退出码 2");
   process.exit(2);
@@ -83,19 +94,38 @@ const store = openStore({ dataDir, env: {} });
 store.createProject({ id: "default", name: "默认项目" });
 const doc = store.ensureRequirementDoc("default", { body: "# 需求\n\n## R1 需求条目列表\n" });
 
-/** 种子：四态齐 + 一条极长标题（长标题正是「把轨道顶宽 / 把整页撑出横向滚动条」的元凶）。 */
+/**
+ * 种子：四态齐 + 一条极长标题（长标题正是「把轨道顶宽 / 把整页撑出横向滚动条」的元凶）
+ * + **每条关联任务各不相同的完成度**（卡 `-160` 收尾：完成度结论要在**列表内**直接读到）。
+ *   · `tasks`：用产品自己的 `createTask` 建这些状态的任务，再用 `associateRequirementTask` 归因到该条目；
+ *   · `verdict` / `label`：本台**独立的期望值**（不拿产品 `summarizeRequirementCompletion` 自证，
+ *     否则"界面与后端一致"会被同一个函数自圆其说）。
+ *   · 第 7 条另带一段超长验收要点：让抽屉内容**高于一屏**，才能证明「点胶囊 ⇒ 真把该段滚进视野」
+ *     而不是"反正一开始就看得见"。
+ */
 const SEED = [
-  ["draft", "待确认", 105, "支持按会话归属筛选需求条目并记住上次筛选（含降级可见提示）"],
-  ["open", "在办", 107, "需求条目列表：宽度 / 密度优化 + 完成 / 关闭状态显式化"],
-  ["done", "已完成", 110, "FR-91 需求文档关联补齐与需求条目完成度评审（需求层收口闭环）"],
-  ["closed", "已关闭", 113, "P0-3 Codex 内嵌部署（放弃）"],
-  ["open", "在办", 115, "极长标题用于验证省略号与横向溢出：把这一行写得很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长"],
-  ["done", "已完成", 116, "另一条已完成的条目"],
+  { status: "draft", title: "支持按会话归属筛选需求条目并记住上次筛选（含降级可见提示）", tasks: [], verdict: "no-tasks", label: "无任务" },
+  { status: "open", title: "需求条目列表：宽度 / 密度优化 + 完成 / 关闭状态显式化", tasks: ["done", "in_progress"], verdict: "in-progress", label: "1/2 收口" },
+  { status: "done", title: "FR-91 需求文档关联补齐与需求条目完成度评审（需求层收口闭环）", tasks: ["done"], verdict: "all-closed", label: "可收口" },
+  { status: "closed", title: "P0-3 Codex 内嵌部署（放弃）", tasks: [], verdict: "no-tasks", label: "无任务" },
+  { status: "open", title: "极长标题用于验证省略号与横向溢出：把这一行写得很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长", tasks: ["in_review"], verdict: "in-review", label: "待验收 1" },
+  { status: "done", title: "另一条已完成的条目", tasks: ["canceled"], verdict: "all-closed", label: "可收口" },
+  { status: "open", title: "关联任务已全部收口的条目（列表内应显示「可收口」，面板头计数为 1）", tasks: ["done"], verdict: "all-closed", label: "可收口", acceptance: `长验收要点用于验证抽屉内定位：${"这是一句很长的验收要点。".repeat(300)}` },
+  { status: "open", title: "有关联任务受阻的条目（列表内应显示「受阻 1」）", tasks: ["blocked"], verdict: "blocked", label: "受阻 1" },
 ];
-for (const [status, , , title] of SEED) {
-  store.createRequirementItem({ projectId: "default", title, status, docId: doc.id });
-}
-const expectCounts = SEED.reduce((acc, [s]) => { acc[s] = (acc[s] ?? 0) + 1; return acc; }, {});
+const seeded = SEED.map(({ status, title, tasks, acceptance }) => {
+  const item = store.createRequirementItem({ projectId: "default", title, status, docId: doc.id, acceptance });
+  for (const taskStatus of tasks) {
+    const task = store.createTask({ projectId: "default", title: `${item.identifier} · ${taskStatus} 任务`, status: taskStatus });
+    store.associateRequirementTask(item.identifier, task.identifier);
+  }
+  return item;
+});
+const expectCounts = SEED.reduce((acc, s) => { acc[s.status] = (acc[s.status] ?? 0) + 1; return acc; }, {});
+/** identifier → 期望完成度（chip 文案 + data-verdict）。 */
+const expectCompletion = new Map(seeded.map((item, i) => [item.identifier, SEED[i]]));
+/** 面板头「可收口 N」的期望：达标（ready）且**尚未**收口的条目数。 */
+const EXPECT_READY = SEED.filter((s) => s.verdict === "all-closed" && s.status !== "done" && s.status !== "closed").length;
 
 let server = createServer({ store, webDir: WEB_DIR });
 const port = await freePort();
@@ -149,6 +179,7 @@ const PROBE = `(() => {
   const acts = items.map((it) => it.querySelector(".req-item-actions"));
   const mains = items.map((it) => it.querySelector(".req-item-main"));
   const chips = items.map((it) => it.querySelector(".req-status-chip"));
+  const comps = items.map((it) => it.querySelector(".req-completion-chip"));
   const mainBefore = mains.map((m) => px(m.getBoundingClientRect().width));
   acts.forEach((a) => { if (a) a.style.display = "none"; });
   const mainNoActs = mains.map((m) => px(m.getBoundingClientRect().width));
@@ -161,7 +192,11 @@ const PROBE = `(() => {
     columnCount: cols === "none" ? 0 : cols.trim().split(/\\s+/).filter(Boolean).length,
     columns: cols,
     listMaxHeight: getComputedStyle(list).maxHeight,
+    listScrollW: list.scrollWidth,
+    listClientW: list.clientWidth,
     headText: (document.querySelector(".req-counts")?.textContent ?? "").replace(/\\s+/g, " ").trim(),
+    headReady: (document.querySelector(".req-ready-count")?.textContent ?? "").trim(),
+    headReadyTitle: document.querySelector(".req-ready-count")?.title ?? "",
     rows: items.map((it, i) => {
       const t = it.querySelector(".req-title");
       const cs = getComputedStyle(it);
@@ -179,6 +214,15 @@ const PROBE = `(() => {
         actionRealW: a ? px(a.getBoundingClientRect().width) : 0,
         chipW: chips[i] ? px(chips[i].getBoundingClientRect().width) : 0,
         chipLeft: chips[i] ? px(chips[i].getBoundingClientRect().left) : 0,
+        comp: comps[i] ? {
+          text: comps[i].textContent,
+          verdict: comps[i].dataset.verdict ?? "",
+          cls: comps[i].className,
+          w: px(comps[i].getBoundingClientRect().width),
+          left: px(comps[i].getBoundingClientRect().left),
+          title: comps[i].title ?? "",
+          loading: comps[i].classList.contains("is-loading"),
+        } : null,
       };
     }),
   };
@@ -280,8 +324,23 @@ try {
   if (!opened.ok) throw new Error(`需求视图未渲染出条目：${opened.note ?? ""}`);
   await sleep(400);
 
+  // ---- A 前置 2：等**列表内完成度**逐条取齐（懒取是异步的，不等就会读到占位的「…」）----
+  const hydrateWait = async (label) => {
+    const r = await waitFor(async () => evalJs(`(() => {
+      const rows = document.querySelectorAll(".req-list .req-item");
+      const chips = document.querySelectorAll('.req-list .req-item .req-completion-chip[data-verdict]');
+      const loading = document.querySelectorAll(".req-list .req-item .req-completion-chip.is-loading");
+      return { ok: rows.length > 0 && chips.length === rows.length && loading.length === 0, rows: rows.length, chips: chips.length, loading: loading.length };
+    })()`), 25000, label);
+    // **不抛**：真缺胶囊时交给 K / K2 / L / M 各自转红 —— 这样反证跑（`TB_BENCH_WEB_DIR=改动前 web`）
+    // 能一次看全"哪几条在区分新旧"，而不是一条前置就把整台短路成 1 条 FAIL。
+    if (!r.ok) console.log(`… ${label}：rows=${r.rows} chips=${r.chips} loading=${r.loading}（继续跑，交给 K/K2/L/M 判红）`);
+    return r;
+  };
+  const hydrated = await hydrateWait("列表内完成度取齐");
+
   const wide = await evalJs(PROBE);
-  check("A 需求视图真渲染出条目列表（种子 6 条）", wide.ok && wide.rows.length === SEED.length,
+  check(`A 需求视图真渲染出条目列表（种子 ${SEED.length} 条）`, wide.ok && wide.rows.length === SEED.length,
     wide.ok ? `rows=${wide.rows.length}` : (wide.note ?? ""));
 
   // ---- B 面板头四态计数（完成 / 关闭不再隐形） ----------------------------------------------
@@ -333,6 +392,71 @@ try {
     revealed.ok && revealed.actionOpacity === 1 && revealed.actionPointer === "auto" && revealed.mainDelta === 0,
     revealed.ok ? `opacity=${revealed.actionOpacity} pointer=${revealed.actionPointer} 行宽差=${revealed.mainDelta}` : (revealed.note ?? ""));
 
+  // ---- K 列表内**逐行完成度结论**（验收第 2 条：不必逐条打开详情）----------------------------
+  // 行序 = 渲染序 = 种子创建序（`all` 筛选、无搜索）
+  const compMismatch = SEED.map((want, i) => {
+    const got = wide.rows[i]?.comp;
+    const ok = got && got.verdict === want.verdict && got.text === want.label && !got.loading;
+    return ok ? null : `${seeded[i].identifier}: 期望 ${want.verdict}/${want.label} · 实得 ${got?.verdict ?? "-"}/${got?.text ?? "-"}`;
+  }).filter(Boolean);
+  check("K 列表内逐行显示完成度结论（无任务 / 1/2 收口 / 待验收 1 / 受阻 1 / 可收口，与种子一致）",
+    compMismatch.length === 0,
+    compMismatch.length ? compMismatch.join(" · ") : wide.rows.map((r) => r.comp?.text).join(" / "));
+
+  // ---- K2 面板头「可收口 N」（完成度结论的面板级入口）----------------------------------------
+  check("K2 面板头「可收口 N」与种子一致（达标且尚未收口 = 1 条）",
+    wide.headReady === `可收口 ${EXPECT_READY}` && wide.headReadyTitle.includes(seeded[6].identifier),
+    `headReady="${wide.headReady}" 期望=${EXPECT_READY} title="${wide.headReadyTitle.slice(0, 90)}"`);
+
+  // ---- L 完成度列**定宽逐行对齐**，且不给列表添横向滚动、行高仍紧凑 -------------------------
+  const compWs = [...new Set(wide.rows.map((r) => r.comp?.w ?? 0))];
+  const compLs = [...new Set(wide.rows.map((r) => r.comp?.left ?? 0))];
+  const listOverflow = wide.listScrollW - wide.listClientW;
+  const rowHeights = wide.rows.map((r) => r.rowH);
+  check("L 完成度列定宽逐行对齐、列表无横向滚动、行高仍紧凑（≤34px）",
+    compWs.length === 1 && compWs[0] > 0 && compLs.length === 1 && listOverflow <= 0 && Math.max(...rowHeights) <= 34,
+    `胶囊宽度集合=${JSON.stringify(compWs)} 左偏移集合=${JSON.stringify(compLs)} 列表横向溢出=${listOverflow}px 行高最大=${Math.max(...rowHeights)}`);
+
+  // ---- M 点胶囊 = 结论的**入口**：开抽屉并滚到「关联任务完成情况」段（不是只开抽屉）----
+  // 必须点**那条带超长验收要点**的「可收口」条目（seeded[6]）：否则抽屉内容不足一屏，
+  // `scrollTop` 天然为 0 ⇒ 这条判据会退化成「反正一开始就看得见」的假绿。
+  const mTarget = seeded[6].identifier;
+  const clicked = await evalJs(`(() => {
+    const target = ${JSON.stringify(mTarget)};
+    const chip = document.querySelector('.req-completion-chip[data-req-completion="' + target + '"]');
+    if (!chip) return { ok: false, note: "找不到目标条目的完成度胶囊" };
+    chip.click();
+    return { ok: true, id: chip.dataset.reqCompletion ?? "", text: chip.textContent };
+  })()`);
+  let detail = { ok: false, note: "未点击" };
+  if (clicked.ok) {
+    await sleep(1200);
+    detail = await evalJs(`(() => {
+      const drawer = document.querySelector(".tb-req-drawer");
+      const body = drawer?.querySelector(".tb-drawer-body");
+      const sec = body?.querySelector('[data-req-section="completion"]');
+      if (!drawer || !body || !sec) return { ok: false, note: "抽屉或完成度段缺失" };
+      const b = body.getBoundingClientRect(); const r = sec.getBoundingClientRect();
+      return {
+        ok: true, shown: drawer.classList.contains("show"),
+        inView: r.top < b.bottom && r.bottom > b.top,
+        scrollTop: Math.round(body.scrollTop),
+        scrollable: body.scrollHeight > body.clientHeight + 20,
+        title: sec.querySelector("h3")?.textContent ?? "",
+      };
+    })()`);
+  }
+  check("M 点完成度胶囊 ⇒ 抽屉打开并**滚到**「关联任务完成情况」段（名实相符的「入口」）",
+    clicked.ok && clicked.id === mTarget && clicked.text === "可收口"
+    && detail.ok && detail.shown && detail.inView && detail.scrollable && detail.scrollTop > 0 && detail.title.includes("关联任务完成情况"),
+    detail.ok
+      ? `行=${clicked.id} 打开=${detail.shown} 在视野=${detail.inView} 可滚=${detail.scrollable} scrollTop=${detail.scrollTop} 段="${detail.title}"`
+      : (detail.note ?? ""));
+  // 关掉抽屉，回到干净列表态再跑反向对照
+  await evalJs(`(() => { document.querySelector(".tb-req-drawer .tb-drawer-head button.ghost")?.click(); return true; })()`);
+  await sleep(500);
+  await hydrateWait("关闭抽屉后完成度重新取齐");
+
   // ---- J 反向对照：注入「改动前」口径后，C / E / F / G 必须转红 ------------------------------
   await evalJs(`(() => {
     const s = document.createElement("style");
@@ -343,7 +467,8 @@ try {
       ".req-status-chip{min-width:48px!important}",
       ".req-stack .req-item.is-done .req-title,.req-stack .req-item.is-closed .req-title{text-decoration:none!important}",
       ".req-stack .req-item.is-closed{opacity:1!important}",
-      ".req-stack .req-item.is-done,.req-stack .req-item.is-closed{box-shadow:none!important}"
+      ".req-stack .req-item.is-done,.req-stack .req-item.is-closed{box-shadow:none!important}",
+      ".req-stack .req-completion-chip{display:none!important}"
     ].join("\\n");
     document.head.appendChild(s);
     return true;
@@ -357,9 +482,11 @@ try {
   const redF = !termB.every((r) => r.titleDecoration === "line-through" && r.insetBar);
   const deltasB = [...new Set(back.rows.map((r) => r.mainDelta))];
   const redG = !(deltasB.length === 1 && deltasB[0] === 0);
-  check("J 反向对照：注入旧口径后 C/E/F/G 四条判据转红",
-    redC && redE && redF && redG,
-    `C红=${redC} E红=${redE} F红=${redF} G红=${redG}`);
+  // 完成度列也要能转红：注入 `display:none` 后逐行"有结论且真占位"必须不成立
+  const redK = !back.rows.every((r) => r.comp && r.comp.verdict && r.comp.w > 0);
+  check("J 反向对照：注入旧口径后 C/E/F/G/K 五条判据转红",
+    redC && redE && redF && redG && redK,
+    `C红=${redC} E红=${redE} F红=${redF} G红=${redG} K红=${redK}`);
 
   // ---- I 窄视口回落单列且无横向溢出 ---------------------------------------------------------
   await evalJs(`(() => { document.getElementById("tb-reverse-control")?.remove(); return true; })()`);

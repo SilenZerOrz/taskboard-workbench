@@ -105,10 +105,12 @@ test("七状态与五优先级：逐项可写可读；非法值被拒", () => {
       sequence += 1;
     }
     const template = store.createTask({ projectId: "demo", title: "模板" });
-    // 任意状态互转（核心层不限制转移）
+    // 任意状态互转（核心层不限制转移）。
+    // 唯一例外（FR-83 补口 · 卡 `-162`）：**从「待验收」收口**要走评审门 —— 这里用 `skipReview: true`
+    // 表达「人显式决定跳过评审」，门本身另有 `tests/review-gate.test.mjs` 逐条钉住。
     for (const status of STATUSES) {
       const current = store.getTaskRef(template.id);
-      const task = store.updateTask(template.id, { expectedVersion: current.version, status });
+      const task = store.updateTask(template.id, { expectedVersion: current.version, status, skipReview: true });
       assert.equal(task.status, status);
     }
     assert.throws(() => store.createTask({ projectId: "demo", title: "坏状态", status: "doing" }), (error) => error.code === "INVALID_STATUS");

@@ -7,7 +7,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -25,7 +25,7 @@ import {
   VERIFY_DEFAULT_COMMAND,
   VERIFY_MAX_COMMAND,
 } from "../src/core/verify.mjs";
-import { runVerifyCommand } from "../src/server/verify.mjs";
+import { probeVerifyApplicability, runVerifyCommand } from "../src/server/verify.mjs";
 
 function setup(workspacePath) {
   const store = openStore({ dbPath: ":memory:" });
@@ -152,6 +152,8 @@ test("API：自动复核产证据但**不改状态**；已收口与人工校验�
     const detail = await route("GET", "/api/tasks/" + task.identifier);
     assert.equal(detail.payload.reviewEvidence.autoReview.exitCode, 0, "详情里要带上评审证据包");
 
+    // FR-83 补口（卡 `-162`）：待验收卡收口前要先评审通过（或显式 skipReview），否则 409 REVIEW_NOT_APPROVED
+    store.approveReview(task.identifier, { comment: "评审通过" });
     store.updateTask(task.identifier, { expectedVersion: store.getTaskRef(task.identifier).version, status: "done" });
     await assert.rejects(() => route("POST", "/api/tasks/" + task.identifier + "/auto-review", {}), /已收口/);
 
@@ -269,6 +271,114 @@ test("API：auto-review 回传复核总结与失败点，且证据评论带总�
     // 第二次复核的评论追加在末尾（listComments 按写入顺序升序），要看最后一条。
     const specBody = store.listComments(task.id).slice(-1)[0].body;
     assert.match(specBody, /总结：测试计数：共 458 项 · 通过 458 · 失败 0/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------- 第三态「不适用」（真机 2026-10-28 · hydro T7-B）
+/**
+ * 报障原文：在 hydro-two-ticket 的 T7-B 点「跑一遍自动复核」⇒ `npm error enoent Could not read
+ * package.json`、退出码 **254**、抽屉红字「失败」。工作区是 Java 工程，**根本没有 `npm test`**。
+ * 修法＝补第三态并**不跑**这条注定报错的默认命令。下面逐层钉住。
+ */
+test("结论口径第三态：不适用既不是通过也不是失败", () => {
+  assert.equal(verdictLabel({ exitCode: null, timedOut: false, skipReason: "工作区里没有 package.json（不是 Node 工程）" }), "不适用（工作区里没有 package.json（不是 Node 工程））");
+  assert.equal(verdictLabel({ exitCode: 1, timedOut: false, skipReason: "package.json 里没有 test 脚本" }), "不适用（package.json 里没有 test 脚本）");
+  // 没有 skipReason 时口径一个字不变（回归保护）
+  assert.equal(verdictLabel({ exitCode: 0 }), "通过");
+  assert.equal(verdictLabel({ exitCode: 254 }), "失败（退出码 254）");
+});
+
+test("证据评论往返：不适用（未执行）与不适用（跑过但无 test 脚本）都解析得回来", () => {
+  const cases = [
+    { command: "npm test", exitCode: null, durationMs: 0, timedOut: false, skipReason: "工作区里没有 package.json（不是 Node 工程）", skipped: true },
+    { command: "npm test", exitCode: 1, durationMs: 320, timedOut: false, skipReason: "package.json 里没有 test 脚本", skipped: true },
+    { command: "npm test", exitCode: 0, durationMs: 900, timedOut: false, skipped: false },
+  ];
+  for (const c of cases) {
+    const body = formatVerifyComment(c);
+    const parsed = parseVerifyComment(body);
+    assert.ok(parsed);
+    assert.equal(parsed.command, c.command);
+    assert.equal(parsed.exitCode, c.exitCode, "退出码如实落盘，不美化");
+    assert.equal(parsed.timedOut, false, "不适用**不得**被误解析成超时");
+    assert.equal(parsed.applicable, !c.skipped);
+    assert.equal(parsed.skipReason ?? null, c.skipReason ?? null);
+    assert.equal(parsed.verdict, verdictLabel(c));
+  }
+  // 未执行的落盘形态是「退出码=未执行」，老评论里的「超时」仍按超时解析
+  assert.match(formatVerifyComment({ command: "npm test", exitCode: null, skipReason: "x" }), /退出码=未执行/);
+  assert.equal(parseVerifyComment(formatVerifyComment({ command: "npm test", exitCode: null, timedOut: true })).timedOut, true);
+});
+
+test("适用性探测：只看内置默认命令，且只看 cwd 这一层的 package.json", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "tb-probe-"));
+  try {
+    // ① 非 Node 工程（报障现场的形状：Java 工程目录）
+    assert.deepEqual(await probeVerifyApplicability({ command: VERIFY_DEFAULT_COMMAND, cwd: dir }), { applicable: false, reason: "工作区里没有 package.json（不是 Node 工程）" });
+    // ② 有 package.json 但没 test 脚本
+    writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x", scripts: { build: "tsc" } }), "utf8");
+    assert.deepEqual(await probeVerifyApplicability({ command: VERIFY_DEFAULT_COMMAND, cwd: dir }), { applicable: false, reason: "package.json 里没有 test 脚本" });
+    // ③ 有 test 脚本 ⇒ 该跑就跑
+    writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "x", scripts: { test: "node --test" } }), "utf8");
+    assert.deepEqual(await probeVerifyApplicability({ command: VERIFY_DEFAULT_COMMAND, cwd: dir }), { applicable: true, reason: null });
+    // ④ 人配过的命令一律照跑（不替人判断）
+    assert.deepEqual(await probeVerifyApplicability({ command: "mvn -q test", cwd: dir }), { applicable: true, reason: null });
+    // ⑤ 坏 JSON 不替 npm 吞错
+    writeFileSync(path.join(dir, "package.json"), "{ 坏掉的", "utf8");
+    assert.deepEqual(await probeVerifyApplicability({ command: VERIFY_DEFAULT_COMMAND, cwd: dir }), { applicable: true, reason: null });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("API：非 Node 工作区 + 未配命令 ⇒ 记「不适用」、不跑命令、仍不改状态（hydro T7-B 回归）", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "tb-verify-skip-"));
+  try {
+    const { store, route } = setup(dir); // 空目录＝非 Node 工程
+    const task = store.createTask({ projectId: "p1", title: "Java 工程里的卡" });
+    store.teamSetTaskStatus(task.identifier, { status: "in_review", actor: "team" });
+    const before = store.getTaskRef(task.identifier);
+
+    const r = await route("POST", "/api/tasks/" + task.identifier + "/auto-review", {});
+    assert.equal(r.status, 201);
+    assert.equal(r.payload.applicable, false);
+    assert.equal(r.payload.exitCode, null, "压根没跑命令 ⇒ 不许编一个退出码出来");
+    assert.equal(r.payload.durationMs, 0);
+    assert.match(r.payload.verdict, /^不适用（工作区里没有 package.json/);
+    assert.match(r.payload.skipReason, /package\.json/);
+    assert.match(r.payload.summary, /不是测试失败/);
+    assert.equal(r.payload.counts.tests, null, "没跑就不该有测试计数");
+
+    const body = store.listComments(task.id)[0].body;
+    assert.match(body, /^【自动复核】命令=npm test；退出码=未执行/);
+    assert.match(body, /不适用原因：/);
+    assert.match(body, /mvn -q test/, "证据里要留一条明路，别只报错");
+
+    const detail = await route("GET", "/api/tasks/" + task.identifier);
+    assert.equal(detail.payload.reviewEvidence.autoReview.applicable, false, "抽屉据此画第三态而不是红色失败");
+    assert.equal(detail.payload.reviewEvidence.autoReview.timedOut, false);
+
+    const after = store.getTaskRef(task.identifier);
+    assert.equal(after.status, before.status, "自动复核**不得**改状态");
+    assert.equal(after.version, before.version);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("API：同一条卡配了复核动作 ⇒ 即使不是 Node 工程也照跑（不替人判断）", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "tb-verify-cfg-"));
+  try {
+    const { store, route } = setup(dir);
+    const task = store.createTask({ projectId: "p1", title: "Java 工程里的卡", verifyCommand: "node -e \"console.log('ok')\"" });
+    store.teamSetTaskStatus(task.identifier, { status: "in_review", actor: "team" });
+    const r = await route("POST", "/api/tasks/" + task.identifier + "/auto-review", {});
+    assert.equal(r.status, 201);
+    assert.equal(r.payload.applicable, true, "人配过的命令不问适用性");
+    assert.equal(r.payload.exitCode, 0);
+    assert.equal(r.payload.verdict, "通过");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

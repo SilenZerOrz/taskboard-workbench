@@ -30,8 +30,16 @@ export function normalizeVerifyCommand(raw) {
   return s === "" ? VERIFY_DEFAULT_COMMAND : s.slice(0, VERIFY_MAX_COMMAND);
 }
 
-/** 人能读的结论（评审人第一眼看的就这一行）。 */
-export function verdictLabel({ exitCode, timedOut } = {}) {
+/**
+ * 人能读的结论（评审人第一眼看的就这一行）。
+ *
+ * 真机报障（2026-10-28 · hydro-two-ticket 的 T7-B）：默认命令 `npm test` 在一个 **不是 Node 工程**
+ * 的工作区里跑，必然 `ENOENT package.json` ⇒ 退出码 254 ⇒ 结论被写成「失败」——**把"这条命令在这里
+ * 不适用"谎报成"你的测试挂了"**，评审人据此点「请求返工」是纯误伤。
+ * 故补第三态 `skipReason`：**不适用**既不是通过也不是失败，退出码照实落盘，不美化。
+ */
+export function verdictLabel({ exitCode, timedOut, skipReason } = {}) {
+  if (skipReason) return `不适用（${skipReason}）`;
   if (timedOut) return "超时未完成";
   return exitCode === 0 ? "通过" : `失败（退出码 ${exitCode}）`;
 }
@@ -79,10 +87,13 @@ export function summarizeVerifyOutput({ exitCode, timedOut = false, tail = "" } 
 }
 
 /** 一次复核结果 → 证据评论正文（首行保持机器可读格式；总结与失败点各占一行，避免分隔符歧义）。 */
-export function formatVerifyComment({ command, exitCode, durationMs = 0, timedOut = false, tail = "", summary = "", failures = [], acceptance = "" } = {}) {
+export function formatVerifyComment({ command, exitCode, durationMs = 0, timedOut = false, tail = "", summary = "", failures = [], acceptance = "", skipReason = null } = {}) {
   const seconds = (Math.round(Number(durationMs) / 100) / 10).toFixed(1);
-  const head = `${VERIFY_COMMENT_PREFIX}命令=${command}；退出码=${timedOut ? "超时" : exitCode}；耗时=${seconds}s；结论=${verdictLabel({ exitCode, timedOut })}`;
+  // 「未执行」只出现在「不适用」且确实没跑命令时（exitCode 为 null）；跑过但结论不适用时退出码照实写。
+  const code = timedOut ? "超时" : (skipReason && exitCode === null ? "未执行" : exitCode);
+  const head = `${VERIFY_COMMENT_PREFIX}命令=${command}；退出码=${code}；耗时=${seconds}s；结论=${verdictLabel({ exitCode, timedOut, skipReason })}`;
   const lines = [head];
+  if (skipReason) lines.push(`不适用原因：${skipReason}`);
   // FR-94：把**本卡当初写下的验收标准**一并落进证据 —— 评审人一眼看到"按什么判定"，
   // 而不是只看一个退出码（真机反馈：「为了快速复核」）。未记录标准时**不写这一块**，不臆断。
   const standard = String(acceptance ?? "").trim().slice(0, VERIFY_MAX_ACCEPTANCE);
@@ -104,6 +115,10 @@ export function parseVerifyComment(body) {
   const numeric = /^-?\d+$/.test(rawCode);
   const exitCode = numeric ? Number(rawCode) : null;
   const text = String(body ?? "");
+  const verdict = m[4].trim();
+  // 第三态：结论以「不适用」开头 ⇒ 这条命令在该工作区不适用（不是测试失败）。老评论无此态 ⇒ applicable=true。
+  const applicable = !verdict.startsWith("不适用");
+  const skipReason = applicable ? null : ((/^不适用原因：(.*)$/m.exec(text)?.[1] ?? "").trim() || null);
   const summary = (/^总结：(.*)$/m.exec(text)?.[1] ?? "").trim() || null;
   const failBlock = /^失败点：\n((?:- .*\n?)+)/m.exec(text)?.[1] ?? "";
   const failures = failBlock.split(/\r?\n/).map((l) => l.replace(/^-\s*/, "").trim()).filter(Boolean);
@@ -112,9 +127,11 @@ export function parseVerifyComment(body) {
   return {
     command: m[1],
     exitCode,
-    timedOut: !numeric, // 非数字只可能是「超时」这类非正常结束
+    timedOut: /超时/.test(rawCode), // 只有「超时」算超时；「未执行」是"不适用"的落盘形态
+    applicable,
+    skipReason,
     durationMs: Math.round(Number(m[3]) * 1000),
-    verdict: m[4].trim(),
+    verdict,
     summary,
     failures,
     tail,

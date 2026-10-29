@@ -88,16 +88,11 @@ export function registerTaskboardTools({ tools, store, events = null, defineTool
         priority: args?.priority,
         owner: args?.owner,
         labels: args?.labels ?? [],
+        // P0：归因**随建卡同事务**（旧实现是「先建卡再关联」⇒ 跨项目报错时会留一张孤儿卡，
+        // 这正是无归因卡的一个生产源）。现在跨项目直接整笔回滚：**不建卡、不吃编号**。
+        requirementId: args?.requirement ?? null,
       });
-      // 归因（可选）：给了条目就顺手关联，省得之后再补归因门。
-      let requirement = null;
-      if (args?.requirement) {
-        const item = store.requireRequirementItemRef(args.requirement);
-        if (item.projectId !== project.id) {
-          throw new TbError("DEPENDENCY_CROSS_PROJECT", `条目与任务必须同项目（条目 ${item.projectId}，任务 ${project.id}）；任务已建为 ${task.identifier}，请改用 project=${item.projectId} 或换条目`, { identifier: task.identifier, requirementProjectId: item.projectId, taskProjectId: project.id });
-        }
-        requirement = store.associateRequirementTask(item.id, task.id).requirementId ?? null;
-      }
+      const requirement = task.requirementId ?? null;
       changed(task);
       // FR-29 验收要点③：落在默认项目（cwd 未匹配）时**必须有明确提示** —— 由工具返回值如实带出。
       return {

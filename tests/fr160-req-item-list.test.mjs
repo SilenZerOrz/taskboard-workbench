@@ -147,3 +147,65 @@ test("卡 -160-7：不改 FR-91 的状态口径（四态词表 / 筛选 / 中文
   assert.match(rule(".req-stack .req-list") ?? "", /flex-direction:\s*column/, "条目列表仍是单列（不得回退成多列网格方块）");
   assert.ok(!/\.req-stack \.req-list\s*\{[^}]*grid-template-columns/.test(CSS), "条目列表本身不得变成网格");
 });
+
+// ── 列表内「完成度结论」（验收第 2 条的收口 · 2026-10-27 第二轮） ─────────────
+
+test("卡 -160-8：列表内**逐行可见完成度结论**，且取数只走既有 /completion 端点（不新增通道）", () => {
+  // 行上真的多出一列，并带上标识（可样式化、可断言、可点）
+  assert.ok(SRC.includes("req-completion-chip"), "列表行要有完成度胶囊（验收：不必逐条打开详情）");
+  assert.ok(SRC.includes("chip.dataset.reqCompletion = it.identifier"), "胶囊要带条目标识（便于原地更新）");
+  assert.ok(/li\.append\(main, statusChip, completionChip, meta\)/.test(SRC), "完成度是状态与来源之间的独立一列（行宽只留给「编号 + 标题 + 状态 + 完成度」）");
+  // 复用既有端点：`GET /api/requirements/items/:ref/completion`（FR-91 已落地，只读、不改状态）
+  assert.ok(SRC.includes('api("GET", `/api/requirements/items/${encodeURIComponent(it.identifier)}/completion`)'), "完成度必须复用既有逐条 completion 端点");
+  // 不得新增取数通道：既不许给列表接口加聚合参数，也不许新开一个"批量 completion"端点
+  assert.ok(!/\/api\/requirements\/items\?[^`"]*completion/.test(SRC), "不得给列表接口新增 completion 聚合参数（属后端/共享文件扩范围）");
+  assert.ok(!SRC.includes("/api/requirements/items/completion"), "不得新开批量 completion 端点");
+  // 面板头另给一条面板级结论计数（这一轮之前只能看到状态，看不到"能不能收口"）
+  assert.ok(SRC.includes("req-ready-count"), "面板头要有「可收口 N」计数");
+  assert.ok(SRC.includes("可收口 ${readyIds.length}"), "可收口计数要按实算，不许写死");
+  assert.ok(rule(".req-ready-count"), "「可收口」计数要有样式");
+});
+
+test("卡 -160-9：四档结论词与配色齐（可收口 / 待验收 / 受阻 / N/M 收口 / 无任务）", () => {
+  for (const label of ["可收口", "无任务", "待验收 ${", "受阻 ${"]) {
+    assert.ok(SRC.includes(label), `结论词阵缺失：${label}`);
+  }
+  assert.ok(SRC.includes("${c.closed ?? 0}/${c.total ?? 0} 收口"), "进行中要给出「已收口/总数」的量化结论");
+  assert.ok(SRC.includes('c.verdict === "no-tasks"'), "无关联任务要与「未收口」区分开（否则空需求看着像做了一半）");
+  // 每一档都有自己的类名与配色，不靠"全都是灰色胶囊"
+  for (const cls of ["is-ready", "is-review", "is-progress", "is-blocked", "is-none"]) {
+    assert.ok(SRC.includes(`"${cls}"`) || SRC.includes(cls), `结论档位缺类名：${cls}`);
+    assert.ok(rule(`.req-stack .req-completion-chip.${cls}`), `结论档位缺配色：${cls}`);
+  }
+  const chip = rule(".req-stack .req-completion-chip");
+  assert.ok(chip, "完成度胶囊要有样式块");
+  assert.match(chip, /flex:\s*0 0 auto/, "完成度列宽度固定，逐行才对得齐");
+  assert.match(chip, /min-width:/, "要有最小宽度（`无任务` 与 `1/2 收口` 不抖动）");
+  assert.match(chip, /min-height:\s*0/, "按钮默认 min-height:28px 会把紧凑行撑高，必须压掉");
+});
+
+test("卡 -160-10：懒取有并发上限 + 缓存 + 在途去重（122 条真机数据也不打请求风暴）", () => {
+  assert.match(SRC, /REQ_COMPLETION_TTL\s*=\s*\d+/, "要有缓存 TTL（重渲染不重复打同一行）");
+  assert.match(SRC, /REQ_COMPLETION_CONCURRENCY\s*=\s*[1-9]\d*/, "要有并发上限（否则一屏 N 条同时打满）");
+  assert.ok(SRC.includes("completionInflight"), "同一行的在途请求要去重");
+  assert.ok(SRC.includes("async function hydrateReqCompletions("), "要有统一的懒取入口");
+  assert.ok(SRC.includes("void hydrateReqCompletions(visible, refreshReadyCount)"), "列表渲染后要真的触发懒取");
+  // 取到后**原地更新**该行，不整表重渲染（否则闪烁 + 滚动位置丢失 + 请求循环）
+  assert.ok(SRC.includes("const paintReqCompletion ="), "要有原地刷新单行的函数");
+  assert.ok(SRC.includes("chip.className = `chip req-completion-chip ${reqVerdictClass(payload)}`"), "原地刷新要更新档位类名（缓存/首次都要一致）");
+  assert.ok(SRC.includes("if (!chip) return;"), "列表已重渲染时要安全跳过（不能对着已脱离文档的节点写）");
+  assert.ok(SRC.includes("点开详情会重新取"), "单条取数失败不得打断整页（留「…」、开详情重取）");
+});
+
+test("卡 -160-11：胶囊即「结论入口」—— 点它开抽屉并定位到「关联任务完成情况」（FR-91 不回退）", () => {
+  assert.ok(SRC.includes("reqState.focusCompletion = true"), "点胶囊要标记「这次要定位到完成度段」");
+  assert.ok(SRC.includes("const focusCompletion = reqState.focusCompletion"), "定位标记要一次性消费（之后任何详情刷新不得抢滚动）");
+  assert.ok(SRC.includes("sec2.scrollIntoView({ block: \"start\" })"), "要真的滚到该段（不是只开抽屉了事）");
+  assert.ok(SRC.includes('sec2.dataset.reqSection = "completion"'), "完成度段要有可定位标识");
+  // FR-91 详情段一字未动：关联任务清单 + 自动结论 + 人工确认入口都还在
+  assert.ok(SRC.includes("关联任务完成情况（${c.total ?? 0} 个任务）"), "详情里的关联任务完成情况不得回退");
+  assert.ok(SRC.includes("req-completion-verdict"), "自动结论块不得回退");
+  assert.ok(SRC.includes("人工确认：标记需求完成"), "人工确认入口不得回退（自动只给建议）");
+  // 详情端点顺带回写缓存（看完详情回到列表不该读到旧结论）
+  assert.ok(SRC.includes("if (completion) reqState.completion.set(identifier, { at: Date.now(), payload: completion });"), "详情取到的最新完成度要回写列表缓存");
+});
