@@ -74,6 +74,7 @@ node tools/dsh-core-pkg-dedupe/verify.mjs          # 验证（务必不带 NODE_
 
 ## 边界（诚实写明）
 
+- **rc.5 起依赖倾斜改由 profile 显式 override 管理，本脚本仅作应急；rc.3 已清零后基本无事可做。**
 - 只对「副本与宿主那份内容相同」的包安全。**桌面应用实例（`profiles/desktop`）未动**：
   它的两份 `dsh-tools` 与宿主那份 sha256 不同（属不同版本），强行归一等于换版本。
 - `--apply` 之后若再执行 `pnpm install` / `dsh plugin add`，副本会被装回来 ⇒ **SOP：每次装完跑一次 `--check`**。
