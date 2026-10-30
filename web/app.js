@@ -3423,7 +3423,7 @@
           li.dataset.status = it.status;
           const statusTxt = reqStatusLabel(it.status);
           li.title = `状态：${statusTxt}`;
-          const srcLabel = it.source === "intake" ? "资料索引" : it.source === "elaborated-ai" ? "AI" : it.source === "elaborated-rule" ? "规则" : "手工";
+          const srcLabel = it.source === "intake" ? "资料索引" : it.source === "elaborated-ai" ? "AI" : it.source === "elaborated-rule" ? "规则" : it.source === "mcp" ? "MCP" : "手工";
           const main = mk("div", "req-item-main");
           const cb = mk("input"); cb.type = "checkbox"; cb.checked = reqState.selected.has(it.identifier); cb.title = "选择";
           cb.addEventListener("click", (e) => { e.stopPropagation(); if (cb.checked) reqState.selected.add(it.identifier); else reqState.selected.delete(it.identifier); void renderRequirements(); });
@@ -3577,7 +3577,7 @@
         head.appendChild(mk("p", "req-meta", item.identifier));
         head.appendChild(mk("h2", null, item.title));
         host.appendChild(head);
-        const srcLabel = item.source === "intake" ? "资料索引(引入)" : item.source === "elaborated-ai" ? "AI 拆解" : item.source === "elaborated-rule" ? "规则拆解" : "手工";
+        const srcLabel = item.source === "intake" ? "资料索引(引入)" : item.source === "elaborated-ai" ? "AI 拆解" : item.source === "elaborated-rule" ? "规则拆解" : item.source === "mcp" ? "MCP" : "手工";
         const statusTxt = reqStatusLabel(item.status);
         const dl = mk("dl", "req-fields");
         const addF = (k, v, cls) => { dl.appendChild(mk("dt", null, k)); const dd = mk("dd", null, v); if (cls) dd.className = cls; dl.appendChild(dd); };

@@ -6,6 +6,26 @@
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 每个版本对应一个 annotated tag（`vX.Y.Z`）与一条 GitHub Release；npm dist-tag 与 dsh 兼容区间随版本记录。
 
+## [0.2.3] - 2026-10-30
+
+> 本版只有一条修复：**把「只影响人读」的错标改对**（数据一直是对的）。
+> 触发：`-176` 证据评论登记的已知限制 —— `REQUIREMENT_SOURCES` 已含 `mcp`，但前端来源文案只认
+> `intake / elaborated-ai / elaborated-rule`，其余一律回落「手工」。
+
+### 修复
+
+- **需求条目来源标签：`mcp` 被错标为「手工」（卡 `-179` / 需求 `R134`）** ——
+  MCP 建的条目在**列表胶囊**与**详情「来源」字段**都显示成「手工」，人会以为是自己手工建的，
+  进而误判「谁该补验收」。数据侧（`source="mcp"`）自 0.2.2 起就是对的，**只有人读的那一层在撒谎**。
+  修：`web/app.js` 两处来源文案三元各补 `mcp → "MCP"` 分支（列表 `srcLabel` / 详情 `srcLabel`），
+  其余四档文案（资料索引 / AI / 规则 / 兜底手工）**零改动**。
+  **守卫**：新增真渲染验证台 `tools/bench-req-source-label.mjs`（临时 `dataDir` + 随机端口 + 真 headless Chrome + CDP，
+  读渲染后 DOM 的**列表胶囊**与**详情字段**实际文本，A/B/C/D 四条 + `TB_BENCH_WEB_DIR` 反向对照）；
+  配套 `tests/bench-req-source-label-coverage.test.mjs`（5 条）进 `npm test`：含**源码守卫**（两处三元都必须有 `mcp` 分支、
+  兜底档必须仍是「手工」）+ 台子不被削薄（隔离形态 / 沙箱自检 / 五档种子 / 反向对照入口 / 退出码契约）。
+  **读数**：修复前 A/B 双红（`mcp=手工`、详情`手工`）→ 修复后 **4/4 PASS**（`mcp=MCP`，intake 详情仍「资料索引(引入)」）；
+  反向对照（注入旧口径）**2/4**（A/B 转红）；源码守卫同样反向验证（删掉 `mcp` 分支 ⇒ 断言失败）。
+
 ## [0.2.2] - 2026-10-29
 
 > 本版是 **0.2.1 之后的第一个小版本**（未发布 npm / 未出 Release 时为「就绪」状态）。
