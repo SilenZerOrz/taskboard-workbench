@@ -69,6 +69,40 @@ export function scanText(text, { level = "all" } = {}) {
   return hits;
 }
 
+/**
+ * N8 发布完整性：`CHANGELOG.md` 的**第一个**版本标题。
+ *
+ * 只认 `## [x]` 二级标题（`### 修复` 这类小节不算），返回 `{ raw, version }`；找不到返回 `null`。
+ * 纯函数：不读盘、不看 git，便于单测。
+ */
+export function parseChangelogHead(text) {
+  for (const line of String(text ?? "").split("\n")) {
+    const m = /^##\s+\[([^\]]+)\]/.exec(line);
+    if (m) return { raw: line.trim(), version: m[1].trim() };
+  }
+  return null;
+}
+
+/**
+ * N8 发布完整性：**CHANGELOG 头部版本必须 == `package.json` version，且不得停在 `[Unreleased]`**。
+ *
+ * 为什么需要它（0.2.1 实测教训）：tag 当时打在 `7162ab3`，CHANGELOG 定稿在其后的 `bf4139f` ⇒
+ * 「已发布内容与声明不一致」；当时没有任何机器守卫能在 tag / publish 前拦住，只能靠人记得先定稿。
+ *
+ * 返回阻断项数组（空数组 = 通过）。纯函数，便于测试。
+ */
+export function changelogProblems(text, pkgVersion) {
+  const head = parseChangelogHead(text);
+  if (!head) return ["CHANGELOG 未找到版本标题（期望形如 `## [0.2.3] - 2026-10-30`）"];
+  if (/^unreleased$/i.test(head.version)) {
+    return [`CHANGELOG 头部仍是 [Unreleased]：发布前必须定稿为 \`## [${pkgVersion}] - <日期>\`（N8）`];
+  }
+  if (head.version !== String(pkgVersion)) {
+    return [`CHANGELOG 头部版本 ${head.version} ≠ package.json ${String(pkgVersion)}（版本漂移，N8）`];
+  }
+  return [];
+}
+
 function run(cmd, args, opts = {}) {
   try {
     return { ok: true, out: execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...opts }) };
@@ -162,6 +196,15 @@ function main(argv) {
 
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
   const pkgProblems = [];
+  // N8（卡 `-181` / 需求 `R136`）：发布完整性 —— CHANGELOG 头版本必须等于 package.json 且非 [Unreleased]。
+  let changelogHead = null;
+  try {
+    const changelogText = readFileSync(new URL("../CHANGELOG.md", import.meta.url), "utf8");
+    changelogHead = parseChangelogHead(changelogText);
+    pkgProblems.push(...changelogProblems(changelogText, pkg.version));
+  } catch (e) {
+    pkgProblems.push(`CHANGELOG.md 读取失败：${e?.message ?? String(e)}`);
+  }
   if (pkg.files?.includes?.("docs")) pkgProblems.push("package.json#files 含整个 docs 目录");
   if (!pkg.files?.includes?.("spec/团队agent.md")) pkgProblems.push("package.json#files 缺随包契约 spec/团队agent.md（FR-22）");
 
@@ -175,6 +218,7 @@ function main(argv) {
       findings,
       problems: [...problems, ...pkgProblems],
       pack: pack ? { total: pack.total, bad: pack.bad, missing: pack.missing } : null,
+      release: { changelogHead: changelogHead?.version ?? null, pkgVersion: pkg.version },
     }, null, 2));
     return fatal ? 1 : 0;
   }
@@ -186,6 +230,8 @@ function main(argv) {
     console.log(`  ${pack.bad.length === 0 ? "✓" : "✗"} npm tarball：${pack.total} 文件${pack.bad.length ? `，越界 ${pack.bad.join(", ")}` : "，无 docs/tests/.git"}`);
     if (pack.missing.length) console.log(`  ✗ npm tarball 缺必需文件：${pack.missing.join(", ")}`);
   }
+  const releaseGate = pkgProblems.filter((p) => /CHANGELOG|unreleased/i.test(p));
+  if (releaseGate.length === 0) console.log(`  ✓ 发布完整性（N8）：CHANGELOG 头 ${changelogHead?.version ?? "?"} = package.json ${pkg.version}`);
   for (const p of [...problems, ...pkgProblems]) console.log(`  ✗ ${p}`);
   console.log(fatal ? "结论：✗ 阻断发布（请处理后重跑）" : "结论：✓ 通过（可继续发布流程）");
   return fatal ? 1 : 0;
