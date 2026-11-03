@@ -6,6 +6,45 @@
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 每个版本对应一个 annotated tag（`vX.Y.Z`）与一条 GitHub Release；npm dist-tag 与 dsh 兼容区间随版本记录。
 
+## [0.3.0] - 2026-11-03
+
+> 主题：让「待验收 → 确认」这段**先变得可信** —— 有度量、有事件、有单一口径、有结构化证据。
+> 本版六张卡全部严格走看板全环（`-193` … `-198`，各带证据四节）；`npm test` **974 / 0**、`release-precheck` **EXIT=0**。
+> **未做**：npm publish / GitHub Release（另批）；生产重载后的快照复评见 `docs/进度/`。
+
+### 新增
+
+- **基线度量脚本 `tools/baseline-metrics.mjs`（卡 `-193` / 需求 `R146`）** —— 把「改善了多少」变成可复跑读数：
+  快照 `.data/backup-20261103.sqlite`（sha256 `21182435…`）、**M1 拆两层**（当前在途滞留中位 **148.4h** vs 已完成周期中位 **19.1h**——
+  只报一个会得出「改善 87%」的假结论）、`done` 事件覆盖 **74.2%**（漏 25.8%）、M2 **3.2**；M3/M4 **明标不可测、不写 0**。
+- **阶段推导单一口径 `ticketStage()`（卡 `-196` / `-198` / 需求 `R149`）** —— 新模块 `src/core/ticket-stage.mjs`：
+  **不写第五套判断**，直接复用 `deriveNextStep` / `assessTask` / `latestAutoReview` / `evidenceFormatOk` 只做归一；
+  显式区分 `format_ok`（四字段齐、无内容判定）与 `ready`（判定与证据/版本一致），判过又变 ⇒ `stale`。
+  `GET /api/tasks/:ref` 新增只读字段 `ticketStage`；任务抽屉显示交付阶段徽标，**`stale` 用警示色**。
+  **安全优先级**：`stale` 先于「只差你点完成」——判定过期时不许邀请人确认他没看过的那一版。
+- **交付物证据结构化 + 授权快照（卡 `-197` / 需求 `R150`）** —— `task_evidence`（四字段：判定 / 偏离 / 边界 / 产物 + `artifact_refs` + actor + task_version）
+  与 `task_mandates`（**append-only**：只有 insert，范围变大 = 新行）。**门在事务前**：四字段缺一即 `EVIDENCE_INCOMPLETE` 且零落库；
+  `artifact_refs` 一条解不开即整体 `unresolved`，不进 `format_ok`。授权快照覆盖**三条认领入口**
+  （`claimTask` / 看板 `PATCH→in_progress` / 团队通道 `teamSetTaskStatus→in_progress`）。
+
+### 修复
+
+- **状态事件漏记（卡 `-194` / 需求 `R147`）** —— `teamSetTaskStatus` 与 `applyTeamTaskOutcome`（completed / failed）此前**直接写列不发事件**，
+  实测 175 次完成类变更中 **46 次（26%）无 `status_changed`**；而诊断 / 看护 / 通知 / M1 度量**全部**建在事件流上。
+  现两处落点补齐（同一状态重复写不产生假事件）。
+- **待验收「发起评审」时间缺失（卡 `-195` / 需求 `R148`）** —— 实测 16 张 `in_review` 中 **10 张 `review_requested_at` 为空**，
+  M1 因此无从计算。现三条进 `in_review` 的路径（看板 PATCH / 执行侧与团队通道 / 团队回流）都补记，**幂等**（不覆盖首值）、
+  **不涨 version**（记账字段不污染乐观锁）。
+
+### 兼容性与升级注意
+
+- **`schemaVersion` 12 → 13**：新增 `task_evidence` / `task_mandates` 两表，`create table if not exists` **可重入**；
+  已在真实库副本上验证（连开两次 `schema=13`、217 条任务不变、无报错）。重启宿主即自动迁移。
+- **`review_requested_at` 只对新增生效**：存量 10 张 `in_review` 空值**不自动回填**（属 P0①-b，需人工执行补发）。
+- **`ticketStage` 是新增只读字段**：既有 `task` / `comments` / `reviewEvidence` 语义未变；详情 GET **零写副作用**（新增测试断言）。
+- **`ready` / `stale` 两态暂不可达**：判定层（`decision_log`）属 0-C，未建表前 `decision` 显式 `null`，不伪造判定。
+- 任务抽屉的「下一步 / 看护 / 诊断」三处旧判断**本版未合并**（沙箱内无浏览器验证台，盲删即静默删功能）⇒ 见 `R151`。
+
 ## [0.2.3] - 2026-10-30
 
 > 本版只有一条修复：**把「只影响人读」的错标改对**（数据一直是对的）。
