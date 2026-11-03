@@ -29,13 +29,14 @@ import {
   clampElaborateLimit, ELABORATE_PREVIEW_SIZE, DEFAULT_ELABORATE_LIMIT, MAX_ELABORATE_LIMIT,
 } from "./requirements.mjs";
 import { TEAM_WRITABLE_STATUSES } from "./team.mjs";
+import { evidenceProblems, normalizeArtifactRefs, verifyArtifactRefs } from "./evidence.mjs";
 import { REVIEW_SOURCE_STATUSES, REVIEW_IDLE_MS, detectReviewDeadlock, reviewReturnStatus } from "./review.mjs";
 import { NOTIFY_DELIVERY_MODES, buildNotifyMessage, normalizeDeliveryMode, selectNotifyEvents } from "./notify.mjs";
 import { HUMAN_REVIEW_LABEL, assertConclusion, categoryLabel, conclusionOutcome, isHumanReviewTask, validateHumanReviewDraft } from "./human-review.mjs";
 // 项目记忆（2026-10-28 拍板 D-M1）：L2 记忆条目，与内核表同库；**不是第二真源**（必带 provenance）。
 import { createMemoryApi } from "./memory.mjs";
 
-export const SCHEMA_VERSION = 12; // 12：契约快照（project_contract / flow_injections · P1）
+export const SCHEMA_VERSION = 13; // 13：交付物证据 task_evidence + 授权快照 task_mandates（0-B · 卡 -197）；12：契约快照
 // 条目化数量口径（卡 `-169` P4②）：定义在 requirements.mjs（纯模块），此处转发以便调用方就近取用。
 export { clampElaborateLimit, DEFAULT_ELABORATE_LIMIT, MAX_ELABORATE_LIMIT, ELABORATE_PREVIEW_SIZE };
 
@@ -270,6 +271,26 @@ create table if not exists task_runs (
   created_at text not null, updated_at text not null
 );
 create unique index if not exists task_runs_task_attempt_idx on task_runs(task_id, attempt);
+-- 交付物证据（FR-106 / 0-B）：**结构化**落库，同一任务「最新一条」为有效证据；历史不回填。
+-- 为什么不是一段自由文本评论：评论表没有 author 字段（805 条作者不可机读），且"四节齐不齐"
+-- 无法被机器判定 —— 于是评审、Router、度量都只能靠人读。
+create table if not exists task_evidence (
+  id text primary key, task_id text not null references tasks(id) on delete cascade,
+  verdict text not null, deviation text not null default '', boundary text not null default '',
+  artifacts text not null default '[]', artifact_refs text not null default '[]',
+  refs_state text not null default 'unchecked',
+  actor text not null, task_version integer not null, created_at text not null
+);
+create index if not exists task_evidence_task_idx on task_evidence(task_id, created_at);
+-- 授权快照（FR-107 / 0-B）：**append-only**，只有 insert；范围变大 = 新行（不 update 旧行）。
+-- 起因：2026-10-28 一次补 69 张无归因卡，其中 56 张**真实来源已不可考** —— 因为"当初凭什么做"没有载体。
+create table if not exists task_mandates (
+  id text primary key, task_id text not null references tasks(id) on delete cascade,
+  requirement_ref text, contract_version text, norms_digest text,
+  scope text not null default '', claim_owner text, claim_source text, created_at text not null
+);
+create index if not exists task_mandates_task_idx on task_mandates(task_id, created_at);
+
 create index if not exists task_runs_task_idx on task_runs(task_id, started_at);
 -- 任务事件流（FR-82）：**追加式**，任务内 seq 单调 + 全库 cursor 单调（FR-81 的推送游标）。
 create table if not exists task_events (
@@ -584,6 +605,18 @@ function isConstraintError(error, needle) {
 }
 
 /** 一次性迁移（幂等）：1) 老库补 owner 列；2) `owner:<role>` 标签搬进 owner 并从 labels 移除。 */
+function rowToTaskEvidence(row) {
+  return {
+    id: row.id, taskId: row.task_id,
+    verdict: row.verdict, deviation: row.deviation, boundary: row.boundary,
+    artifacts: safeJsonArray(row.artifacts), artifactRefs: safeJsonArray(row.artifact_refs),
+    refsState: row.refs_state, actor: row.actor, taskVersion: row.task_version, createdAt: row.created_at,
+  };
+}
+function safeJsonArray(raw) {
+  try { const v = JSON.parse(raw ?? "[]"); return Array.isArray(v) ? v : []; } catch { return []; }
+}
+
 export function migrateOwnerField(db) {
   const columns = db.prepare("pragma table_info(tasks)").all().map((row) => row.name);
   let addedColumn = false;
@@ -908,6 +941,27 @@ export function openStore(options = {}) {
     } catch { /* 审计写失败也不能影响业务写入 */ }
     return verdict;
   }
+
+    /**
+     * FR-107 内部助手：**冻结一条授权快照**（append-only；失败不阻断主流程）。
+     *
+     * 三条路径都要冻结，因为本项目口径里「认领」有三种入口，缺一条就等于 100% 结构化率是假的：
+     *   · `claimTask`（执行器拿锁）—— scope=claim
+     *   · `updateTask → in_progress`（看板拖拽 / HTTP PATCH）—— scope=board
+     *   · `teamSetTaskStatus → in_progress`（执行侧 / 团队通道 / MCP）—— scope=team
+     * 范围变大 = 新行（不 update 旧行），所以重复进入 in_progress 会产生多行，这是刻意的。
+     */
+  const freezeMandate = (taskId, { scope = "claim", claimOwner = null, claimSource = null } = {}) => {
+      try {
+        const t = store.getTaskById(taskId);
+        if (!t) return null;
+        let requirementRef = null;
+        try {
+          requirementRef = t.requirementId ? (store.getRequirementItemById(t.requirementId)?.identifier ?? null) : null;
+        } catch { requirementRef = null; }
+        return store.recordTaskMandate(t.identifier, { requirementRef, scope, claimOwner, claimSource });
+      } catch { return null; }
+    }
 
   const store = {
     schemaVersion: SCHEMA_VERSION,
@@ -1487,6 +1541,10 @@ export function openStore(options = {}) {
         // FR-82：状态变化 → 事件流追加（不再让各处各自造"状态历史"）。
         // 注意：**纯列内排序不写任何事件** —— 版式调整不是任务生命周期事件，塞进去只会污染事件流与通知口径。
         store.recordTaskEvent(current.id, { type: "status_changed", from: current.status, to: nextStatus, actor: changes.actor ?? "human" });
+        // FR-111（`-195`）：进待验收就补评审发起时间（幂等；已有值不覆盖）
+        if (nextStatus === "in_review" && !current.reviewRequestedAt) store.markReviewRequested(current.id, timestamp);
+        // FR-107（`-197`）：看板 PATCH 进入「进行中」= 本项目口径下的一次认领 ⇒ 冻结授权快照
+        if (nextStatus === "in_progress") freezeMandate(current.id, { scope: "board", claimOwner: nextOwner ?? actor, claimSource: current.status });
       }
       // FR-83 补口（卡 `-162`）：逃生口放行后必须**可回看** —— 这是"人显式决定跳过评审"的取证点，
       // 否则事后只看到一张 done 卡，分不清"评审通过后收口"与"跳过评审收口"。
@@ -2122,6 +2180,8 @@ export function openStore(options = {}) {
       if (res.changes !== 1) return { claimed: false, reason: "cas-lost", task: store.getTaskById(task.id) };
       // FR-82：**认领即开一条尝试记录**（授权→尝试→结论 可回看）
       const run = store.startTaskRun(task.identifier, { sessionId, claimLock: lock, actor: sessionId ?? "team", now: ts });
+      // FR-107（`-197`）：认领即冻结**授权事实**（append-only）。失败不阻断认领（快照是留痕，不是门）。
+      freezeMandate(task.id, { scope: "claim", claimOwner: sessionId ?? null, claimSource: sourceStatus ?? cur?.status ?? null });
       store.recordTaskEvent(task.id, { type: "claimed", to: "claimed", actor: sessionId ?? "team", detail: `认领（来源 ${sourceStatus ?? cur?.status ?? "-"}）`, now: ts });
       return { claimed: true, claim: { lock, expiresAt: expires, owner: sessionId ?? null, source: sourceStatus ?? cur?.status ?? null }, run: run.started ? run.run : null, task: store.getTaskById(task.id) };
     },
@@ -2584,6 +2644,81 @@ export function openStore(options = {}) {
      * 追加一条任务事件（**追加式**，供看护 / 通知 / 详情共同消费——不各自造数）。
      * 事件写失败不阻断主流程（返回 null），保证生命周期方法不被可观测性拖垮。
      */
+    /**
+     * FR-111（卡 `-195`）：**进了「待验收」就视为已发起评审** —— 补 `review_requested_at`。
+     *
+     * 为什么要兜底：`requestReview` 会写这个字段，但「看板点下一列」/ 团队回流 / 执行侧置待验收
+     * 这三条路径都只改 `status`，于是出现「卡在待验收列、却没有任何人被请求评审」——
+     * `-193` 快照实测 16 张里 10 张如此（中位滞留 148.4h）。
+     *
+     * 三条纪律：
+     * 1. **幂等**：已有值不覆盖（首次提交时间才是度量口径，M1 全靠它）。
+     * 2. **不涨 version**：这是同一次逻辑写入的记账字段；涨了会破坏调用方 `expectedVersion` 语义。
+     * 3. **不改 `review_state`**：置 `pending` 是「显式请求评审」的动作语义（会释放认领、记来源列），
+     *    混用会把「人点下一列」变成「重设评审轮次」。
+     */
+    markReviewRequested(taskId, at = nowIso()) {
+      if (!taskId) return null;
+      try {
+        db.prepare("update tasks set review_requested_at = ? where id = ? and (review_requested_at is null or review_requested_at = '')").run(at, taskId);
+        return at;
+      } catch { return null; }
+    },
+    /**
+     * 交付物证据（FR-106 / 卡 `-197`）：**门在落库前** —— 四字段缺一个就整笔拒绝（`EVIDENCE_INCOMPLETE`），
+     * 不留半条记录。`refs_state` 由调用方给定的 `resolve` 决定（不给则 `unchecked`）：解不开的
+     * `artifact_refs` 永远不许被当作"已校验通过"。
+     */
+    addTaskEvidence(ref, input = {}) {
+      const task = store.requireTaskRef(ref);
+      const problems = evidenceProblems(input);
+      if (problems.length) {
+        throw new TbError("EVIDENCE_INCOMPLETE", `交付物证据四字段不全：${problems.map((p) => p.field).join(", ")}`, { identifier: task.identifier, problems });
+      }
+      const artifacts = (Array.isArray(input.artifacts) ? input.artifacts : []).map((a) => String(a).trim()).filter(Boolean);
+      const refs = normalizeArtifactRefs(input.artifactRefs);
+      const verified = verifyArtifactRefs(refs, input.resolve);
+      const id = randomUUID();
+      const at = nowIso();
+      db.prepare(
+        `insert into task_evidence (id, task_id, verdict, deviation, boundary, artifacts, artifact_refs, refs_state, actor, task_version, created_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(id, task.id, String(input.verdict).trim(), String(input.deviation ?? "").trim(), String(input.boundary ?? "").trim(),
+        JSON.stringify(artifacts), JSON.stringify(refs), verified.state, String(input.actor ?? "agent"), Number(task.version), at);
+      return store.getTaskEvidenceById(id);
+    },
+    getTaskEvidenceById(id) {
+      const row = db.prepare("select * from task_evidence where id = ?").get(id);
+      return row ? rowToTaskEvidence(row) : null;
+    },
+    listTaskEvidence(ref) {
+      const task = store.requireTaskRef(ref);
+      return db.prepare("select * from task_evidence where task_id = ? order by created_at, rowid").all(task.id).map(rowToTaskEvidence);
+    },
+    /** 有效证据 = 最新一条（历史留档但不再生效）。 */
+    latestTaskEvidence(ref) {
+      const all = store.listTaskEvidence(ref);
+      return all.length ? all[all.length - 1] : null;
+    },
+    /**
+     * 授权快照（FR-107）：**append-only**。没有 update / delete 方法，也别加 ——
+     * 加了就等于"授权事实可以被改写"，那这张表就白建了。
+     */
+    recordTaskMandate(ref, input = {}) {
+      const task = store.requireTaskRef(ref);
+      const id = randomUUID();
+      const at = nowIso();
+      db.prepare(
+        `insert into task_mandates (id, task_id, requirement_ref, contract_version, norms_digest, scope, claim_owner, claim_source, created_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(id, task.id, input.requirementRef ?? null, input.contractVersion ?? null, input.normsDigest ?? null,
+        String(input.scope ?? ""), input.claimOwner ?? null, input.claimSource ?? null, at);
+      return db.prepare("select * from task_mandates where id = ?").get(id);
+    },
+    listTaskMandates(ref) {
+      const task = store.requireTaskRef(ref);
+      return db.prepare("select * from task_mandates where task_id = ? order by created_at, rowid").all(task.id);
+    },
     recordTaskEvent(ref, { type, from = null, to = null, actor = "system", detail = null, now = null } = {}) {
       try {
         if (!type) return null;
@@ -3212,6 +3347,15 @@ export function openStore(options = {}) {
       const clearClaim = status === "in_progress" ? "" : ", claim_lock = null, claim_expires = null, claim_owner = null, last_heartbeat_at = null";
       db.prepare(`update tasks set status = ?${clearClaim}, version = version + 1, updated_at = ? where id = ?`).run(status, nowIso(), t.id);
       store.recordAudit({ actor, action: "set-status", target: t.identifier, allowed: true, reason: "team-writable", detail: status });
+      // FR-112（卡 `-194`）：**状态变化必须进事件流**。此前全仓只有 3 处 emit（updateTask / requestReview /
+      // 评审收口），本入口与 applyTeamTaskOutcome 直接写列 ⇒ 实测 175 次完成类变更里 46 次（26%）无事件，
+      // 而诊断 / 看护 / 通知 / M1 度量**全部**建在事件流上 —— 漏 26% 等于度量基础不可信。
+      // 只在实际变化时发（同状态重复写不产生假事件）。
+      if (t.status !== status) store.recordTaskEvent(t.id, { type: "status_changed", from: t.status, to: status, actor });
+      // FR-111（`-195`）：执行侧 / 团队通道置待验收同样补评审发起时间
+      if (status === "in_review" && t.status !== status && !t.reviewRequestedAt) store.markReviewRequested(t.id);
+      // FR-107（`-197`）：执行侧 / 团队通道进入「进行中」同样是一次认领 ⇒ 冻结授权快照
+      if (status === "in_progress" && t.status !== status) freezeMandate(t.id, { scope: "team", claimOwner: t.claimOwner ?? actor, claimSource: t.status });
       return store.getTaskById(t.id);
     },
     /** 红线③：审查未过 / 上游失败 → 下游保持 blocked（不解锁）。 */
@@ -3239,6 +3383,8 @@ export function openStore(options = {}) {
       const ev = evidence ? `（证据：${evidence}）` : "";
       if (outcome === "completed") {
         db.prepare("update tasks set status = 'in_review', version = version + 1, updated_at = ? where id = ?").run(nowIso(), t.id);
+        if (t.status !== "in_review") store.recordTaskEvent(t.id, { type: "status_changed", from: t.status, to: "in_review", actor: "team" }); // FR-112
+        if (!t.reviewRequestedAt) store.markReviewRequested(t.id); // FR-111（`-195`）：团队回流进待验收也补
         db.prepare("update team_tasks set status = 'completed', updated_at = ? where id = ?").run(nowIso(), teamTaskId);
         if (row.kind === "review" && reviewPassed !== true) store.blockDownstream(t.id, "review-not-passed");
         store.addComment(t.id, { body: `团队回报：完成 → 提交待验收${ev}` }); // 自动登记反馈
@@ -3246,6 +3392,7 @@ export function openStore(options = {}) {
       } else if (outcome === "failed") {
         // FR-80：团队回报失败也走统一受阻入口（transient）
         db.prepare("update tasks set status = 'blocked', version = version + 1, updated_at = ? where id = ?").run(nowIso(), t.id);
+        if (t.status !== "blocked") store.recordTaskEvent(t.id, { type: "status_changed", from: t.status, to: "blocked", actor: "team" }); // FR-112
         db.prepare("update team_tasks set status = 'failed', updated_at = ? where id = ?").run(nowIso(), teamTaskId);
         store.blockDownstream(t.id, "upstream-failed");
         store.addComment(t.id, { body: `团队回报：失败 → 受阻${ev}` }); // 自动登记失败反馈
