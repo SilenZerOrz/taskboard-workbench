@@ -717,7 +717,11 @@
     const drawerHeadMain = mk("div");
     const drawerTitle = mk("h2", null, "");
     const drawerId = mk("div", "tb-drawer-id", "");
-    drawerHeadMain.append(drawerId, drawerTitle);
+    // FR-108（卡 `-198`）：交付阶段徽标 —— 服务端 `ticketStage` 的单一口径，只读展示。
+    // `stale` 单独给警示样式：判定过期时**不许**看起来像"可以确认"。
+    const drawerStage = mk("span", "tb-stage-badge", "");
+    drawerStage.hidden = true;
+    drawerHeadMain.append(drawerId, drawerStage, drawerTitle);
     const drawerClose = mk("button", "ghost", "✕");
     drawerClose.type = "button";
     drawerClose.title = "关闭";
@@ -3899,11 +3903,35 @@
         showBanner(`派发失败（${identifier}）：${error.message}${error.code ? `（${error.code}）` : ""}`, "error");
       }
     }
+    /**
+     * FR-108（卡 `-198`）：交付阶段徽标的**唯一**渲染点。
+     * 文案只描述"交付物到哪一步"，不替代"下一步点哪里"（那是 `next` 的活）。
+     * `stale` 必须显式告警 —— 判定绑定的证据/版本已经变了，人看到的不是被确认的那一版。
+     */
+    function renderStageBadge(stageInfo) {
+      const stage = stageInfo?.stage ?? null;
+      const LABELS = {
+        format_ok: "交付物格式合格（未判）",
+        ready: "交付物已判可收",
+        stale: "证据/版本已变，判定作废",
+        refs_unresolved: "产物引用解不开",
+      };
+      const label = LABELS[stage] ?? null;
+      if (!label) { drawerStage.hidden = true; drawerStage.textContent = ""; drawerStage.removeAttribute("data-stage"); return; }
+      drawerStage.hidden = false;
+      drawerStage.textContent = label;
+      drawerStage.dataset.stage = stage;
+      drawerStage.title = stageInfo?.reason ? `${label}：${stageInfo.reason}` : label;
+    }
+
     async function openTaskDetail(task) {
       const renderSeq = ++detailRenderSeq; // 本代编号（并发渲染时只有最新一代允许落地）
       detailTask = task;
       drawerId.textContent = task.identifier;
       drawerTitle.textContent = task.title;
+      drawerStage.hidden = true;
+      drawerStage.textContent = "";
+      drawerStage.removeAttribute("data-stage");
       drawerActions.replaceChildren(); // 换卡先清空标题栏动作区，避免上一张卡的按钮残留
       drawerBody.replaceChildren(mk("p", "hint", "加载详情…"));
       drawerBackdrop.classList.add("show");
@@ -3921,6 +3949,7 @@
           api("GET", `/api/requirements/items?project=${encodeURIComponent(task.projectId)}`).catch(() => ({ items: [] })),
         ]);
         if (renderSeq !== detailRenderSeq) return; // 取数期间已被更新的一代取代 ⇒ 本次渲染作废
+        renderStageBadge(detail.ticketStage ?? null);
         const t = detail.task ?? task;
         // 需求条目 id → 可读「identifier · title」。真机报障（2026-10-22）：概览只打裸 UUID，
         // 用户「不知道这个关联的是哪个需求」—— 归属成了没人看得懂的字段。

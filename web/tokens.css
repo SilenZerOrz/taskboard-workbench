@@ -645,6 +645,18 @@ dialog h2 { margin: 0 0 var(--space-3); font-size: 15px; }
 .tb-drawer-head .tb-drawer-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--text-tertiary); }
 .tb-drawer-head h2 { margin: 0; font-size: 15px; line-height: 1.35; }
 .tb-drawer-head .spacer { flex: 1 1 auto; }
+/* FR-108（卡 `-198`）：交付阶段徽标。只显示"交付物到哪一步"（format_ok / ready / stale / refs_unresolved），
+   不替代"下一步点哪里"。`stale` 用警示色：判定绑定的证据或版本已变，人看到的不是被确认的那一版。 */
+.tb-stage-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 1px 8px; border-radius: 999px;
+  font-size: 11px; line-height: 1.6; white-space: nowrap;
+  border: var(--border-hairline) solid var(--border);
+  color: var(--text-secondary); background: transparent;
+}
+.tb-stage-badge[data-stage="ready"] { color: var(--success); border-color: currentColor; }
+.tb-stage-badge[data-stage="stale"],
+.tb-stage-badge[data-stage="refs_unresolved"] { color: var(--danger); border-color: var(--danger); background: var(--danger-soft); font-weight: 600; }
 /* 2026-10-23（用户真机批注）：整卡动作区（原正文底部「操作」区块）上移到标题栏，与「全部收起 / 还原 / ✕」同排。
    动作多时**只在动作区内部换行**，不挤掉标题、也不撑破标题栏；没有任何动作时整块不占位。 */
 .tb-drawer-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); justify-content: flex-end; align-items: center; flex: 0 1 auto; max-width: min(72%, 900px); }

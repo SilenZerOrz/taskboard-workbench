@@ -11,6 +11,7 @@ import { buildTeamDirective } from "../host/team-engine.mjs";
 import { runExecutionLoop, activeEngine } from "../core/loop.mjs";
 import { assertTeamTemplate, assertQualityGates, planTeamMembers } from "../core/team.mjs";
 import { assessTaskRef, projectWatchdog } from "../core/watchdog.mjs";
+import { ticketStage } from "../core/ticket-stage.mjs";
 import { isHumanReviewTask, planHumanReview } from "../core/human-review.mjs";
 import { deriveNextStep } from "../core/next-step.mjs";
 /**
@@ -625,7 +626,18 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
         // FR-90：详情里直接带上「评审证据包」（自动复核结论 + 最近一条进展评论），
         // 评审人打开抽屉即可看到机器结论，而不是只看到两个按钮。
         const comments = store.listComments(task.id);
-        return { status: 200, payload: { task, comments, reviewEvidence: buildReviewEvidence({ comments }) } };
+        // FR-108（卡 `-198`）：详情带**阶段推导单一口径**（`ticketStage`，0-A1 的纯函数）。
+        // 只读附加字段：不改任何既有字段语义，也不写库。
+        //   · `decision` 先给 null —— `decision_log` 表属 0-C（FR-109），建表后在这里读行传进来即可；
+        //   · `diagnostics` 传空数组 —— 详情 GET 不该跑诊断规则（那是 `/diagnostics` 的活），
+        //     更不能因为一次读页面就 persist 出诊断行。
+        const evidence = typeof store.latestTaskEvidence === "function" ? store.latestTaskEvidence(task.identifier) : null;
+        let sessionState = null;
+        try { sessionState = store.taskSessionState(task); } catch { sessionState = null; }
+        let currentRun = null;
+        try { currentRun = typeof store.getCurrentRun === "function" ? store.getCurrentRun(task) : null; } catch { currentRun = null; }
+        const stage = ticketStage(task, { evidence, decision: null, comments, sessionState, currentRun, diagnostics: [] });
+        return { status: 200, payload: { task, comments, reviewEvidence: buildReviewEvidence({ comments }), ticketStage: stage } };
       }
       if (method === "PATCH") {
         const task = store.updateTask(ref, {
