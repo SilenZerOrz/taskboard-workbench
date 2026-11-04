@@ -5059,18 +5059,37 @@
           // `ticketStage.next` 是 `deriveNextStep()` 的完整回包（hint / steps / focus / actions / blocker），
           // 所以下面按 `focus` 折叠、按 `actions` 生成按钮、按 `blocker` 跳前置卡的能力一条不减。
           const step = detail?.ticketStage?.next ?? null;
+          // 卡 `-211`（需求 `R155`）：`next` 能不能用，按**形状**判，不按存在性判。
+          // 真机事故（2026-11-04，卡 `-185`）：宿主没重载，服务端仍回 `{code,title}`；旧判据只看 `next` 是否为 null
+          // ⇒ 半残回包绕过「旧版服务端」提示，落到 else 分支输出「本卡无待办动作」，把一个**错误结论**摆到人脸上
+          // （那张卡其实只差人点「完成」）。注意 `actions: []` 是合法形态（已收口卡就是空数组），
+          // 所以判据必须看**字段在不在**，不能看数组空不空。
+          const NEXT_STEP_ARRAY_FIELDS = ["steps", "focus", "actions"];
+          const NEXT_STEP_PLAIN_FIELDS = ["hint", "blocker"];
+          const nextShapeMissing = (() => {
+            if (!step || typeof step !== "object") return null; // 完全没有 ⇒ 走「不可用」文案
+            const missing = [];
+            for (const k of NEXT_STEP_ARRAY_FIELDS) if (!Array.isArray(step[k])) missing.push(k);
+            for (const k of NEXT_STEP_PLAIN_FIELDS) if (!(k in step)) missing.push(k);
+            return missing.length ? missing : null; // 空数组也是真值 ⇒ 齐全时必须回 null，否则好形态会被当成缺字段
+          })();
           // 取数阶段已整体 await 完（`Promise.all`），本段是同步构建；代次判断保留作为并发兜底。
           if (renderSeq !== detailRenderSeq) return;
           // 引导拿不到不阻断抽屉（老服务/回包缺字段时照旧能看到其它区块）；但不静默 —— 留一行说明。
           // FR-89（真机反馈 2026-10-22）：「收口了为何还有这么多校验/评审/执行会话按钮」「异常时既可评审又可检验、无从下手」。
           // 处置 = 只做**呈现层默认折叠**（内容与按钮一个不删，点标题即可展开），并把人手动开过的区块排除在外。
           const isClosed = t.status === "done" || t.status === "canceled";
-          const foldedTitles = step ? applyFocusPolicy(step.focus) : [];
+          const foldedTitles = step && !nextShapeMissing ? applyFocusPolicy(step.focus) : [];
           syncExpandAllLabel();
           const sec = mk("div", "drawer-section next-step");
           sec.appendChild(mk("h3", null, "下一步"));
-          if (!step) {
-            sec.appendChild(mk("div", "empty-note", "下一步引导不可用：详情回包里没有 `ticketStage.next`（旧版服务端）——重载插件后生效。当前请按下方各区块自行判断。"));
+          if (!step || nextShapeMissing) {
+            // 半残回包（有 code/title、缺 actions 等）同样算「引导不可用」：它**不是**「本卡无待办动作」。
+            // 标题照旧显示（它常常已经把结论说对了，如「只差你点『完成』」），但动作区不能凭空下结论。
+            if (step && step.title) sec.appendChild(mk("div", "next-step-title", step.title));
+            sec.appendChild(mk("div", "empty-note", nextShapeMissing
+              ? `下一步引导不完整：详情回包里的 ticketStage.next 缺 ${nextShapeMissing.join(" / ")}（旧版服务端）——重载插件后生效。此处不是「无待办」，请按下方各区块自行判断。`
+              : "下一步引导不可用：详情回包里没有 `ticketStage.next`（旧版服务端）——重载插件后生效。当前请按下方各区块自行判断。"));
           } else {
             sec.appendChild(mk("div", "next-step-title", step.title));
             if (step.hint) sec.appendChild(mk("p", "hint", step.hint));
