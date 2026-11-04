@@ -1,7 +1,12 @@
 /**
  * api.mjs —— 纯路由逻辑（不依赖 node:http）。独立服务与 DSH 宿主插件共用。
  */
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { PRIORITIES, STATUSES } from "../core/domain.mjs";
+import { materializeProjectNorms, normsView } from "../core/norms.mjs";
+import { docsView, materializeProjectDocs, readDocFile } from "../core/docs-assets.mjs";
 import { clampElaborateLimit } from "../core/requirements.mjs";
 import { EXIT, TbError, invalidField } from "../core/errors.mjs";
 import { resolveContext } from "../core/binding.mjs";
@@ -21,6 +26,11 @@ import { deriveNextStep } from "../core/next-step.mjs";
  * 真实情况：独立进程实例（`node src/server/server.mjs`，没有 DSH 宿主）的 `host.capabilities` 恒为 `null`，
  * 这类动作在该进程上**做不到**，正确出路是"换到 DSH 内的任务工作台"或"把 prompt 粘到会话里手工投递"。
  */
+/** 随包机器规范目录（`package.json#files` 含 `spec/norms`）；项目副本在 `<工作区>/.taskboard/norms/`。 */
+const PACKAGED_NORMS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../spec/norms");
+/** 随包**人读**文档目录（`package.json#files` 含 `spec/docs`）；项目副本默认在 `<工作区>/.taskboard/docs/`。 */
+const PACKAGED_DOCS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../spec/docs");
+
 const HOST_UNAVAILABLE_NEXT = "该实例没有宿主会话通道（独立进程，/api/health 的 host.capabilities 为 null）：改到 DSH 内的任务工作台操作，或把返回的 prompt 直接粘到会话里手工投递";
 
 import { buildDebugDispatchPrompt } from "../core/debug-dispatch.mjs";
@@ -350,6 +360,78 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
         return { status: 200, payload: saved };
       }
       throw new TbError("USAGE_ERROR", "settings 仅支持 GET 或 PUT");
+    }
+    // 项目级机器规范（卡 `-216` / 需求 `R160`）：看板到底读的是哪份、要不要生成 / 恢复副本。
+    const projectNormsRoute = /^\/api\/projects\/([^/]+)\/norms$/.exec(pathname);
+    if (projectNormsRoute) {
+      const project = store.requireProject(decodeURIComponent(projectNormsRoute[1]));
+      const workspacePath = project.workspacePath ?? null;
+      if (method === "GET") {
+        return { status: 200, payload: normsView({ packagedDir: PACKAGED_NORMS_DIR, workspacePath }) };
+      }
+      if (method === "POST") {
+        const action = String(body.action ?? "materialize");
+        if (action !== "materialize" && action !== "reset") throw new TbError("USAGE_ERROR", "action 只支持 materialize / reset");
+        const out = materializeProjectNorms({ packagedDir: PACKAGED_NORMS_DIR, workspacePath, overwrite: action === "reset" });
+        try {
+          store.recordAudit({
+            actor: body.actor ?? "human", action: `norms-${action}`, target: project.id, allowed: true,
+            reason: out.dir, detail: JSON.stringify({ written: out.written, kept: out.kept }),
+          });
+        } catch { /* 审计失败不影响复制结果 */ }
+        return { status: 200, payload: { ...out, view: normsView({ packagedDir: PACKAGED_NORMS_DIR, workspacePath }) } };
+      }
+      throw new TbError("USAGE_ERROR", "norms 仅支持 GET 或 POST（POST body.action = materialize | reset）");
+    }
+    // 项目级**人读**文档位置（卡 `-220` / 需求 `R161`）：包内默认 / 项目存放 / 生效来源 —— 可查、可看、可改。
+    // 与 `norms` 分开：这里改文档**不影响契约**（契约只吃 `spec/norms/`），所以别做成同一张卡。
+    const projectDocsRoute = /^\/api\/projects\/([^/]+)\/docs$/.exec(pathname);
+    if (projectDocsRoute) {
+      const project = store.requireProject(decodeURIComponent(projectDocsRoute[1]));
+      const workspacePath = project.workspacePath ?? null;
+      const overrideDir = store.getProjectSettings(project.id)?.envConfig?.docsDir ?? null;
+      const view = () => docsView({ packagedDir: PACKAGED_DOCS_DIR, workspacePath, overrideDir });
+      if (method === "GET") {
+        const file = searchParams.get("file");
+        // ?file= 只读「看一眼」：路径按**生效目录**解析（有副本读副本，没有读包内）。
+        if (file) {
+          const cur = view();
+          return { status: 200, payload: { ...readDocFile(cur.effective.dir, file), source: cur.effective.source, dir: cur.effective.dir } };
+        }
+        return { status: 200, payload: view() };
+      }
+      if (method === "POST") {
+        const action = String(body.action ?? "materialize");
+        if (action !== "materialize" && action !== "reset") throw new TbError("USAGE_ERROR", "action 只支持 materialize / reset");
+        const out = materializeProjectDocs({ packagedDir: PACKAGED_DOCS_DIR, workspacePath, overrideDir, overwrite: action === "reset" });
+        try {
+          store.recordAudit({
+            actor: body.actor ?? "human", action: `docs-${action}`, target: project.id, allowed: true,
+            reason: out.dir, detail: JSON.stringify({ written: out.written, kept: out.kept }),
+          });
+        } catch { /* 审计失败不影响复制结果 */ }
+        return { status: 200, payload: { ...out, view: view() } };
+      }
+      if (method === "PUT") {
+        // 改存放位置：空 / null ⇒ 恢复默认（删 docsDir 键，不留空串歧义）。
+        const next = body.dir;
+        if (next !== undefined && next !== null && typeof next !== "string") throw new TbError("USAGE_ERROR", "dir 必须是字符串或 null");
+        const current = store.getProjectSettings(project.id).envConfig ?? {};
+        const envConfig = { ...current };
+        if (next === undefined || next === null || String(next).trim() === "") delete envConfig.docsDir;
+        else envConfig.docsDir = String(next).trim();
+        // 写前先解析一遍：相对路径无工作区时会抛 WORKSPACE_MISSING —— 在写库**之前**拦，避免存进一个用不了的配置。
+        const after = docsView({ packagedDir: PACKAGED_DOCS_DIR, workspacePath, overrideDir: envConfig.docsDir ?? null });
+        store.saveProjectSettings(project.id, { envConfig });
+        try {
+          store.recordAudit({
+            actor: body.actor ?? "human", action: "docs-set-dir", target: project.id, allowed: true,
+            reason: after.project.dir, detail: JSON.stringify({ override: envConfig.docsDir ?? null, isDefault: !envConfig.docsDir }),
+          });
+        } catch { /* 审计失败不影响保存 */ }
+        return { status: 200, payload: docsView({ packagedDir: PACKAGED_DOCS_DIR, workspacePath, overrideDir: envConfig.docsDir ?? null }) };
+      }
+      throw new TbError("USAGE_ERROR", "docs 仅支持 GET / POST(materialize|reset) / PUT(dir)");
     }
     // 会话 ↔ 项目关联（FR-63）：列出 / 申请 / 批准
     const projectAgentTeamsRoute = /^\/api\/projects\/([^/]+)\/agent-teams$/.exec(pathname);

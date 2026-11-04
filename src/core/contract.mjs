@@ -22,8 +22,14 @@ import path from "node:path";
 
 import { TbError } from "./errors.mjs";
 
-/** 随包分发的五份机器规范（缺一份即 `NORM_NOT_FOUND`）。 */
-export const NORM_IDS = Object.freeze(["flow", "card-update", "doc-editing", "acceptance", "project-defaults"]);
+/**
+ * 随包分发的机器规范（缺一份即 `NORM_NOT_FOUND`）。
+ *
+ * `item-detail`（卡 `-216` / 需求 `R160`，2026-11-04）：`docs/规范/07-条目详情规范.md` 的随包机器版 ——
+ * `docs/` 被 gitignore ⇒ 没有 git 历史、不进包、没有 version/digest，`NORM_STALE` 护不到它；
+ * 收进这里之后它才真正参与 `contract_version`。
+ */
+export const NORM_IDS = Object.freeze(["flow", "card-update", "doc-editing", "acceptance", "project-defaults", "item-detail"]);
 
 /** 参与 contract_version 的门配置项（顺序固定 ⇒ 可复现）。 */
 export const GATE_NAMES = Object.freeze(["attribution", "authorization", "review", "humanReview"]);
@@ -40,9 +46,12 @@ export function sha256(text) {
  * 只认最小 YAML 子集（`key: value` / `key: [a, b]` / 数字 / 引号串）——本仓规范就是这么写的，
  * 引完整 YAML 解析器会把「机器规范的形状」变成第三方依赖的版本风险。
  *
+ * `allowUnknown`：只给**项目副本**用 —— 用户在自己目录里多放一份 `notes.md` 不该把整个看板炸掉
+ * （卡 `-216`：宁可忽略陌生文件，也不要 `NORM_INVALID` 把读写全挡了）。
+ *
  * @returns {{meta:{norm_id:string,version:number,updated:string,applies_to:string[]}, body:string, digest:string}}
  */
-export function parseNormDoc(text, file = "<norm>") {
+export function parseNormDoc(text, file = "<norm>", { allowUnknown = false } = {}) {
   const raw = String(text ?? "").replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
   if (!raw.startsWith("---\n")) throw new TbError("NORM_INVALID", `规范缺 frontmatter：${file}`, { file });
   const end = raw.indexOf("\n---\n", 4);
@@ -58,7 +67,7 @@ export function parseNormDoc(text, file = "<norm>") {
     meta[key] = parseScalar(line.slice(idx + 1).trim());
   }
   const normId = String(meta.norm_id ?? "");
-  if (!NORM_IDS.includes(normId)) {
+  if (!NORM_IDS.includes(normId) && !allowUnknown) {
     throw new TbError("NORM_INVALID", `规范 norm_id 非法：${file} · ${JSON.stringify(meta.norm_id)}`, { file, allowed: NORM_IDS });
   }
   if (!Number.isInteger(meta.version) || meta.version < 1) {
@@ -93,16 +102,17 @@ function stripQuotes(s) {
  * 读一个规范目录（`spec/norms/*.md`）。
  *
  * @param {string} dir
- * @param {{requireAll?: boolean}} [opts] `requireAll`（默认 true）＝五份必须齐；单测造夹具时可关。
+ * @param {{requireAll?: boolean}} [opts] `requireAll`（默认 true）＝`NORM_IDS` 必须齐；单测造夹具与
+ *   **读项目副本**（缺项要逐份回落包内）时必须传 `false`。
  */
-export function loadNorms(dir, { requireAll = true } = {}) {
+export function loadNorms(dir, { requireAll = true, allowUnknown = false } = {}) {
   if (!dir || !existsSync(dir)) throw new TbError("NORM_NOT_FOUND", `机器规范目录不存在：${dir}`, { dir });
   const files = readdirSync(dir).filter((f) => f.endsWith(".md")).sort();
   const norms = [];
   const seen = new Map();
   for (const file of files) {
     const abs = path.join(dir, file);
-    const parsed = parseNormDoc(readFileSync(abs, "utf8"), abs);
+    const parsed = parseNormDoc(readFileSync(abs, "utf8"), abs, { allowUnknown });
     const prev = seen.get(parsed.meta.norm_id);
     if (prev) throw new TbError("NORM_INVALID", `norm_id 重复：${parsed.meta.norm_id}（${prev} / ${abs}）`, { normId: parsed.meta.norm_id });
     seen.set(parsed.meta.norm_id, abs);

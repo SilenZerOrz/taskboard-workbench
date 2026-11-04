@@ -31,6 +31,13 @@
       "file": "spec/norms/flow.md"
     },
     {
+      "norm_id": "item-detail",
+      "version": 1,
+      "updated": "2026-11-04",
+      "digest": "d499289758145cd2e5e411f94579786c00a7332349429e4d252536de26d7963f",
+      "file": "spec/norms/item-detail.md"
+    },
+    {
       "norm_id": "project-defaults",
       "version": 1,
       "updated": "2026-10-29",

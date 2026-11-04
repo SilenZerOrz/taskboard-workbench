@@ -2346,8 +2346,10 @@
       if (!value) return "—";
       return String(value).replace("T", " ").replace(/\.\d+Z?$/, "").replace(/Z$/, "");
     }
-    function pill(text, cls = "") {
-      return mk("span", `chip ${cls}`.trim(), text);
+    function pill(text, cls = "", title = "") {
+      const node = mk("span", `chip ${cls}`.trim(), text);
+      if (title) node.title = title;
+      return node;
     }
     function statusPill(status) {
       return mk("span", `chip dot status-chip status-${status}`, STATUS_LABELS[status] ?? status);
@@ -2355,6 +2357,19 @@
     /** FR-91：需求条目状态中文口径（draft/open/done/closed 四处共用，避免各写一份走样）。 */
     function reqStatusLabel(status) {
       return status === "draft" ? "待确认" : status === "open" ? "在办" : status === "done" ? "已完成" : status === "closed" ? "已关闭" : String(status ?? "");
+    }
+    /**
+     * 卡 `-218`（R159 D-1=`c`）：条目**完整性**三态的唯一文案表（列表胶囊与详情字段共用，避免两处走样）。
+     * 口径来自服务端派生字段 `detailState`（`src/core/requirements.mjs` `deriveDetailState`）。
+     */
+    const DETAIL_STATE_LABELS = {
+      truncated: { text: "残片", tone: "warn", title: "描述被截断（早期导入上限 2000 字符）—— 完整原文见来源文档，别当完整描述引用" },
+      mirror: { text: "镜像", tone: "", title: "文档镜像条目：正文是某份文档的片段，不是可执行需求" },
+    };
+    function detailStateText(state) {
+      return state === "truncated" ? "已截断 · 残片（仅存前 2000 字符；完整原文见「来源」所指文档）"
+        : state === "mirror" ? "文档镜像（原文片段，非需求正文）"
+        : "完整";
     }
     function btn(label, onClick, cls = "ghost") {
       const node = mk("button", cls, label);
@@ -2490,11 +2505,15 @@
         box.appendChild(mk("h2", null, `任务工作台 · 配置`));
         box.appendChild(mk("p", "hint", `配置对象：${state.projectId}（${projName}）${sessionId ? " · 会话内" : " · 全局入口"} — 用上方“项目”下拉切换；下方所有保存都作用于该项目。`));
         // 开局向导（团队先行七步 + 复制指令）
-        const [gSettings, gDocs, gItems, gTasks] = await Promise.all([
+        const [gSettings, gDocs, gItems, gTasks, gNorms, gSpec] = await Promise.all([
           api("GET", `/api/projects/${encodeURIComponent(state.projectId)}/settings`).catch(() => ({})),
           api("GET", `/api/requirements/docs?project=${encodeURIComponent(state.projectId)}`).catch(() => ({ docs: [] })),
           api("GET", `/api/requirements/items?project=${encodeURIComponent(state.projectId)}`).catch(() => ({ items: [] })),
           api("GET", `/api/tasks?project=${encodeURIComponent(state.projectId)}`).catch(() => ({ tasks: [] })),
+          // 卡 `-216`（R160）：规范来源（旧服务端没有这条路由 ⇒ null，卡片显示"不可用"而不是崩）
+          api("GET", `/api/projects/${encodeURIComponent(state.projectId)}/norms`).catch(() => null),
+          // 卡 `-220`（R161）：随包人读文档的位置（包内默认 / 项目存放 / 生效来源）
+          api("GET", `/api/projects/${encodeURIComponent(state.projectId)}/docs`).catch(() => null),
         ]);
         const gDoc = (gDocs.docs || [])[0] || null;
         const gItemsAll = gItems.items || [];
@@ -2536,6 +2555,142 @@
         // 真机 2026-10-23（用户报障「配置页只能切换已有项目，不能新增」）：切换走顶部项目下拉，
         // 新建走这里的按钮 —— 此前配置页只有「前往需求视图」，正常使用路径下无法新建项目。
         bind.appendChild(mk("p", "hint", "切换项目用顶部「项目」下拉；要新建项目点上面的「新建项目」（建完即切换为本会话的项目）。"));
+
+        // ── 卡 `-216`（R160 · D-A/D-B/D-C 已拍）：规范来源 ───────────────────────────
+        // 真机缺口的原貌：`web/app.js` 里 `contract` / `norms` **一次都没出现** ⇒ 规范在包内、
+        // 契约在变、`NORM_STALE` 会拦写，而界面上**一个字都没有**。人只能靠报错反推规则在哪。
+        const normsCard = card("规范来源（机器规范）", "看板读写用的规则来自哪里；可以直接改副本 —— 改正文必须 bump version");
+        const normsBody = mk("div", "config-body");
+        normsCard.appendChild(normsBody);
+        const drawNorms = (v) => {
+          normsBody.replaceChildren();
+          if (!v) { normsBody.appendChild(mk("p", "hint", "当前服务端没有 /norms 路由（旧版）—— 请重启 web profile 后再看。")); return; }
+          const fallback = v.fallbackIds || [];
+          const changed = (v.norms || []).filter((n) => n.modified).length;
+          normsBody.appendChild(kvList([
+            ["来源", v.source === "project" ? "项目副本（本工作区优先）" : "随包默认（安装包内）"],
+            ["目录", v.dir || v.packagedDir || "—"],
+            ["份数", `${(v.norms || []).length} 份${fallback.length ? `（缺 ${fallback.length} 份已回落包内：${fallback.join(" / ")}）` : ""}`],
+            ["与内置不同", `${changed} 份`],
+          ]));
+          const list = mk("ul", "req-list");
+          for (const n of (v.norms || [])) {
+            const li = mk("li", "req-item");
+            li.append(mk("span", "req-title", `${n.id}@v${n.version}`));
+            li.appendChild(pill(n.origin === "project" ? "副本" : "包内", n.origin === "project" ? "accent" : ""));
+            if (n.modified) li.appendChild(pill("已改", "warn"));
+            list.appendChild(li);
+          }
+          normsBody.appendChild(list);
+          if ((v.ignoredFiles || []).length) {
+            normsBody.appendChild(mk("p", "hint", `已忽略 ${v.ignoredFiles.length} 个非规范文件：${v.ignoredFiles.map((x) => `${x.file}（${x.reason}）`).join(" · ")}`));
+          }
+          const actions = mk("div", "config-row");
+          actions.appendChild(btn("生成默认副本", () => void normsAction("materialize"), "primary"));
+          actions.appendChild(btn("恢复默认（覆盖副本）", () => void normsAction("reset")));
+          normsBody.appendChild(actions);
+          normsBody.appendChild(mk("p", "hint", "改法：直接编辑副本里的 .md（frontmatter 的 norm_id 别动）；**改正文必须把 version 加 1**，否则会被判「规范被偷偷改了」而拦写。改完在「契约」里重算一次基线。要不要把 .taskboard/ 入库由你定。"));
+        };
+        const refreshNorms = async () => {
+          const v = await api("GET", `/api/projects/${encodeURIComponent(state.projectId)}/norms`).catch(() => null);
+          drawNorms(v);
+        };
+        const normsAction = async (action) => {
+          if (action === "reset" && !window.confirm("用安装包里的默认规范覆盖本项目副本？已做的修改会丢。")) return;
+          try {
+            const r = await api("POST", `/api/projects/${encodeURIComponent(state.projectId)}/norms`, { action, actor: "human" });
+            // 只弹一条：规范变了 ⇒ 契约基线一定变。**不自动重算**（那是写库，让人自己点）。
+            const head = action === "materialize"
+              ? `已生成规范副本（写 ${r.written?.length ?? 0} 份 / 保留 ${r.kept?.length ?? 0} 份）`
+              : `已恢复默认（写 ${r.written?.length ?? 0} 份）`;
+            showBanner(`${head}；规范已变 ⇒ 请重算契约基线，否则写操作会按旧契约被拦`, "warn");
+          } catch (err) { showBanner(`${action === "reset" ? "恢复" : "生成"}失败：${err.message}`, "error"); }
+          await refreshNorms();
+        };
+        box.appendChild(normsCard);
+        drawNorms(gNorms);
+
+        // ── 卡 `-220`（R161）：文档与规范位置 ────────────────────────────────────
+        // 用户要求：**落地真实启动包的相关配套文档**，其「默认解压位置 / 后续存放位置」要能查、能看、能改。
+        // 与上面「规范来源」分卡的理：这份改了**不影响契约**（契约只吃 spec/norms 的机器规范）。
+        const specCard = card("文档与规范位置（随包人读文档）", "开局 / 流程 / 条目文档放在哪：包内默认 → 项目存放 → 生效来源；存放位置可改");
+        const specBody = mk("div", "config-body");
+        specCard.appendChild(specBody);
+        const drawSpec = (v) => {
+          specBody.replaceChildren();
+          if (!v) { specBody.appendChild(mk("p", "hint", "当前服务端没有 /docs 路由（旧版）—— 重启 web profile 后再看。")); return; }
+          const proj = v.project || {};
+          const pack = v.packaged || {};
+          specBody.appendChild(kvList([
+            ["包内默认（解压后）", pack.dir || "—"],
+            ["项目存放位置", `${proj.dir || "—"}${proj.dirIsOverride ? "（已改）" : "（默认）"}`],
+            ["生效来源", (v.effective || {}).source === "project" ? "项目副本（本工作区优先）" : "包内默认（安装包内）"],
+            ["文件数", `${(proj.files || []).length} 份 / 包内 ${(pack.files || []).length} 份`],
+          ]));
+          const list = mk("ul", "req-list");
+          for (const f of (pack.files || [])) {
+            const li = mk("li", "req-item");
+            li.append(mk("span", "req-title", f));
+            li.appendChild(pill((proj.files || []).includes(f) ? "副本" : "包内", (proj.files || []).includes(f) ? "accent" : ""));
+            li.addEventListener("click", () => void openSpecDoc(f));
+            list.appendChild(li);
+          }
+          specBody.appendChild(list);
+          if ((v.missingInProject || []).length) {
+            specBody.appendChild(mk("p", "hint", `副本里缺 ${v.missingInProject.length} 份（回落包内）：${v.missingInProject.join(" · ")}`));
+          }
+          // 存放位置：可改、可恢复默认
+          const dirInput = mk("input");
+          dirInput.placeholder = "留空＝默认 <工作区>/.taskboard/docs；也可填相对工作区的路径";
+          dirInput.value = proj.dirIsOverride ? proj.dir : "";
+          const dirRow = mk("div", "config-row");
+          dirRow.appendChild(mk("span", null, "存放位置"));
+          const dirRight = mk("span", "config-actions");
+          dirRight.appendChild(dirInput);
+          dirRight.appendChild(btn("保存路径", async () => {
+            const val = dirInput.value.trim();
+            try { const out = await api("PUT", `/api/projects/${encodeURIComponent(state.projectId)}/docs`, { dir: val, actor: "human" }); showBanner(val ? `存放位置已改为：${out.project.dir}` : "已恢复默认存放位置", "info"); drawSpec(out); }
+            catch (e) { showBanner(`保存失败：${e.message}`, "error"); }
+          }, "primary"));
+          dirRight.appendChild(btn("恢复默认路径", async () => {
+            try { const out = await api("PUT", `/api/projects/${encodeURIComponent(state.projectId)}/docs`, { dir: null, actor: "human" }); showBanner(`已恢复默认存放位置：${out.project.dir}`, "info"); drawSpec(out); }
+            catch (e) { showBanner(`恢复失败：${e.message}`, "error"); }
+          }));
+          dirRow.appendChild(dirRight);
+          specBody.appendChild(dirRow);
+          const actions = mk("div", "config-row");
+          actions.appendChild(btn("生成默认副本", () => void specAction("materialize"), "primary"));
+          actions.appendChild(btn("恢复默认（覆盖副本）", () => void specAction("reset")));
+          specBody.appendChild(actions);
+          specBody.appendChild(mk("p", "hint", "改这些人读文档**不影响契约与门禁**（那只看 spec/norms 的机器规范）；要不要把副本入库由你定。"));
+        };
+        const openSpecDoc = async (file) => {
+          try {
+            const d = await api("GET", `/api/projects/${encodeURIComponent(state.projectId)}/docs?file=${encodeURIComponent(file)}`);
+            const c = mk("section", "config-card");
+            c.appendChild(mk("h3", null, `${d.file} · ${d.source === "project" ? "项目副本" : "包内默认"}`));
+            c.appendChild(mk("p", "hint", d.dir));
+            const pre = mk("pre", "doc-preview"); pre.textContent = d.text;
+            c.appendChild(pre);
+            specBody.replaceChildren(c, btn("← 返回位置视图", () => void refreshSpec(), "ghost"));
+          } catch (e) { showBanner(`打开失败：${e.message}`, "error"); }
+        };
+        const refreshSpec = async () => {
+          const v = await api("GET", `/api/projects/${encodeURIComponent(state.projectId)}/docs`).catch(() => null);
+          drawSpec(v);
+        };
+        const specAction = async (action) => {
+          if (action === "reset" && !window.confirm("用安装包里的默认文档覆盖本项目副本？已做的修改会丢。")) return;
+          try {
+            const r = await api("POST", `/api/projects/${encodeURIComponent(state.projectId)}/docs`, { action, actor: "human" });
+            showBanner(action === "materialize"
+              ? `已生成文档副本（写 ${r.written?.length ?? 0} 份 / 保留 ${r.kept?.length ?? 0} 份）⇒ ${r.dir}`
+              : `已恢复默认（写 ${r.written?.length ?? 0} 份）`, "info");
+            drawSpec(r.view);
+          } catch (e) { showBanner(`${action === "reset" ? "恢复" : "生成"}失败：${e.message}`, "error"); }
+        };
+        box.appendChild(specCard);
+        drawSpec(gSpec);
 
         const req = card("需求", "需求文档与条目的管理入口");
         req.appendChild(row("需求视图", btn("打开", () => setView("req"), "primary")));
@@ -3442,6 +3597,9 @@
           const completionChip = reqCompletionChip(it, reqState.completion.get(it.identifier)?.payload ?? null);
           const meta = mk("div", "req-item-meta");
           meta.append(pill(srcLabel, it.source === "intake" ? "" : "accent"));
+          // 卡 `-218`（R159 D-1=`c`）：**行上**就要看出这条是不是残片/镜像 —— 不点进详情才发现的等于没标。
+          const integrity = DETAIL_STATE_LABELS[it.detailState];
+          if (integrity) meta.append(pill(integrity.text, integrity.tone, integrity.title));
           if (it.feasibility === "infeasible") meta.append(pill("不可行", "danger"));
           li.append(main, statusChip, completionChip, meta);
           const acts = mk("div", "req-item-actions");
@@ -3589,6 +3747,7 @@
         const addF = (k, v, cls) => { dl.appendChild(mk("dt", null, k)); const dd = mk("dd", null, v); if (cls) dd.className = cls; dl.appendChild(dd); };
         addF("状态", statusTxt);
         addF("来源", srcLabel);
+        addF("完整性", detailStateText(item.detailState), item.detailState === "truncated" ? "warn" : "");
         addF("优先级", PRIORITY_LABELS[item.priority] ?? item.priority);
         addF("可行性", item.feasibility ?? "未评估", item.feasibility === "infeasible" ? "danger" : item.feasibility === "feasible" ? "ok" : "");
         if (item.acceptance) addF("验收要点", item.acceptance);

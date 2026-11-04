@@ -106,7 +106,7 @@ test("P1/E store：contractSnapshot 纯读不落行，refreshProjectContract 才
     assert.ok(refreshed.baseline);
     const row = store.getProjectContract(id);
     assert.equal(row.contractVersion, snap.snapshot.contractVersion);
-    assert.equal(row.norms.length, 5);
+    assert.equal(row.norms.length, 6, "P1 五份 + R160 的 item-detail");
     assert.equal(row.gates.attribution, "warn", "默认 warn（TB_STRICT_ATTRIBUTION 未设）");
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });

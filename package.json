@@ -50,6 +50,7 @@
     "cli",
     "spec/团队agent.md",
     "spec/norms",
+    "spec/docs",
     "scripts/tb-flow.mjs",
     "tools/seed.mjs",
     "tools/env-check.mjs"

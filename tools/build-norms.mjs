@@ -3,8 +3,9 @@
  * tools/build-norms.mjs —— 机器规范 manifest 的构建与校验（P1 · 方案 §7.1）
  *
  * 用法：
- *   node tools/build-norms.mjs            # 重新生成 spec/norms/manifest.json
- *   node tools/build-norms.mjs --check    # 只校验（CI / npm test 用），不写文件
+ *   node tools/build-norms.mjs                       # 重新生成 spec/norms/manifest.json
+ *   node tools/build-norms.mjs --check               # 只校验（CI / npm test 用），不写文件
+ *   node tools/build-norms.mjs --dir <dir> [--check] # 校验/生成**项目副本**的 manifest（卡 `-216`）
  *
  * 为什么要这个脚本：`spec/norms/*.md` 是**随包分发的唯一真源**，`version` + `digest` 是
  * 写操作校验的依据（`NORM_STALE`）。正文悄悄改了却不动 `version`，校验就形同虚设 ——
@@ -15,17 +16,29 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { buildNormsManifest, diffNormsManifest, loadNorms } from "../src/core/contract.mjs";
+import { readProjectNorms } from "../src/core/norms.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-// `TB_NORMS_DIR` 只给测试用（造夹具目录），正常构建永远用包内 spec/norms。
-const NORMS_DIR = process.env.TB_NORMS_DIR ? path.resolve(process.env.TB_NORMS_DIR) : path.join(ROOT, "spec", "norms");
+const argv = process.argv.slice(2);
+const dirFlag = argv.indexOf("--dir");
+const dirArg = dirFlag >= 0 ? argv[dirFlag + 1] : null;
+if (dirFlag >= 0 && (!dirArg || dirArg.startsWith("--"))) {
+  console.error("✗ --dir 需要一个目录参数");
+  process.exit(1);
+}
+// 优先级：`--dir`（项目副本自检）> `TB_NORMS_DIR`（测试夹具）> 包内 spec/norms。
+const NORMS_DIR = dirArg
+  ? path.resolve(dirArg)
+  : process.env.TB_NORMS_DIR ? path.resolve(process.env.TB_NORMS_DIR) : path.join(ROOT, "spec", "norms");
 const MANIFEST = path.join(NORMS_DIR, "manifest.json");
 
-const checkOnly = process.argv.includes("--check");
+const checkOnly = argv.includes("--check");
 
 let norms;
 try {
-  norms = loadNorms(NORMS_DIR);
+  // 项目副本里往往还有 README / 用户笔记（没有 frontmatter）⇒ 用逐文件容错读；
+  // 包内目录严格读（那里只该有规范）。
+  norms = dirArg ? readProjectNorms(NORMS_DIR).norms : loadNorms(NORMS_DIR);
 } catch (error) {
   console.error(`✗ 规范加载失败：${error.code ?? ""} ${error.message}`);
   process.exit(1);

@@ -19,7 +19,8 @@ dist/
 .vscode/
 
 # 本地过程文档与规范（不上传；SOP 见 docs/发布与收录/）
-docs/
+# 锚定到仓库根：`docs/` 原来无前缀，会连带忽略 `spec/docs/`（随包人读文档，必须入库）—— 卡 `-219`
+/docs/
 # 架构产物（archify 生成）
 .archify/
 # 本机 agent 约定（含内网信息，是否公开由人拍板）

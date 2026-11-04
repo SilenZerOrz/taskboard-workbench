@@ -290,3 +290,41 @@ export function summarizeRequirementCompletion(tasks = []) {
   }
   return { total, closed, active, counts, verdict, ready, text, tasks: list };
 }
+
+/**
+ * 条目详情的**完整性形态**（`R159` D-1=`c` / D-3=派生，2026-11-04 人拍）。
+ *
+ * 为什么是派生而不是落库：判据客观（长度 + 末字符 + 归类前缀），随数据自动更新，
+ * 不需要迁移与历史回填；真要「人工豁免某一条」时再升级成字段。
+ *
+ * 三态（顺序有意义 —— 镜像优先，因为镜像是**设计上限**而不是事故）：
+ *   · `mirror`    —— 文档镜像/归类归档条目（`【归类 YYYY-MM-DD · …】非需求条目`），正文本来就是片段；
+ *   · `truncated` —— 正文被 2000 字符截断的残片（早期导入 `slice(0,2000)` 的历史损伤）；
+ *   · `full`      —— 其余（含空描述：那是另一种缺口，由 `acceptanceSet` 负责，不是残片）。
+ *
+ * ⚠️ 只判「形状」，不读盘 ⇒ 判不出「源文已演进 / 源档缺失」（那两条要 cwd + 文件比对，
+ *    只在一次性分析工具里做，见 docs/进度/2026-11-04-R159判据说明与R160范围扩写.md §A4）。
+ */
+export const DETAIL_STATES = Object.freeze(["full", "truncated", "mirror"]);
+
+/** 2000 字符截断的**下界**（实测 1999/2000 都有，留 10 字符容差）。 */
+export const TRUNCATED_MIN_LEN = 1990;
+
+/** 句读/收尾字符：末字符属于它就不算被截断（`|` `>` 是 markdown 表格行尾）。 */
+const SENTENCE_END_CHARS = new Set([..."。！？…；）)】」』”\"'.:;!?]`|>"]);
+
+const MIRROR_PREFIX = /^【归类\s*\d{4}-\d{2}-\d{2}\s*·/;
+
+/**
+ * @param {string|null|undefined} description
+ * @returns {"full"|"truncated"|"mirror"}
+ */
+export function deriveDetailState(description) {
+  const text = typeof description === "string" ? description : "";
+  const head = text.trimStart();
+  if (MIRROR_PREFIX.test(head)) return "mirror";
+  const trimmed = text.trimEnd();
+  if (trimmed === "") return "full";
+  if (trimmed.length >= TRUNCATED_MIN_LEN && !SENTENCE_END_CHARS.has(trimmed.at(-1))) return "truncated";
+  return "full";
+}

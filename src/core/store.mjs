@@ -20,6 +20,7 @@ import {
 import { normalizeOwner, splitOwnerLabels } from "./owner.mjs";
 import { TbError, invalidField } from "./errors.mjs";
 import { computeContract, diffContract, evaluateSubmittedContract, loadNorms } from "./contract.mjs";
+import { resolveNorms } from "./norms.mjs";
 import { UNTAKEN_COMMENT_MARKER, detectUntakenDelivery } from "./delivery.mjs";
 import { VERIFY_MAX_COMMAND, parseVerifyComment } from "./verify.mjs";
 import {
@@ -27,6 +28,7 @@ import {
   elaborateDocument, formatRequirementIdentifier, normalizeTitle, parseRequirementIdentifier,
   titleKey, assertRequirementStatus, normalizeCandidates, summarizeRequirementCompletion,
   clampElaborateLimit, ELABORATE_PREVIEW_SIZE, DEFAULT_ELABORATE_LIMIT, MAX_ELABORATE_LIMIT,
+  deriveDetailState,
 } from "./requirements.mjs";
 import { TEAM_WRITABLE_STATUSES } from "./team.mjs";
 import { evidenceProblems, normalizeArtifactRefs, verifyArtifactRefs } from "./evidence.mjs";
@@ -575,6 +577,8 @@ const rowToRequirementItem = (row) => (row ? {
   id: row.id, identifier: row.identifier, projectId: row.project_id, docId: row.doc_id,
   title: row.title, description: row.description, acceptance: row.acceptance,
   priority: row.priority, status: row.status, source: row.source, normTitle: row.norm_title,
+  // `R159`（D-1=`c` / D-3=派生）：完整性形态是**算出来的**，不是存的 —— 列表/详情/完成度三处同源。
+  detailState: deriveDetailState(row.description),
   feasibility: row.feasibility ?? null, feasibilityReason: row.feasibility_reason ?? null,
   feasibilityBy: row.feasibility_by ?? null, feasibilityOverride: row.feasibility_override ?? null,
   createdAt: row.created_at, updatedAt: row.updated_at,
@@ -883,10 +887,20 @@ export function openStore(options = {}) {
   // 回滚开关：`TB_CONTRACT_MODE=warn`（一行降级，等价 2026-10-29 起的旧行为）。
   const contractMode =
     String((options.env ?? process.env)?.TB_CONTRACT_MODE ?? "reject").trim().toLowerCase() === "warn" ? "warn" : "reject";
-  // P1 契约快照：机器规范默认随包读 `spec/norms/*.md`；测试可传 `normsDir` 或直接传 `norms`。
-  const normsDir = options.normsDir ?? path.join(PKG_ROOT, "spec", "norms");
+  // P1 契约快照：机器规范默认随包读 `spec/norms/*.md`；测试可传 `normsDir` / 直接传 `norms` / 传解析器。
+  // 卡 `-216`（R160）：项目若有 `<工作区>/.taskboard/norms/`，**优先用副本**，缺项逐份回落包内。
+  const packagedNormsDir = options.normsDir ?? path.join(PKG_ROOT, "spec", "norms");
   const injectedNorms = Array.isArray(options.norms) ? options.norms : null;
-  const loadNormsForContract = () => injectedNorms ?? loadNorms(normsDir);
+  const resolveNormsForProject = (projectId) => {
+    if (injectedNorms) return { source: "injected", dir: packagedNormsDir, norms: injectedNorms, fallbackIds: [] };
+    if (typeof options.normsResolver === "function") {
+      const out = options.normsResolver(projectId);
+      return Array.isArray(out) ? { source: "injected", dir: packagedNormsDir, norms: out, fallbackIds: [] } : out;
+    }
+    if (options.normsDir) return { source: "packaged", dir: packagedNormsDir, norms: loadNorms(packagedNormsDir), fallbackIds: [] };
+    const project = store.getProject(projectId);
+    return resolveNorms({ packagedDir: packagedNormsDir, workspacePath: project?.workspacePath ?? null });
+  };
 
   let db;
   let migration;
@@ -1047,7 +1061,8 @@ export function openStore(options = {}) {
     contractSnapshot(projectId) {
       const project = store.requireProject(projectId);
       const doc = store.getRequirementDoc(projectId);
-      const norms = loadNormsForContract();
+      const resolved = resolveNormsForProject(projectId);
+      const norms = resolved.norms;
       const gates = {
         attribution: strictAttribution ? "reject" : "warn",
         authorization: "hard",
@@ -1061,7 +1076,9 @@ export function openStore(options = {}) {
         : null;
       return {
         project: { id: project.id, name: project.name },
-        normsDir,
+        normsDir: resolved.dir ?? packagedNormsDir,
+        normsSource: resolved.source ?? "packaged",
+        normsFallbackIds: resolved.fallbackIds ?? [],
         snapshot,
         baseline: stored,
         changed,
