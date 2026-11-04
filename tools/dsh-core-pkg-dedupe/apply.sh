@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # dsh-core-pkg-dedupe/apply.sh —— 「宿主核心包多物理副本」的**根因级持久修复**（非产品代码）
 #
-# 要修的问题（与 tools/dsh-tools-alias-shim/ 同一根因，但那是运行时兜底）：
+# 要修的问题（同一根因的运行时 shim 已于 2026-10-30 全部下线并删除；本目录是「盘上形态」的根因修复）：
 #   会话内工具调用以宿主异常收尾：
 #     Cannot read properties of undefined (reading 'prepare')
 #   抛出点：@deepseek-ai/dsh-agent-loop/lib/index.js:582

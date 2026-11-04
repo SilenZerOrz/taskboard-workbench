@@ -25,16 +25,15 @@ var ToolRuntime = class extends Service { [TOOL_RUNTIME_SCHEDULER] = { prepare, 
 同一个坑还有 `dsh-scope`（模块级 `kScope = Symbol("dsh.scope")`，症状是新建会话报
 `Agent preset binding requires a scoped context`）。
 
-## 与 `tools/dsh-tools-alias-shim/` / `tools/dsh-scope-alias-shim/` 的关系
+## 与已下线的运行时 shim 的关系（2026-10-30 更新）
 
-| | 运行时 shim（既有） | **本目录（根因修复）** |
-| --- | --- | --- |
-| 做法 | 用 `node --import` 的 ESM loader 钩子**在内存里**把解析结果改写到宿主那份 | 把 `.pnpm` 下重复的**物理副本目录**换成指向宿主那份的**符号链接** |
-| 生效条件 | 必须带上 `NODE_OPTIONS`（否则完全无效） | 无需任何环境变量；Node 默认按 realpath 解析即天然单实例 |
-| 覆盖面 | 只覆盖**带 shim 启动**的进程 | 覆盖**所有**用该 profile 的进程 |
-| 缺点 | LaunchAgent/桌面应用拉起时会丢（本机就踩过） | 下次 `pnpm install` 会把副本装回来，需重跑 |
+`tools/dsh-tools-alias-shim/` 与 `tools/dsh-scope-alias-shim/` 已于 **2026-10-30 全部删除**：
+它们建立在「同一份源码被两条路径加载 ⇒ 两个模块级 Symbol」的假设上，实测该假设不成立
+（三处副本内容完全一致、相关符号已 `Symbol.for` 全局注册；真病灶是 ToolRuntime 构造期竞态，已在 dsh 侧修）。
+且 shim 会劫持模块解析、绑定本仓库绝对路径 —— 仓库一移动服务就起不来，已从 LaunchAgent 移除。
 
-两者可**同时启用**，互不冲突；本目录是「盘上形态」的修复，shim 是「进程内」的兜底。
+因此本目录现在是**唯一**的副本归一手段（盘上形态：把 `.pnpm` 下重复的物理副本目录换成指向宿主那份的符号链接）。
+不要再按「shim 与本目录可同时启用、互为兜底」理解 —— 那个兜底已经不存在了。
 
 ## 用法
 
