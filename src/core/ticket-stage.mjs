@@ -86,6 +86,8 @@ export function deriveDelivery({ task = {}, evidence = null, decision = null } =
  * 归一为单一 `stage`（纯）。优先级见文件头三条。
  * 返回 `{ stage, reason, delivery, next, watch, verify, diagnostics }` ——
  * 后四者是**同批读数**（不参与 stage 计算，但同一函数给出，避免调用方各取一套再自己拼）。
+ * `next` = `deriveNextStep()` 的**完整**回包，`watch` = `assessTask()` 的**完整**回包（卡 `-199`：
+ * 抽屉直接消费这两个对象，不再各自去请求 `/next-step` 与 `/execution`）。
  */
 export function ticketStage(task = {}, ctx = {}) {
   const t = task ?? {};
@@ -108,7 +110,17 @@ export function ticketStage(task = {}, ctx = {}) {
   const next = deriveNextStep(t, { humanReviewBlocker: ctx.humanReviewBlocker ?? null, stalled });
   const autoReview = latestAutoReview(ctx.comments ?? []);
 
-  const base = { delivery, next: { code: next.code, title: next.title }, watch: { state: watch.state, minutes: watch.minutes }, verify: autoReview ? { verdict: autoReview.verdict ?? null, at: autoReview.at ?? null } : null, diagnostics: Array.isArray(ctx.diagnostics) ? ctx.diagnostics.slice() : [] };
+  // 卡 `-199`（FR-108 收口）：`next` / `watch` **原样整份透传**，不再削成 `{code,title}` / `{state,minutes}`。
+  // 削字段不是"瘦身"，是**静默删功能**：`next` 少了 `hint/steps/focus/actions/blocker`，「下一步」区块
+  // 就只剩一句标题（步骤、按钮、默认折叠、前置卡跳转全没了）；`watch` 少了 `followups/reason`，
+  // 「派生为子任务 / 忽略」与「执行会话未在线」文案就一起消失。调用方只消费这一份，所以必须给全。
+  const base = {
+    delivery,
+    next,
+    watch,
+    verify: autoReview ? { verdict: autoReview.verdict ?? null, at: autoReview.at ?? null } : null,
+    diagnostics: Array.isArray(ctx.diagnostics) ? ctx.diagnostics.slice() : [],
+  };
 
   // 1) 终态
   if (status === "done") return { stage: "done", reason: "已完成", ...base };

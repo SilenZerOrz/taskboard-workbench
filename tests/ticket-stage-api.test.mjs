@@ -73,25 +73,66 @@ test("D 待验收未发起评审 ⇒ awaiting_review_request（先于交付物�
   assert.equal(r.payload.ticketStage.stage, "awaiting_review_request");
 });
 
-test("E 只读：GET 详情不写库（version / 证据条数 / 事件数 / schema 全不变）", async () => {
+test("E 只读：GET 详情不写库（version / 证据条数 / 事件数 / **诊断行数** / schema 全不变）", async () => {
   const { store, route } = setup();
+  // 这张卡会**命中诊断规则**（in_progress + 无认领锁 + 会话不在运行 ⇒ `unclaimed`）——
+  // 卡 `-199` 起详情 GET 真的会把诊断算出来交给 `ticketStage`，所以这条快照才真正有分量：
+  // 算出来可以，「顺手落库」不行（`persist:false`）。
   const t = store.createTask({ projectId: "p1", title: "T", status: "in_progress" });
   store.addTaskEvidence(t.identifier, { ...FULL, actor: "codex" });
-  const before = {
+  const snapshot = () => ({
     version: store.getTaskRef(t.identifier).version,
     evidence: store.listTaskEvidence(t.identifier).length,
     events: store.listTaskEvents(t.identifier, { limit: 500 }).length,
+    diagnostics: store.listTaskDiagnostics(t.identifier, { includeResolved: true }).length,
     schema: SCHEMA_VERSION,
-  };
+  });
+  const before = snapshot();
   await route("GET", `/api/tasks/${t.identifier}`);
   await route("GET", `/api/tasks/${t.identifier}`);
-  const after = {
-    version: store.getTaskRef(t.identifier).version,
-    evidence: store.listTaskEvidence(t.identifier).length,
-    events: store.listTaskEvents(t.identifier, { limit: 500 }).length,
-    schema: SCHEMA_VERSION,
-  };
-  assert.deepEqual(after, before, "详情 GET 不得产生任何写副作用");
+  const after = snapshot();
+  assert.deepEqual(after, before, "详情 GET 不得产生任何写副作用（诊断不得 persist）");
+});
+
+test("G 载荷完整（卡 `-199`）：`next` 不只是 {code,title}、`watch` 带 followups/reason、`diagnostics` 真实求值", async () => {
+  const { store, route } = setup();
+  const t = store.createTask({ projectId: "p1", title: "T", status: "in_progress" });
+  const r = await route("GET", `/api/tasks/${t.identifier}`);
+  const stage = r.payload.ticketStage;
+
+  // ① next：抽屉的「下一步」区块靠这五项生成步骤/按钮/默认折叠/前置卡跳转 —— 少一项就是静默删功能
+  for (const k of ["code", "title", "hint", "steps", "focus", "actions", "blocker"]) {
+    assert.ok(k in stage.next, `next 必须带 ${k}（削成摘要会让「下一步」区块少一半能力）`);
+  }
+  assert.ok(Array.isArray(stage.next.steps) && Array.isArray(stage.next.actions), "steps / actions 必须是数组");
+  assert.ok(stage.next.actions.length > 0, "进行中卡必须有可执行动作（不是只有一句标题）");
+
+  // ② watch：`followups` 驱动「派生为子任务 / 忽略」，`reason` 驱动「执行会话未在线/空闲」文案
+  for (const k of ["state", "minutes", "followups", "reason"]) {
+    assert.ok(k in stage.watch, `watch 必须带 ${k}`);
+  }
+  assert.ok(Array.isArray(stage.watch.followups), "followups 必须是数组");
+
+  // ③ diagnostics：真的算了（不是恒空数组）。这张卡 in_progress 无认领无会话 ⇒ unclaimed
+  assert.ok(Array.isArray(stage.diagnostics) && stage.diagnostics.length > 0, "诊断必须真实求值，不能恒为空");
+  assert.ok(stage.diagnostics.some((d) => d.kind === "unclaimed"), `期望命中 unclaimed，实得 ${stage.diagnostics.map((d) => d.kind)}`);
+  const d0 = stage.diagnostics[0];
+  assert.ok(d0.title && d0.detail && Array.isArray(d0.actions), "诊断项必须带给人看的标题/说明/恢复动作");
+});
+
+test("H 源码守卫（卡 `-199`）：三处判断收敛到 ticketStage，旧调用点必须为 0", () => {
+  const root = process.cwd();
+  const app = fs.readFileSync(path.join(root, "web/app.js"), "utf8");
+
+  // ① 旧调用点一个都不能留 —— 留着就是"同一张卡同一屏两套判断"的复发口
+  assert.doesNotMatch(app, /exec\?\.watchdog/, "看护读数不得再读 `exec.watchdog`（应读 ticketStage.watch）");
+  assert.doesNotMatch(app, /exec\?\.diagnostics/, "诊断不得再读 `exec.diagnostics`（应读 ticketStage.diagnostics）");
+  assert.doesNotMatch(app, /api\/tasks\/\$\{ref\}\/next-step/, "「下一步」不得再单独请求 /next-step（应读 ticketStage.next）");
+
+  // ② 新读点必须在位，且都指向**同一份**回包
+  assert.match(app, /detail\?\.ticketStage\?\.next/, "「下一步」必须读 detail.ticketStage.next");
+  assert.match(app, /detail\?\.ticketStage\?\.watch/, "看护必须读 detail.ticketStage.watch");
+  assert.match(app, /detail\?\.ticketStage\?\.diagnostics/, "诊断必须读 detail.ticketStage.diagnostics");
 });
 
 test("F 源码守卫：前端消费 ticketStage，且 stale 有独立警示样式", () => {

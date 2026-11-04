@@ -2317,9 +2317,11 @@
     let detailTask = null;
     // 真机 2026-10-23（用户报障「评审通过点击后…有两个完成按钮」）：抽屉渲染会被**并发**触发 ——
     // 评审/授权成功后处理器里的 `reopen()`、SSE `task.updated` 回流、60s 看护轮询、回到页签自愈，
-    // 任两条撞在一起就有两代渲染同时在跑。而「下一步」区块是**唯一在 await（`GET …/next-step`）之后
-    // 才追加**的区块 ⇒ 先完成的那一代把自己的 `<section>` 插进了后一代的 body，该区块于是出现两次
+    // 任两条撞在一起就有两代渲染同时在跑。当时「下一步」区块是**唯一在额外的 await（`GET …/next-step`）
+    // 之后才追加**的区块 ⇒ 先完成的那一代把自己的 `<section>` 插进了后一代的 body，该区块于是出现两次
     // （按钮自然也就成了两个）。处置＝渲染代次：每代自增序号，await 回来发现已被更新的一代取代即退出。
+    // 卡 `-199` 之后取数已收敛为一次 `Promise.all`（不再单独 await `/next-step`），代次守卫仍保留：
+    // 它同时兜住「用户连点两张卡」这类**已知**并发，而幂等兜底（见「下一步」区块）兜住未知的。
     let detailRenderSeq = 0;
     const setView = (next) => {
       view = next;
@@ -4693,9 +4695,10 @@
         cliSec.appendChild(cliBar);
         drawerBody.appendChild(cliSec);
 
-        // 诊断与恢复动作（FR-79）：结构化诊断（类型 / 严重度 / 说明 / 恢复动作），
-        // 卡片上只有摘要徽标，完整列表在这里一次取回（exec.diagnostics）。
-        const diagList = Array.isArray(exec?.diagnostics) ? exec.diagnostics : [];
+        // 诊断与恢复动作（FR-79）：结构化诊断（类型 / 严重度 / 说明 / 恢复动作）。
+        // 卡 `-199`：改读 `GET /api/tasks/:ref` 回包里的 `ticketStage.diagnostics` —— 三块判断
+        // （下一步 / 看护 / 诊断）自此同源，不再各取一套（旧口径是 `exec.diagnostics`，走 `/execution`）。
+        const diagList = Array.isArray(detail?.ticketStage?.diagnostics) ? detail.ticketStage.diagnostics : [];
         if (diagList.length > 0) {
           const SEV_LABEL = { high: "高危", medium: "中等", low: "提示" };
           const dsec = mk("div", "drawer-section");
@@ -4831,7 +4834,9 @@
         }
 
         // 执行看护（FR-75 停滞 / FR-76 "下一步建议"跟进）
-        const watch = exec?.watchdog ?? null;
+        // 卡 `-199`：改读 `ticketStage.watch`（与「下一步」「诊断」同源）。`watch` 是 `assessTask()` 的完整回包，
+        // `followups / reason` 都在里面 —— 「派生为子任务 / 忽略」和「执行会话未在线」文案不会因此丢掉。
+        const watch = detail?.ticketStage?.watch ?? null;
         if (watch && (watch.state === "stalled" || watch.state === "awaiting-decision")) {
           const wsec = mk("div", "drawer-section");
           wsec.appendChild(mk("h3", null, "执行看护"));
@@ -4970,7 +4975,8 @@
         // 「下一步」引导（真机反馈 2026-10-22：「详情界面没有下一步该做啥的提示，也没有操作按钮」）。
         // 缺口实质：按钮此前按**功能分类**散落在「评审 / 操作 / 人工校验」各区块，没有一处回答
         // "我现在该干嘛"；被人工校验门挡住的卡只有一行文字，连跳过去下结论的入口都没有。
-        // 口径唯一来源＝服务端 `GET /api/tasks/:ref/next-step`（纯函数 src/core/next-step.mjs + 单测），
+        // 口径唯一来源＝服务端 `ticketStage.next`（`ticketStage()` 内部调 `deriveNextStep()`，纯函数 + 单测；
+        // 卡 `-199` 起随 `GET /api/tasks/:ref` 一并返回，不再单独请求 `/next-step`）。
         // 这里只把 action id 映射成按钮与处理器 —— 不在前端重写一遍判断，避免两份口径。
         {
           const scrollToSection = (keyword) => {
@@ -5048,11 +5054,14 @@
               } catch (e) { showBanner(`转调试失败：${e.message}`, "error"); }
             },
           };
-          let step = null;
-          try { step = (await api("GET", `/api/tasks/${ref}/next-step`))?.nextStep ?? null; } catch (_) { step = null; }
-          // 这一步 await 过 ⇒ 必须重判代次，否则本代的「下一步」区块会被追加到后一代的抽屉里（重复区块）。
+          // 卡 `-199`：改读 `detail.ticketStage.next`（与「看护」「诊断」同源），**不再**单独请求
+          // `GET /api/tasks/:ref/next-step` —— 那条路径会让同一张卡在同一屏上出现两套判断。
+          // `ticketStage.next` 是 `deriveNextStep()` 的完整回包（hint / steps / focus / actions / blocker），
+          // 所以下面按 `focus` 折叠、按 `actions` 生成按钮、按 `blocker` 跳前置卡的能力一条不减。
+          const step = detail?.ticketStage?.next ?? null;
+          // 取数阶段已整体 await 完（`Promise.all`），本段是同步构建；代次判断保留作为并发兜底。
           if (renderSeq !== detailRenderSeq) return;
-          // 引导拿不到不阻断抽屉（老服务/端点异常时照旧能看到其它区块）；但不静默 —— 留一行说明。
+          // 引导拿不到不阻断抽屉（老服务/回包缺字段时照旧能看到其它区块）；但不静默 —— 留一行说明。
           // FR-89（真机反馈 2026-10-22）：「收口了为何还有这么多校验/评审/执行会话按钮」「异常时既可评审又可检验、无从下手」。
           // 处置 = 只做**呈现层默认折叠**（内容与按钮一个不删，点标题即可展开），并把人手动开过的区块排除在外。
           const isClosed = t.status === "done" || t.status === "canceled";
@@ -5061,7 +5070,7 @@
           const sec = mk("div", "drawer-section next-step");
           sec.appendChild(mk("h3", null, "下一步"));
           if (!step) {
-            sec.appendChild(mk("div", "empty-note", "下一步引导不可用：服务端尚未加载该端点（GET /api/tasks/:ref/next-step 返回 404）——重载插件后生效。当前请按下方各区块自行判断。"));
+            sec.appendChild(mk("div", "empty-note", "下一步引导不可用：详情回包里没有 `ticketStage.next`（旧版服务端）——重载插件后生效。当前请按下方各区块自行判断。"));
           } else {
             sec.appendChild(mk("div", "next-step-title", step.title));
             if (step.hint) sec.appendChild(mk("p", "hint", step.hint));
@@ -5106,9 +5115,9 @@
               sec.appendChild(moreBar);
             }
           }
-          // 幂等兜底（2026-10-23 · 用户批注「两个完成按钮」的第二道防线）：代次守卫已挡住已知的并发路径，
-          // 但「下一步」区块是抽屉里**唯一**在 await 之后才追加的 DOM —— 一旦将来又冒出新的并发入口绕过守卫，
-          // 症状仍旧是「两个完成按钮」。这里把人能看到的**输出不变量**钉死：同一抽屉里只允许有一个该区块。
+          // 幂等兜底（2026-10-23 · 用户批注「两个完成按钮」的第二道防线）：代次守卫已挡住已知的并发路径。
+          // 卡 `-199` 起本区块不再单独 await（数据来自 `Promise.all` 取回的 `ticketStage`），
+          // 但**保留**这条输出不变量：一旦将来又冒出新的并发入口绕过守卫，症状仍旧是「两个完成按钮」。
           for (const staleNextStep of Array.from(drawerBody.querySelectorAll(".drawer-section.next-step"))) staleNextStep.remove();
           drawerBody.insertBefore(sec, drawerBody.firstChild); // 放最前：先回答"该干嘛"，再看明细
         }

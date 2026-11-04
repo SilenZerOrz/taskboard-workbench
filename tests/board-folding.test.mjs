@@ -101,10 +101,12 @@ test("FR-88：折叠 / 取消折叠只改 labels —— 状态、数据、父子
 /**
  * 真机 2026-10-23（用户报障「评审通过点击后，出现下一步提醒的时候有两个完成按钮」）：
  * 抽屉渲染会被**并发**触发 —— 评审/授权成功后处理器里的 `reopen()`、SSE `task.updated` 回流、
- * 60s 看护轮询、回到页签自愈，任两条撞上就有两代渲染同时在跑。而「下一步」区块是**唯一在
- * await（`GET …/next-step`）之后才追加**的区块 ⇒ 先完成的一代把自己的 section 插进了后一代的 body，
+ * 60s 看护轮询、回到页签自愈，任两条撞上就有两代渲染同时在跑。当时「下一步」区块是**唯一在
+ * 额外的 await（`GET …/next-step`）之后才追加**的区块 ⇒ 先完成的一代把自己的 section 插进了后一代的 body，
  * 该区块出现两次（按钮也就成了两个）。处置＝渲染代次：await 回来发现已被取代即退出。
- * 本测试钉「取号 → await 后重判代次 → 再追加」这段顺序，防止有人把守卫删掉（删掉即复发）。
+ * 卡 `-199` 之后取数收敛为一次 `Promise.all`（不再单独 await `/next-step`），代次守卫**保留**
+ * （它同时兜住「用户连点两张卡」这类已知并发）。本测试钉「取号 → 追加前重判代次 → 再追加」这段顺序，
+ * 防止有人把守卫删掉（删掉即复发）。
  */
 test("FR-89 补口（真机 2026-10-23）：抽屉并发渲染不得重复追加「下一步」区块（两个完成按钮）", () => {
   const source = read("web/app.js");
@@ -112,7 +114,9 @@ test("FR-89 补口（真机 2026-10-23）：抽屉并发渲染不得重复追加
   assert.match(source, /const renderSeq = \+\+detailRenderSeq;/, "每次渲染须取号");
   assert.match(source, /if \(renderSeq !== detailRenderSeq\) return;/, "须在 await 之后重判代次");
   const takeTicket = source.indexOf("const renderSeq = ++detailRenderSeq;");
-  const recheck = source.indexOf("这一步 await 过 ⇒ 必须重判代次");
+  // 卡 `-199`：该处的 `await` 已消失（数据改由 `Promise.all` 一次取回），锚点随语义改为
+  // 「取数已 await 完 / 本段同步构建」这一行 —— 守卫本身仍在，删掉即复发。
+  const recheck = source.indexOf("取数阶段已整体 await 完");
   const insert = source.indexOf("drawerBody.insertBefore(sec, drawerBody.firstChild);");
   assert.ok(takeTicket > -1 && recheck > -1 && insert > -1, "三处锚点都必须在位");
   assert.ok(takeTicket < recheck && recheck < insert, "代次判定必须夹在「取号」与「追加下一步区块」之间");

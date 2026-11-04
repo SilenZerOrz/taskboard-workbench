@@ -626,17 +626,39 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
         // FR-90：详情里直接带上「评审证据包」（自动复核结论 + 最近一条进展评论），
         // 评审人打开抽屉即可看到机器结论，而不是只看到两个按钮。
         const comments = store.listComments(task.id);
-        // FR-108（卡 `-198`）：详情带**阶段推导单一口径**（`ticketStage`，0-A1 的纯函数）。
+        // FR-108（卡 `-198` → 卡 `-199`）：详情带**阶段推导单一口径**（`ticketStage`，0-A1 的纯函数）。
         // 只读附加字段：不改任何既有字段语义，也不写库。
         //   · `decision` 先给 null —— `decision_log` 表属 0-C（FR-109），建表后在这里读行传进来即可；
-        //   · `diagnostics` 传空数组 —— 详情 GET 不该跑诊断规则（那是 `/diagnostics` 的活），
-        //     更不能因为一次读页面就 persist 出诊断行。
+        //   · `diagnostics` **真实求值但零写**（卡 `-199`）：抽屉的「下一步 / 看护 / 诊断」三块现在只消费
+        //     这一份 `ticketStage`，不再各自去打 `/next-step` 与 `/execution`（那里一次请求算一次、还会落库）。
+        //     所以这里必须把诊断算出来，否则诊断块会因为"没人再算"而永远空着。
+        //     `persist:false` 保住本端点的既有不变量「详情 GET 不得有写副作用」；计数字段从**已落库行**补回
+        //     （否则界面上永远显示"第 1 次"，把复发次数这条信息抹掉）。
         const evidence = typeof store.latestTaskEvidence === "function" ? store.latestTaskEvidence(task.identifier) : null;
         let sessionState = null;
         try { sessionState = store.taskSessionState(task); } catch { sessionState = null; }
         let currentRun = null;
         try { currentRun = typeof store.getCurrentRun === "function" ? store.getCurrentRun(task) : null; } catch { currentRun = null; }
-        const stage = ticketStage(task, { evidence, decision: null, comments, sessionState, currentRun, diagnostics: [] });
+        let diagnostics = [];
+        try {
+          const preview = evaluateTaskDiagnostics(store, task, { persist: false });
+          const persisted = new Map(
+            (typeof store.listTaskDiagnostics === "function" ? store.listTaskDiagnostics(task) : []).map((d) => [String(d.kind ?? ""), d]),
+          );
+          diagnostics = (preview.diagnostics ?? []).map((d) => {
+            const prev = persisted.get(String(d.kind ?? ""));
+            if (!prev) return d;
+            const count = Number(prev.count ?? 0);
+            return {
+              ...d,
+              // 计数只认已落库行：它才是"这条诊断第几次出现"的事实来源；预览恒为 1。
+              count: count > 0 ? count : d.count,
+              firstSeenAt: prev.firstSeenAt ?? null,
+              lastSeenAt: prev.lastSeenAt ?? d.lastSeenAt,
+            };
+          });
+        } catch { diagnostics = []; }
+        const stage = ticketStage(task, { evidence, decision: null, comments, sessionState, currentRun, diagnostics });
         return { status: 200, payload: { task, comments, reviewEvidence: buildReviewEvidence({ comments }), ticketStage: stage } };
       }
       if (method === "PATCH") {
