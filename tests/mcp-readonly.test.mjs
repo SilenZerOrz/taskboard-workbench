@@ -29,7 +29,9 @@ function seed(dir) {
   const ws = path.join(dir, "ws");
   mkdirSync(ws, { recursive: true });
   writeFileSync(path.join(ws, "AGENTS.md"), "# 项目补充\n\n- 构建：mvn -q test\n");
-  const store = openStore({ dataDir: dir });
+  // 夹具要造一条 contract-warn 漂移行（workbench_audit 的 contract-stale 有东西可报）⇒ 用 warn 档，
+  // reject 档（2026-11-04 起的默认）会直接拦掉这次写入。
+  const store = openStore({ dataDir: dir, env: { TB_CONTRACT_MODE: "warn" } });
   store.createProject({ id: "p1", name: "P1 演示", workspacePath: ws });
   store.ensureRequirementDoc("p1", { body: "# 需求 v1\n" });
   const item = store.createRequirementItem({ projectId: "p1", title: "需求一" });

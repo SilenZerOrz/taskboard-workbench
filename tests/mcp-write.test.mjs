@@ -297,20 +297,23 @@ test("P3/E card_progress：证据必填 + norm_digest 门 + 去重 + done 红线
 });
 
 /* ---------------- F ---------------- */
-test("P3/F 契约仍是 warn 档：带旧 contract 写入成功，只留 contract-warn 审计", async () => {
+test("P3/F 契约门 reject 档：带旧 contract 的 card_create 被拒（CONTRACT_STALE），且不落卡", async () => {
+  // 2026-11-04 人拍 D2-**R-A**：默认 reject，只拒「带了但与当前不符」；不带契约仍放行（见 contract-warn 测试）。
   await withServer({}, async ({ dir, tool, item }) => {
+    const before = openStore({ dataDir: dir });
+    const beforeCount = before.listTasks({ projectId: "p1" }).length;
+    before.close();
+
     const res = await tool("card_create", {
       project: "p1", title: "带旧契约建的卡", requirement: item.identifier,
       contract: { version: "v1-000000000000", actor: "agent" },
     });
-    assert.equal(res.isError, false, "warn 档不得把写变成失败（D2 观察期内）");
-    assert.equal(res.value.contract.verdict, "warn", "返回体要告诉 agent 它用的是旧契约");
-    assert.equal(res.value.contract.problems[0].kind, "version");
+    assert.equal(res.isError, true, "reject 档必须拒");
+    assert.equal(res.value.error.code, "CONTRACT_STALE", "错误码要与 HTTP 口径一致（mcp-parity）");
 
     const store = openStore({ dataDir: dir });
-    const warns = store.listGovernanceAudit({ action: "contract-warn" });
-    assert.equal(warns.length, 1);
-    assert.equal(warns[0].target, res.value.card.identifier);
+    assert.equal(store.listTasks({ projectId: "p1" }).length, beforeCount, "被拒时不得建出卡（门在写之前）");
+    assert.equal(store.listGovernanceAudit({ action: "contract-reject" }).length, 1, "必须留一行可盘点的拒绝记录");
     store.close();
   });
 });

@@ -878,6 +878,11 @@ export function openStore(options = {}) {
   // 797 条既有用例与真机交互一起打红；按 §17.5「先 warn 后 reject」两步走，P3 随 MCP 一起翻默认。
   const strictAttribution =
     String((options.env ?? process.env)?.TB_STRICT_ATTRIBUTION ?? "") === "1";
+  // D2 契约门（2026-11-04 人拍 **R-A**）：默认 `reject` —— **只拒「带了但过期」**。
+  // `skipped`（调用方根本没带 contract，如 Web / CLI）**照旧放行** ⇒ 主力入口零影响。
+  // 回滚开关：`TB_CONTRACT_MODE=warn`（一行降级，等价 2026-10-29 起的旧行为）。
+  const contractMode =
+    String((options.env ?? process.env)?.TB_CONTRACT_MODE ?? "reject").trim().toLowerCase() === "warn" ? "warn" : "reject";
   // P1 契约快照：机器规范默认随包读 `spec/norms/*.md`；测试可传 `normsDir` 或直接传 `norms`。
   const normsDir = options.normsDir ?? path.join(PKG_ROOT, "spec", "norms");
   const injectedNorms = Array.isArray(options.norms) ? options.norms : null;
@@ -921,25 +926,48 @@ export function openStore(options = {}) {
     return contractCheckCache.byProject.get(projectId);
   }
   /**
-   * 只有**调用方显式带 `contract`** 才校验（老客户端不带 ⇒ skipped，零打扰）。
-   * 判 `warn` **不阻断写入**，只落一条 `contract-warn` 审计；
-   * 之后可用 `GET /api/governance/audit?action=contract-warn` 查「谁在用旧规范干活」。
+   * 契约门（**门在写入之前**，这是切 reject 的硬前提）。
+   *
+   * 只有**调用方显式带 `contract`** 才校验（老客户端 / Web / CLI 不带 ⇒ `skipped`，零打扰）。
+   * 带了但与当前不符 ⇒ `warn` verdict：
+   *   · `contractMode === "warn"`（回滚档）⇒ 只落 `contract-warn` 审计，照常写入；
+   *   · `contractMode === "reject"`（**默认**，2026-11-04 人拍 R-A）⇒ 落 `contract-reject` 审计并抛
+   *     `CONTRACT_STALE`。**必须在任何写库动作之前调用**，否则会「先写成功再回 409」。
+   *
+   * 为什么默认就拒：MCP 写工具**总是**带契约，所以被拒的正是「拿旧模板干活的 agent」；
+   * 而 `contract-warn` 生产审计自 2026-10-29 起一直是 **0 行** ⇒ 无存量会被打断。
    */
-  function noteContractUse(projectId, submitted, target) {
+  function assertContractUsable(projectId, submitted, target) {
     const current = currentContractCached(projectId);
     const verdict = evaluateSubmittedContract(current, submitted);
     if (verdict.verdict !== "warn") return verdict;
+    const detail = JSON.stringify({ problems: verdict.problems, current_version: current?.contractVersion ?? null, mode: contractMode });
     try {
       store.recordAudit({
         actor: String(submitted?.actor ?? "unknown"),
         action: "contract-warn",
         target: String(target ?? projectId),
-        allowed: true,
+        allowed: contractMode !== "reject",
         reason: "stale",
-        detail: JSON.stringify({ problems: verdict.problems, current_version: current?.contractVersion ?? null }),
+        detail,
       });
     } catch { /* 审计写失败也不能影响业务写入 */ }
-    return verdict;
+    if (contractMode !== "reject") return verdict;
+    try {
+      store.recordAudit({
+        actor: String(submitted?.actor ?? "unknown"),
+        action: "contract-reject",
+        target: String(target ?? projectId),
+        allowed: false,
+        reason: "stale",
+        detail,
+      });
+    } catch { /* 同上 */ }
+    throw new TbError(
+      "CONTRACT_STALE",
+      `你带的契约已过期（${verdict.problems.map((p) => (p.norm ? `${p.kind}:${p.norm}` : p.kind)).join(", ")}）；先取最新契约再重试；确需按旧契约写入请设 TB_CONTRACT_MODE=warn`,
+      { problems: verdict.problems, currentVersion: current?.contractVersion ?? null },
+    );
   }
 
     /**
@@ -1268,6 +1296,10 @@ export function openStore(options = {}) {
         throw new TbError("REQUIREMENT_REQUIRED", "建卡必须归属需求条目：请给 requirement <条目>；确实不需要归属时用 unattributedReason <理由> 显式声明（会落审计）", { projectId });
       }
 
+      // 契约门（D2/R-A）：**必须在 begin 之前** —— 否则旧契约会「先建出卡再回 409」。
+      // 代价：审计 target 只能指到 `project:new-task`（卡号此时还不存在）。
+      assertContractUsable(projectId, input.contract, `${projectId}:new-task`);
+
       let requirementId = null; // 事务内解析、事务外留痕（故声明在 try 之外）
 
       db.exec("begin immediate");
@@ -1313,8 +1345,6 @@ export function openStore(options = {}) {
         store.recordTaskEvent(id, { type: "attribution_missing", to: status, actor: "human", detail: "建卡未归属需求条目（未声明理由）—— 启动执行/派发团队会被归因门拒绝" });
       }
       const created = store.getTaskById(id);
-      // P1.5 · warn 档：审计要指到**这张卡**（不是 `task:new`）。切 reject 时必须把这行挪到 `begin` 之前。
-      noteContractUse(projectId, input.contract, created.identifier);
       return created;
     },
 
@@ -1414,7 +1444,7 @@ export function openStore(options = {}) {
 
     updateTask(ref, changes = {}) {
       const current = store.requireTaskRef(ref);
-      noteContractUse(current.projectId, changes.contract, current.identifier);
+      assertContractUsable(current.projectId, changes.contract, current.identifier);
       const { expectedVersion } = changes;
       if (expectedVersion === undefined || expectedVersion === null) {
         throw new TbError("MISSING_VERSION", "更新必须提供 expectedVersion（我读到的版本）", { taskId: current.id, currentVersion: current.version });
@@ -1575,7 +1605,7 @@ export function openStore(options = {}) {
 
     addComment(ref, input = {}) {
       const task = store.requireTaskRef(ref);
-      noteContractUse(task.projectId, input.contract, task.identifier);
+      assertContractUsable(task.projectId, input.contract, task.identifier);
       const body = normalizeDescription(input.body);
       const id = input.id ?? randomUUID();
       const timestamp = nowIso();
@@ -1744,6 +1774,8 @@ export function openStore(options = {}) {
       }
       const id = input.id ?? randomUUID();
       const ts = nowIso();
+      // 契约门（D2/R-A）：同上，必须在 begin 之前。
+      assertContractUsable(projectId, input.contract, `${projectId}:new-requirement`);
       db.exec("begin immediate");
       try {
         insertRequirementItem(db, { id, projectId, docId, title, description, acceptance, priority, status, source, ts });
@@ -1754,13 +1786,12 @@ export function openStore(options = {}) {
         throw error;
       }
       const createdItem = store.getRequirementItemById(id);
-      noteContractUse(projectId, input.contract, createdItem.identifier);
       return createdItem;
     },
     /** 更新需求条目（状态/标题/说明/验收/优先级）——资料引入后的"确认/修订"。 */
     updateRequirementItem(ref, changes = {}) {
       const item = store.requireRequirementItemRef(ref);
-      noteContractUse(item.projectId, changes.contract, item.identifier);
+      assertContractUsable(item.projectId, changes.contract, item.identifier);
       const sets = []; const params = [];
       if (changes.title !== undefined) {
         const nextTitle = assertTitle(changes.title);

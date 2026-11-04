@@ -66,7 +66,7 @@ test("P1.5/A 纯判据：不带 ⇒ skipped；版本不符 ⇒ warn(version)；�
 /* ---------------- B/C/D ---------------- */
 test("P1.5/B+C+D store：warn 不阻断、落一条审计；版本对得上 / 不带 ⇒ 不落审计", () => {
   const dir = freshDir("b");
-  const store = openStore({ dataDir: dir });
+  const store = openStore({ dataDir: dir, env: { TB_CONTRACT_MODE: "warn" } });
   try {
     const id = seedProject(store);
     const current = store.contractSnapshot(id).snapshot;
@@ -99,7 +99,7 @@ test("P1.5/B+C+D store：warn 不阻断、落一条审计；版本对得上 / �
 /* ---------------- E ---------------- */
 test("P1.5/E store：更新与评论两条写路径同样受检（不是只堵建卡）", () => {
   const dir = freshDir("e");
-  const store = openStore({ dataDir: dir });
+  const store = openStore({ dataDir: dir, env: { TB_CONTRACT_MODE: "warn" } });
   try {
     const id = seedProject(store);
     const task = createTask(store, id, { title: "两条写路径" });
@@ -120,7 +120,7 @@ test("P1.5/E store：更新与评论两条写路径同样受检（不是只堵�
 /* ---------------- F ---------------- */
 test("P1.5/F HTTP：body.contract 透传到内核（门面层不复制校验逻辑）", async () => {
   const dir = freshDir("f");
-  const store = openStore({ dataDir: dir });
+  const store = openStore({ dataDir: dir, env: { TB_CONTRACT_MODE: "warn" } });
   const server = createServer({ store });
   try {
     const id = seedProject(store);
@@ -144,7 +144,9 @@ test("P1.5/F HTTP：body.contract 透传到内核（门面层不复制校验逻�
     assert.equal(audit.status, 200);
     const body = await audit.json();
     assert.equal(body.count, 1);
-    assert.equal(body.audit[0].target, json.task.identifier);
+    // 2026-11-04 D2/R-A 起：warn 判据挪到**事务之前**（否则切 reject 会「先写成功再 409」），
+    // 因此 create 路径的审计 target 只能指到 `<project>:new-task`（卡号此时还不存在）。
+    assert.equal(body.audit[0].target, `${id}:new-task`);
   } finally {
     // 关服务必须在 finally 里：断言失败时若只关 store，端口仍监听 ⇒ `node --test` 永不退出（首版就这么被假挂住）
     server.closeAllConnections?.();

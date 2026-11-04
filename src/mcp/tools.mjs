@@ -180,7 +180,12 @@ export function workbenchAudit({ store }, args = {}) {
   // ① contract-stale：内核 warn 档留下的审计（P1.5）——「有 agent 用旧契约写过东西」
   const warns = store.listGovernanceAudit({ action: "contract-warn" })
     .filter((r) => Date.parse(r.at) >= sinceMs)
-    .filter((r) => String(r.target ?? "").startsWith(`${project.id}-`) || r.target === project.id);
+    // target 有两种形态：`<project>-<seq>`（既有卡/条目的编号）与 `<project>:new-task|new-requirement`
+    // （2026-11-04 起契约门挪到**事务之前**，建卡/建条目时编号还不存在）。两种都要算本项目。
+    .filter((r) => {
+      const target = String(r.target ?? "");
+      return target.startsWith(`${project.id}-`) || target.startsWith(`${project.id}:`) || target === project.id;
+    });
   // ② unattributed：未完成且无归因的卡
   const unattributed = tasks.filter((t) => !TERMINAL.has(t.status) && !t.requirementId);
   // ③ unbound-session：项目主会话未绑定
