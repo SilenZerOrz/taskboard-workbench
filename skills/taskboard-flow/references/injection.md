@@ -1,4 +1,10 @@
-# 三档装载 + 分层注入策略（档 C 预埋，未启用）
+# 三档装载 + 分层注入策略（档 C 预埋，**未实现**）
+
+> ⚠ **未实现（全仓无 reader）** —— `flow_inject_policy` 在当前代码里**没有任何读取点**：
+> `grep -rn "flow_inject_policy" src scripts web cli tools` 命中 **0** ⇒ **改它不改变任何行为**。
+> 它只是为「档 C 宿主自动注入」预留的配置位（卡 `-186` / 需求 `R141`）；要真正接线，得先做 P5（卡 `-210`）。
+> **自证**：`node --test tests/flow-inject-policy-gap.test.mjs` —— 该守卫在「有人接线却没更新本文」时转红，
+> 所以这条标注不是承诺，是可执行判据。
 
 ## 一、三档从侵入性低到高
 
@@ -29,7 +35,7 @@
 
 | 预埋项 | 内容 | 现在生效吗 |
 | --- | --- | --- |
-| `flow_inject_policy` | `off` / `main-only` / `main+exec` / `all`（**默认 `off`**） | ✅ 是一个"配置位"，但**没有任何代码读它去注入** |
+| `flow_inject_policy` | `off` / `main-only` / `main+exec` / `all`（**默认 `off`**） | ⚠ **未实现（全仓无 reader）** —— 无任何代码读它去注入；改它不改变行为（卡 `-186` / 需求 `R141`） |
 | 审计表 | `flow_injections(session_id, project_id, policy, contract_version, digest, injected_at)` | ✅ 表在（P1 建的），`recordFlowInjection` / `listFlowInjections` 可用 |
 | 接入位 | 「会话创建 → 注入」的 hook 点 | ⏸ **只在本文件文档化，不写任何 `~/.dsh/**` 补丁** |
 
