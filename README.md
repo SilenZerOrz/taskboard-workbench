@@ -96,8 +96,14 @@ CLI 约定：成功 `stdout` 输出 JSON（含 `schemaVersion`），退出码 `0
 ```bash
 node src/mcp/server.mjs --data-dir "$TB_DATA_DIR"   # MCP 客户端作为子进程拉起（stdio）
 node src/mcp/server.mjs --print-tools               # 只打印工具清单（调试用）
+node src/mcp/server.mjs --read-only                 # **只读模式**：只暴露五件只读工具，写四件调用即 READ_ONLY_MODE
 npm run mcp -- --data-dir "$TB_DATA_DIR"            # 同上，走 npm script
 ```
+
+`--read-only` 是写工具的**回滚开关**（写路径出问题时的逃生口）：`tools/list` 里不再出现
+`card_create` / `card_progress` / `requirement_upsert` / `requirement_change`，直接调用返回
+`isError:true` + `code=READ_ONLY_MODE`（**不是**「未知工具」，便于区分「开关生效」与「名字拼错」）。
+不带该参数时行为不变（9 个工具）。
 
 传输是 **stdio + newline-delimited JSON-RPC 2.0**（MCP stdio transport）：
 **不占端口、不碰 `:3080`、不写 `~/.dsh/**`、不需要重载宿主**，每个 agent 会话一个进程。

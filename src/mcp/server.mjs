@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * server.mjs —— Taskboard Workbench MCP server（stdio · 零依赖 · 只读四工具）。
+ * server.mjs —— Taskboard Workbench MCP server（stdio · 零依赖 · 只读五 + 写四）。
  *
  * 方案依据：§6.1 —— **stdio 而不是 HTTP**：① 不占端口、不碰 `:3080`；② 不需要重载宿主、
  * 不写 `~/.dsh/**`；③ 每个 agent 会话一个进程，天然隔离。数据连**同一个** `taskboard.sqlite`。
@@ -8,6 +8,7 @@
  * 用法：
  *   node src/mcp/server.mjs --data-dir <dir>     # 由 MCP 客户端作为子进程拉起
  *   node src/mcp/server.mjs --print-tools        # 打印工具清单（调试 / 守卫测试用）
+ *   node src/mcp/server.mjs --read-only          # **只读模式**（P3 的回滚开关）：写四件不出现在 tools/list，调用即 READ_ONLY_MODE
  *
  * 传输：newline-delimited JSON-RPC 2.0（MCP stdio transport）。
  * stdout **只允许**出现协议消息；日志一律走 stderr（否则客户端解析失败）。
@@ -29,9 +30,16 @@ const argOf = (name) => {
 };
 const has = (name) => argv.includes(name);
 
+// P3 的回滚开关（方案 §十 回滚列 / 风险表 R2）：只读模式下按 annotations.readOnlyHint 过滤工具面。
+// 这是**承诺过的逃生口** —— 写工具出问题时应能一条参数降级，而不是回退提交。
+const READ_ONLY = has("--read-only");
+const ACTIVE_TOOLS = READ_ONLY ? TOOLS.filter((t) => t.annotations?.readOnlyHint === true) : TOOLS;
+const ACTIVE_NAMES = ACTIVE_TOOLS.map((t) => t.name);
+
 if (has("--help") || has("-h")) {
   process.stderr.write(`taskboard-workbench MCP server（9 个工具：只读五 / 写四 · prompt 1）
-用法: node src/mcp/server.mjs [--data-dir <dir>] [--print-tools]
+用法: node src/mcp/server.mjs [--data-dir <dir>] [--print-tools] [--read-only]
+只读: --read-only 关闭写四件（card_create / card_progress / requirement_upsert / requirement_change）——P3 的回滚开关
 工具: ${TOOL_NAMES.join(", ")}
 提示: prompt taskboard.flow（= node scripts/tb-flow.mjs start 的输出）
 数据: --data-dir > $TB_DATA_DIR > 默认（同 Web/CLI）
@@ -42,7 +50,7 @@ if (has("--help") || has("-h")) {
 const pkg = JSON.parse(readFileSync(path.join(PKG_ROOT, "package.json"), "utf8"));
 
 if (has("--print-tools")) {
-  process.stdout.write(`${JSON.stringify({ name: pkg.name, version: pkg.version, tools: TOOLS.map((t) => t.name) }, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify({ name: pkg.name, version: pkg.version, readOnly: READ_ONLY, tools: ACTIVE_NAMES }, null, 2)}\n`);
   process.exit(0);
 }
 
@@ -51,7 +59,7 @@ const store = openStore({ dataDir, env: process.env });
 const ctx = { store };
 let skillMeta = null;
 try { skillMeta = readSkill().meta; } catch { /* skill 缺失时不影响工具面；prompts/* 会报出具体原因 */ }
-process.stderr.write(`[tb-mcp] ready dataDir=${store.dataDir} tools=${TOOL_NAMES.join(",")} prompt=taskboard.flow skill=${skillMeta ? `v${skillMeta.version}` : "missing"}\n`);
+process.stderr.write(`[tb-mcp] ready dataDir=${store.dataDir} readOnly=${READ_ONLY} tools=${ACTIVE_NAMES.join(",")} prompt=taskboard.flow skill=${skillMeta ? `v${skillMeta.version}` : "missing"}\n`);
 
 const SERVER_INFO = { name: "taskboard-workbench", version: pkg.version };
 const DEFAULT_PROTOCOL = "2025-06-18";
@@ -72,7 +80,7 @@ const toolError = (error) => {
 };
 
 function listTools() {
-  return TOOLS.map((t) => ({
+  return ACTIVE_TOOLS.map((t) => ({
     name: t.name,
     description: t.description,
     inputSchema: t.inputSchema,
@@ -94,8 +102,19 @@ async function handle(message) {
   if (method === "tools/list") return result(id, { tools: listTools() });
   if (method === "tools/call") {
     const name = params?.name;
-    const tool = TOOLS.find((t) => t.name === name);
-    if (!tool) return rpcError(id, -32602, `Unknown tool: ${name ?? "(missing)"}`, { tools: TOOL_NAMES });
+    const tool = ACTIVE_TOOLS.find((t) => t.name === name);
+    if (!tool) {
+      // 只读模式下「写工具存在但被关掉」与「工具根本不存在」必须分开报：
+      // 前者是**预期降级**（回滚开关生效），后者是客户端拼错了名字。
+      if (READ_ONLY && TOOLS.some((t) => t.name === name)) {
+        return result(id, toolError(new TbError(
+          "READ_ONLY_MODE",
+          `--read-only 已启用：写工具 ${name} 不可用（P3 回滚开关）。只读工具：${ACTIVE_NAMES.join(", ")}`,
+          { tool: name, readOnly: true, available: ACTIVE_NAMES },
+        )));
+      }
+      return rpcError(id, -32602, `Unknown tool: ${name ?? "(missing)"}`, { tools: ACTIVE_NAMES });
+    }
     try {
       const value = await tool.handler(ctx, params?.arguments ?? {});
       return result(id, { content: [{ type: "text", text: JSON.stringify(value, null, 2) }], isError: false });
