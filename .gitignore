@@ -31,3 +31,6 @@ AGENTS.md
 package/
 # Codex 钩子的本地运行痕迹（会话留痕等，不入库）
 .codex/local/
+
+# agent-teams 团队的运行期状态（inbox / team.json 会话留痕），不入库
+.agent-teams/
