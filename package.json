@@ -66,7 +66,10 @@
     "flow": "node scripts/tb-flow.mjs",
     "seed": "node tools/seed.mjs",
     "test": "node --test",
-    "env-check": "node tools/env-check.mjs"
+    "env-check": "node tools/env-check.mjs",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
   },
   "peerDependencies": {
     "@deepseek-ai/dsh-client-ui-layout": "*",
