@@ -77,10 +77,16 @@ const dataDir = await mkdtemp(path.join(os.tmpdir(), "tb-nextcol-data-"));
 const chromeProfile = await mkdtemp(path.join(os.tmpdir(), "tb-nextcol-chrome-"));
 const store = openStore({ dataDir, env: {} });
 store.createProject({ id: "default", name: "默认项目" });
+// 归因校验（REQUIREMENT_NOT_FOUND）落地后，种子不能再写占位串 `4-abc`（库里没有这条）——
+// 台必须像真实调用方一样**先建条目、再取它的 identifier**，否则在建数据阶段就崩，一条断言都跑不到。
+const seedRequirement = store.createRequirementItem({
+  projectId: "default", title: "验证台种子需求", status: "open", priority: "medium",
+});
+const REQUIREMENT = seedRequirement.identifier;
 
 /** 造一张「待验收」卡（走真实评审流程进入 in_review）。 */
 const seedReview = (title) => {
-  const t = store.createTask({ projectId: "default", title, status: "todo", requirementId: "4-abc" });
+  const t = store.createTask({ projectId: "default", title, status: "todo", requirement: REQUIREMENT });
   store.requestReview(t.identifier, { actor: "agent", reviewer: "r1", comment: "请评审" });
   return store.getTaskRef(t.identifier);
 };
@@ -89,7 +95,7 @@ const approved = seedReview("已评审通过的卡");
 store.approveReview(approved.identifier, { actor: "reviewer" });
 const pending = seedReview("评审待处理的卡");
 // 反向对照：非待验收列
-const inProgress = store.createTask({ projectId: "default", title: "进行中的卡", status: "in_progress", requirementId: "4-abc" });
+const inProgress = store.createTask({ projectId: "default", title: "进行中的卡", status: "in_progress", requirement: REQUIREMENT });
 
 const TITLES = { approved: "已评审通过的卡", pending: "评审待处理的卡", inProgress: "进行中的卡" };
 

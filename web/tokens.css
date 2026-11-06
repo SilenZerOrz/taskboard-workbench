@@ -201,6 +201,17 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
 button.ghost { border-color: transparent; background: transparent; color: var(--text-secondary); }
 button.ghost:hover { background: var(--surface-hover); }
+/* 卡 `-224`（需求 `R164`）：按钮**层级**只有五档 —— primary 抢主色（每屏至多一个）、
+   secondary 常规动作、ghost 工具/低频、link 跨区块跳转、danger 破坏性。
+   层级在需要时显式声明，不再靠"每个区块各补一条选择器"去调外观（那种补丁会让同一种按钮在
+   不同区块长得不一样，正是真机批注的那条）。 */
+button.secondary { background: var(--surface); border-color: var(--border-strong); color: var(--text-primary); }
+button.secondary:hover { background: var(--surface-hover); }
+button.link {
+  border-color: transparent; background: transparent; color: var(--accent);
+  padding: 0 var(--space-1); text-decoration: underline; text-underline-offset: 2px;
+}
+button.link:hover { background: transparent; text-decoration-thickness: 2px; }
 button:disabled { opacity: .5; cursor: not-allowed; }
 button.icon { min-width: 28px; padding: 0 var(--space-2); }
 
@@ -602,6 +613,36 @@ dialog h2 { margin: 0 0 var(--space-3); font-size: 15px; }
 .req-candidate { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-1) 0; font-size: 12px; }
 .field-inline { display: flex; gap: var(--space-2); align-items: flex-end; flex-wrap: wrap; }
 .field-inline label { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: var(--text-secondary); }
+/* 卡 `-225`（需求 `R166`）：**需求条目面板工具区** —— 真机批注「同类输入框&按钮都挤在左侧」。
+   三段各成一行：新建（输入 + 按钮）/ 筛选（状态 + 搜索 + 下一步提示）/ 批量（已选 N + 动作组）。
+   宽视口左右分组（提示与动作组 `margin-left: auto` 靠右），窄视口自动换行；控件统一 30px 高。
+   只新增本面板专用类，**不动** `.field-inline` 的全局定义（其余表单仍在用，且 `align-items: flex-end`
+   正是同排控件基线歪掉的根因，改它会外溢到别的面板）。 */
+.req-toolbar { display: flex; flex-direction: column; gap: var(--space-2); margin-bottom: var(--space-2); }
+.req-toolbar-row { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+.req-toolbar-row > input[type="text"],
+.req-toolbar-row > input[type="search"] { flex: 1 1 200px; min-width: 160px; max-width: 420px; }
+.req-toolbar-row > select { flex: 0 0 auto; min-width: 116px; }
+/* 几何统一：**显式 height** 而不是 min-height —— 全局规则里 input 是 31px（13px 字 + padding + border）、
+   select 29px、button 28px，只写 min-height 会把三种原生高度原样保留（验证台实测 31/29/28）。
+   这里统一钉成 30px 并去掉纵向 padding，纵向居中交给浏览器。 */
+.req-toolbar-row > input[type="text"],
+.req-toolbar-row > input[type="search"],
+.req-toolbar-row > select,
+.req-toolbar-row > button,
+.req-bulk-actions > button { height: 30px; min-height: 30px; padding-top: 0; padding-bottom: 0; font-size: 12px; }
+.req-toolbar-row > button,
+.req-bulk-actions > button { padding-left: var(--space-3); padding-right: var(--space-3); }
+.req-toolbar-hint { margin: 0 0 0 auto; font-size: 12px; line-height: 1.5; color: var(--text-tertiary); text-align: right; }
+.req-bulk-bar { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; margin-bottom: var(--space-2); }
+.req-bulk-count { flex: 0 0 auto; white-space: nowrap; }
+.req-bulk-actions { display: flex; align-items: center; gap: var(--space-1); margin-left: auto; flex-wrap: wrap; }
+.req-bulk-actions > button { white-space: nowrap; }
+/* 窄视口：右对齐会退化成"孤零零靠右"，改为跟随左列 */
+@media (max-width: 760px) {
+  .req-toolbar-hint { margin-left: 0; text-align: left; }
+  .req-bulk-actions { margin-left: 0; }
+}
 
 /* ---------------------------------------------------------------- 任务详情抽屉 */
 .tb-drawer-backdrop {
@@ -662,6 +703,12 @@ dialog h2 { margin: 0 0 var(--space-3); font-size: 15px; }
 .tb-drawer-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); justify-content: flex-end; align-items: center; flex: 0 1 auto; max-width: min(72%, 900px); }
 .tb-drawer-actions > button { white-space: nowrap; }
 .tb-drawer-actions:empty { display: none; }
+/* 卡 `-224`：标题栏分区 —— 动作段（卡片级）与工具段之间一条发丝线；工具组顺序固定
+   `全部收起 → 全屏 → ✕`，尺寸与正文按钮同高（不再因为混排在动作后面而忽大忽小）。 */
+.tb-drawer-sep { width: 1px; align-self: stretch; background: var(--border); margin: 2px 0; flex: 0 0 auto; }
+.tb-drawer-utils { display: flex; align-items: center; gap: var(--space-1); flex: 0 0 auto; }
+.tb-drawer-utils:empty { display: none; }
+.tb-drawer-utils > button { padding: 0 var(--space-2); }
 .tb-drawer-body { padding: var(--space-4) var(--space-5) var(--space-6); overflow: auto; display: flex; flex-direction: column; gap: var(--space-4); }
 /* FR-87 修订：抽屉够宽时正文自动两栏 —— 内容、区块与顺序一字不动，只是把长竖列摊成两栏
    （`break-inside: avoid` 保证区块不跨栏断行）。分栏阈值由 app.js 按**实测抽屉宽度**写在 data-cols 上，
@@ -864,15 +911,70 @@ dialog h2 { margin: 0 0 var(--space-3); font-size: 15px; }
    「引入的文件」由平铺列表改成**文件夹树** —— 目录是节点（可展开/收起，默认展开），文件只在叶子里。 */
 .req-files-head { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
 .req-files-head > h3 { margin: 0; font-size: 12px; font-weight: 600; color: var(--text-secondary); }
-.req-tree { display: flex; flex-direction: column; gap: var(--space-1); max-height: 420px; overflow: auto; }
-.req-folder { border: var(--border-hairline) solid var(--border); border-radius: var(--radius-md); background: var(--surface-muted); }
-.req-folder > summary { display: flex; align-items: center; gap: var(--space-2); cursor: pointer; padding: var(--space-1) var(--space-2); font-size: 12px; font-weight: 600; color: var(--text-secondary); }
-.req-folder-name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-.req-folder-body { display: flex; flex-direction: column; gap: var(--space-1); padding: var(--space-1) var(--space-2) var(--space-2) var(--space-4); }
-.req-list-files { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
-.req-file { display: flex; align-items: baseline; gap: var(--space-2); font-size: 12px; padding: 2px var(--space-1); border-radius: var(--radius-sm); }
+/* 卡 `-226`（需求 `R167`）· 真机批注「引入文件的样式我希望引用 dsh 侧边栏的文件列表样式」：
+   旧形态是**每层一个卡片盒**（边框 + 圆角 + `--surface-muted` 底），层数一多就是「盒子里套盒子」，
+   文件行是「名字 + 弹簧 + 体积胶囊」—— 与 DSH 侧栏那种**扁平树 + 折叠箭头 + 逐层缩进 + 类型图标**
+   完全两种语言。这里换成侧栏语言，**结构一字未改**（`details.req-folder` / `ul.req-list-files` /
+   `li.req-file` / `summary .req-folder-name` / `span.chip` 全保留），只重写呈现：
+     · 去盒子 ⇒ 整棵树连续，靠缩进与发丝引导线表达层级；
+     · `summary::before` 画三角箭头（展开时 rotate 90°），不再依赖浏览器默认 marker；
+     · 行高统一 22px、整行 `:hover`（点击/悬停目标从"文字"扩到"整行"）；
+     · 文件类型徽标 14×14 纯 CSS 色块（离线、零请求，见 app.js `fileKind`）；
+     · 体积列定宽 68px 等宽右对齐（沿用 -160 的教训：对齐列必须定宽，否则逐行抖）。 */
+.req-tree {
+  --ft-js: #d9a13a; --ft-ts: #3f7fd4; --ft-md: #43bc58; --ft-json: #e08a2e;
+  --ft-yaml: #a463d6; --ft-img: #5e6ad2; --ft-css: #4aa3c7; --ft-sh: #7d8694; --ft-file: #9e9ea1;
+  display: flex; flex-direction: column; gap: 0; max-height: 420px; overflow: auto;
+  scrollbar-gutter: stable; padding: 2px 0;
+}
+.req-tree-tools { display: flex; align-items: center; gap: var(--space-1); margin: 0 0 var(--space-1); }
+.req-folder { border: 0; background: transparent; border-radius: 0; }
+.req-folder > summary {
+  display: flex; align-items: center; gap: 6px; height: 22px; padding: 0 6px;
+  border-radius: var(--radius-sm); font-size: 12px; font-weight: 500; color: var(--text-secondary);
+  cursor: pointer; user-select: none; list-style: none;
+}
+.req-folder > summary::-webkit-details-marker { display: none; }
+.req-folder > summary::before {
+  content: ""; flex: 0 0 auto; width: 0; height: 0; opacity: 0.6;
+  border-left: 4.5px solid currentColor;
+  border-top: 3.5px solid transparent; border-bottom: 3.5px solid transparent;
+  transition: transform 0.12s ease;
+}
+.req-folder[open] > summary::before { transform: rotate(90deg); }
+.req-folder > summary:hover { background: var(--surface-hover); }
+.req-folder-name { font-family: inherit; font-weight: 500; letter-spacing: 0.2px; }
+.req-folder-body {
+  display: flex; flex-direction: column; gap: 0;
+  padding-left: 13px; margin-left: 7px;
+  border-left: var(--border-hairline) solid var(--border);
+}
+.req-list-files { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0; }
+.req-file {
+  display: flex; align-items: center; gap: 6px; height: 22px; padding: 0 6px;
+  border-radius: var(--radius-sm); font-size: 12px;
+}
 .req-file:hover { background: var(--surface-hover); }
-.req-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.req-file-icon {
+  flex: 0 0 auto; width: 14px; height: 14px; border-radius: 3px;
+  display: inline-flex; align-items: center; justify-content: center;
+  font: 600 8px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #fff; background: var(--ft-file); letter-spacing: 0;
+}
+.req-file-icon[data-kind="js"] { background: var(--ft-js); }
+.req-file-icon[data-kind="ts"] { background: var(--ft-ts); }
+.req-file-icon[data-kind="md"] { background: var(--ft-md); }
+.req-file-icon[data-kind="json"] { background: var(--ft-json); }
+.req-file-icon[data-kind="yaml"] { background: var(--ft-yaml); }
+.req-file-icon[data-kind="img"] { background: var(--ft-img); }
+.req-file-icon[data-kind="css"] { background: var(--ft-css); }
+.req-file-icon[data-kind="sh"] { background: var(--ft-sh); }
+.req-file-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.req-file-size {
+  flex: 0 0 auto; width: 68px; text-align: right;
+  font: 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text-tertiary); font-variant-numeric: tabular-nums;
+}
 
 /* FR-91：需求文档正文缺失告警 + 需求详情的「关联任务完成情况」 */
 .req-warn {
@@ -996,31 +1098,30 @@ dialog h2 { margin: 0 0 var(--space-3); font-size: 15px; }
 .md-comment { display: flex; flex-direction: column; gap: var(--space-1); }
 .md-comment-meta { font-size: 11px; color: var(--text-tertiary); }
 
-/* ③ 抽屉里的按钮：此前多为 ghost（透明无边框），看着不像可点的东西 —— 统一给足可辨识度 */
-.tb-drawer-body .btn-row > button,
-.tb-drawer-body .review-actions > button,
-.tb-drawer-body .next-actions > button {
+/* ③ 抽屉里的按钮（卡 `-224` 重写）：**一套规则管全抽屉**。
+      旧写法把 .btn-row / .review-actions / .next-actions 三处并列各补一遍 —— 结果是新增一个容器就漏一档，
+      而且头部与正文各用不同的 min-height（30 vs 28），同一排按钮肉眼可见地不齐。
+      现在只按**层级**分色（primary / secondary / ghost / link / danger），尺寸统一由这里给，
+      所有容器（含新加的 .tb-drawer-utils）自动继承。 */
+.tb-drawer button:not(.link):not(.icon) {
   background: var(--surface);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-md);
-  padding: var(--space-1) var(--space-3);
-  min-height: 30px;
+  padding: 0 var(--space-3);
+  min-height: 28px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--text-primary);
+  display: inline-flex; align-items: center; justify-content: center;
 }
-.tb-drawer-body .btn-row > button:hover,
-.tb-drawer-body .review-actions > button:hover,
-.tb-drawer-body .next-actions > button:hover { background: var(--surface-hover); }
-.tb-drawer-body .btn-row > button.primary,
-.tb-drawer-body .review-actions > button.primary,
-.tb-drawer-body .next-actions > button.primary {
-  background: var(--accent); border-color: var(--accent); color: #fff;
-}
-.tb-drawer-body .btn-row > button.danger,
-.tb-drawer-body .review-actions > button.danger,
-.tb-drawer-body .next-actions > button.danger {
-  border-color: var(--danger); color: var(--danger); background: var(--danger-soft);
-}
+.tb-drawer button:not(.link):not(.icon):hover { background: var(--surface-hover); }
+/* ghost 是工具档：不上底色（上面的通配已给了实底，这里按层级复位） */
+.tb-drawer button.ghost { background: transparent; border-color: transparent; color: var(--text-secondary); }
+.tb-drawer button.ghost:hover { background: var(--surface-hover); }
+.tb-drawer button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.tb-drawer button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+.tb-drawer button.danger { border-color: var(--danger); color: var(--danger); background: var(--danger-soft); }
+.tb-drawer button.link { min-height: 28px; font-size: 12px; }
 button.danger { border-color: var(--danger); color: var(--danger); background: var(--danger-soft); }
 
 /* 「下一步」引导块：一眼看到"现在该干嘛" —— 主色左脊 + 加粗结论行 + 按钮排 */
@@ -1151,3 +1252,9 @@ button.danger { border-color: var(--danger); color: var(--danger); background: v
 [data-theme="dark"] .advance-kind.k-accept { background: rgba(110, 210, 150, .18); color: #a8e6bf; }
 [data-theme="dark"] .advance-kind.k-dispatch { background: rgba(150, 150, 255, .18); color: #c3c0ff; }
 [data-theme="dark"] .advance-kind.k-mem { background: rgba(180, 150, 250, .18); color: #d6c4ff; }
+
+/* 卡 `-222`（需求 `R163`）：面板 bootstrap 失败态（复用 `.empty-guide` 排版，只收敛宽度）。
+   `.board` 是 7 列网格，`grid-column: 1 / -1` 的盒子会横跨**整张网格**（实测 2172px，视口 1440）
+   ⇒ 不收敛就画出一条超出视口的「长条面板」。面板按可读行宽收窄；常驻条与 banner 同宽居中。 */
+.tb-boot-panel { max-width: min(760px, calc(100vw - 24px)); }
+.tb-boot-strip { width: 100%; max-width: var(--board-max-width); align-self: center; }

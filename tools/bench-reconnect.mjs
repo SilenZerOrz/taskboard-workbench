@@ -132,11 +132,17 @@ let cdp = null;
 let failed = false;
 try {
   const debugPort = await freePort();
+  // 环境坑（2026-10-27 实测，同 bench-next-column / bench-review-evidence-dom）：workspace-write
+  // 沙箱里 Chrome **自带沙箱**拉不起渲染进程 ⇒ 连上 devtools 之后 Page/Runtime 域一律超时
+  // （现象就是 `CDP 超时：Page.enable`）。这里是临时 profile 的隔离浏览器，加 --no-sandbox 系列即可；
+  // 2026-10-26 写这台时还没有这条结论，于是它的 "Page.enable 超时" 一直被误当成环境噪音。
   chrome = spawn(chromeBin, [
     "--headless=new",
+    "--disable-gpu",
+    "--no-first-run", "--no-default-browser-check",
+    "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
     `--remote-debugging-port=${debugPort}`,
     `--user-data-dir=${chromeProfile}`,
-    "--no-first-run", "--no-default-browser-check", "--disable-gpu",
     "--disable-extensions", "--disable-background-networking", "--window-size=1440,900",
     "about:blank",
   ], { stdio: "ignore" });

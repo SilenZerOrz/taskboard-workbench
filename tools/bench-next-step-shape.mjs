@@ -86,7 +86,7 @@ function makeProxy(innerPort) {
   return http.createServer((req, res) => {
     const isDetail = /^\/api\/tasks\/[^/?]+$/.test(req.url ?? "");
     if (!isDetail || req.method !== "GET" || !degradeNext) {
-      const up = http.request({ port: innerPort, path: req.url, method: req.method, headers: req.headers }, (r) => {
+      const up = http.request({ port: innerPort, path: req.url, method: req.method, headers: req.headers, agent: false }, (r) => {
         res.writeHead(r.statusCode ?? 500, r.headers);
         r.pipe(res);
       });
@@ -94,7 +94,7 @@ function makeProxy(innerPort) {
       req.pipe(up);
       return;
     }
-    const up = http.request({ port: innerPort, path: req.url, method: req.method, headers: req.headers }, (r) => {
+    const up = http.request({ port: innerPort, path: req.url, method: req.method, headers: req.headers, agent: false }, (r) => {
       const chunks = [];
       r.on("data", (c) => chunks.push(c));
       r.on("end", () => {
@@ -122,6 +122,7 @@ let chromeProfile = null;
 let inner = null;
 let proxy = null;
 let chrome = null;
+let ws = null;
 
 try {
   dataDir = await mkdtemp(path.join(os.tmpdir(), "tb-nsshape-"));
@@ -175,7 +176,7 @@ try {
     await sleep(250);
   }
   if (!wsUrl) { console.log("SKIP  devtools 端点未就绪 ——本台不产证据，退出码 2"); process.exit(2); }
-  const ws = new WebSocket(wsUrl);
+  ws = new WebSocket(wsUrl);
   await new Promise((r, j) => { ws.addEventListener("open", r); ws.addEventListener("error", j); });
   let seq = 0;
   const pendingReq = new Map();
@@ -276,13 +277,22 @@ try {
   check("C1 已收口卡（actions:[]）⇒ 仍显示「本卡已收口」", /本卡已收口/.test(cText), cText.slice(0, 90));
   check("C2 已收口卡 ⇒ 不被误报为「旧版服务端」", !/旧版服务端/.test(cText), cText.slice(0, 90));
 
-  clearTimeout(watchdog);
   const failed = results.filter((r) => !r.ok);
   console.log(`\n结果：${results.length - failed.length}/${results.length} PASS`);
   if (failed.length) console.log("FAIL 项：" + failed.map((r) => r.name).join(" / "));
   process.exitCode = failed.length ? 1 : 0;
 } finally {
+  // 看门狗也要在 finally 清：失败路径同样不能让 180s 定时器把进程吊住。
+  clearTimeout(watchdog);
+  // 退出纪律（卡 `-223`）：只置 `process.exitCode`、不 `process.exit()` 的台，必须自己把句柄清干净，
+  // 否则「11/11 PASS 却不退出」（实测被 timeout 杀成 124）。此前漏掉的是 **CDP WebSocket** ——
+  // 它一开着，事件循环就永远有活。另两个 server 已有 strace 级嫌疑：`close()` 只停止 accept，
+  // Chrome 一侧的 keep-alive 连接还在 ⇒ 补 `closeAllConnections()`；代理的上游请求加 `agent: false`，
+  // 避免 Node 全局 agent 的 keep-alive 定时器把进程再吊几秒。
+  try { ws?.close(); } catch { /* ignore */ }
   try { if (chrome) chrome.kill("SIGKILL"); } catch { /* ignore */ }
+  try { proxy?.closeAllConnections?.(); } catch { /* ignore */ }
+  try { inner?.closeAllConnections?.(); } catch { /* ignore */ }
   try { if (proxy) proxy.close(); } catch { /* ignore */ }
   try { if (inner) inner.close(); } catch { /* ignore */ }
   for (const d of [dataDir, chromeProfile]) {

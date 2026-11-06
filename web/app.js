@@ -683,6 +683,12 @@
     const hostNotice = mk("div", "banner warn");
     hostNotice.hidden = true;
     hostNotice.setAttribute("role", "status");
+    // 卡 `-222`（需求 `R163` ①）：**可降级步骤**失败时的常驻条 —— 「面板能用，但这几项没读到」。
+    // 与一次性 `banner` 分开：条里要**留住原因**并带「重试」按钮；banner 到时会自动消失。
+    // 复用 `.empty-guide` 既有排版（只在 tokens.css 补一条宽度收敛，不新增取数通道）。
+    const bootStrip = mk("div", "empty-guide tb-boot-strip");
+    bootStrip.hidden = true;
+    bootStrip.setAttribute("role", "status");
     const boardScroll = mk("main", "board-scroll");
     const board = mk("div", "board");
     board.setAttribute("aria-label", "任务看板（按状态分列）");
@@ -709,6 +715,8 @@
     const advanceRoot = mk("div", "advance-view");
     advanceScroll.appendChild(advanceRoot);
     shell.append(header, toolbar, banner, connNotice, hostNotice, boardScroll, reqScroll, teamScroll, configScroll, gateScroll, advanceScroll);
+    // 卡 `-222`：常驻条挂在「能力提示」与各视图之间（单独插，不改上面那条已被 FR-20 守卫钉住的挂载行）。
+    try { shell.insertBefore(bootStrip, boardScroll); } catch { /* ignore */ }
 
     // 任务详情抽屉（含"归属团队 / 执行会话"关联）
     const drawerBackdrop = mk("div", "tb-drawer-backdrop");
@@ -722,7 +730,7 @@
     const drawerStage = mk("span", "tb-stage-badge", "");
     drawerStage.hidden = true;
     drawerHeadMain.append(drawerId, drawerStage, drawerTitle);
-    const drawerClose = mk("button", "ghost", "✕");
+    const drawerClose = mk("button", "ghost icon", "✕");
     drawerClose.type = "button";
     drawerClose.title = "关闭";
     // FR-87 修订（2026-10-19）：抽屉头加「全部收起 / 全部展开」与「全屏 / 还原」两个动作。
@@ -734,8 +742,16 @@
     drawerFull.title = "抽屉铺满窗口（再点一下还原为按视口分级的默认宽度）";
     // 2026-10-23（用户真机批注）：整卡动作区上移到标题栏 —— 与「全部收起 / 还原 / ✕」同一排；
     // 卡片级操作（编辑 / 移动列 / 启动执行 / 拆解…）不再沉在正文最底部的「操作」区块里。
+    // 卡 `-224`（需求 `R164`）：标题栏拆**两段** —— `.tb-drawer-actions` 只放卡片级动作
+    // （编辑 / 上一列 / 下一列 / 处置指针），`.tb-drawer-utils` 只放工具（全部收起 / 全屏 / ✕）。
+    // 原先这七个按钮一起 append，位置由**插入顺序**决定：动作一多就把工具挤向左边，高频与低频混在一排
+    // （真机批注「常用按钮位置和按钮样式不统一」）。现在顺序写死：动作区 → 分隔线 → 工具组，
+    // 工具组内部永远是 收起 → 全屏 → 关闭；两块之间由 CSS 画一条发丝线，不再靠"谁先 append"表达分区。
     const drawerActions = mk("div", "tb-drawer-actions");
-    drawerHead.append(drawerHeadMain, mk("div", "spacer"), drawerActions, drawerExpandAll, drawerFull, drawerClose);
+    const drawerUtils = mk("div", "tb-drawer-utils");
+    const drawerSep = mk("div", "tb-drawer-sep");
+    drawerUtils.append(drawerExpandAll, drawerFull, drawerClose);
+    drawerHead.append(drawerHeadMain, mk("div", "spacer"), drawerActions, drawerSep, drawerUtils);
     const drawerResize = mk("div", "tb-drawer-resize");
     drawerResize.title = "拖动调整抽屉宽度（双击还原）";
     const drawerBody = mk("div", "tb-drawer-body");
@@ -829,6 +845,32 @@
       const sections = drawerSections();
       const allCollapsed = sections.length > 0 && sections.every((section) => section.classList.contains("collapsed"));
       drawerExpandAll.textContent = allCollapsed ? "全部展开" : "全部收起";
+    };
+    /**
+     * 卡 `-224`（需求 `R164`）：**全抽屉至多一个 primary**。
+     *
+     * 真机批注：「常用按钮位置和按钮样式不统一」。实证：未归因卡的抽屉里同时出现 3 个蓝按钮
+     * （头部「去归因」/「下一步」区「去归因」/「归因」区「关联需求条目」），各处置区又各配一个
+     * primary ⇒ 一屏 5–7 个同权重蓝块，人无法一眼看出"现在该点哪个"。
+     *
+     * 口径（只做**呈现**，不删按钮、不改回调、不改服务端 `next-step` 的 kind）：
+     *   · 「下一步」区的 primary 优先保留 —— 它是唯一回答"该干嘛"的地方；
+     *   · 其它区块的 primary 降为 `secondary`（照样可点，只是不再抢主色）；
+     *   · 只换 class 与补 title，不动 disabled / onclick。
+     * 幂等：没有多余 primary 时什么都不做（重复渲染/手动展开区块都安全）。
+     */
+    const normalizeActionTiers = () => {
+      const primaries = Array.from(drawerBody.querySelectorAll("button.primary"));
+      if (primaries.length <= 1) return;
+      const sectionOf = (b) => (typeof b.closest === "function" ? b.closest(".drawer-section") : null);
+      const keep = primaries.find((b) => sectionOf(b)?.classList.contains("next-step")) ?? primaries[0];
+      for (const b of primaries) {
+        if (b === keep) continue;
+        b.classList.remove("primary");
+        b.classList.add("secondary");
+        const why = "全抽屉只保留一个主按钮（在「下一步」区）";
+        b.title = b.title ? `${b.title}（${why}）` : why;
+      }
     };
     const setSectionCollapsed = (section, collapsed) => {
       const key = String(section.querySelector(":scope > h3")?.textContent ?? "");
@@ -969,16 +1011,39 @@
       if (r.titleApplied === true) return r.sessionName ? ` · 会话名《${r.sessionName}》` : "";
       return ` · ⚠ 会话名未生效（${r.titleReason ?? "原因未知"}）`;
     };
-    const showBanner = (message, kind = "info") => {
+    /**
+     * 卡 `-222`（需求 `R163` ③）：`sticky` —— **初始化失败态横幅不自动消失**。
+     *
+     * 取证（2026-11-04）：`bootstrap()` 末尾**无条件** `hideBanner()`，而 error 横幅本身也只活 10s
+     * ⇒ 一次 `Failed to fetch` 之后，那条唯一的失败理由被抹掉，人回来看到的是「全空且没有任何理由」。
+     * 除初始化失败外，其余调用点都是「一次性操作提示」，故缺省 `sticky: false`，既有行为不变。
+     */
+    const showBanner = (message, kind = "info", { sticky = false } = {}) => {
       banner.textContent = message;
-      banner.className = `banner ${kind}`;
+      banner.className = `banner ${kind}${sticky ? " tb-banner-sticky" : ""}`;
       banner.hidden = false;
       try { banner.scrollIntoView({ block: "nearest" }); } catch { /* ignore */ }
       clearTimeout(bannerTimer);
-      bannerTimer = setTimeout(() => { banner.hidden = true; }, kind === "error" ? 10000 : 5000);
+      bannerTimer = sticky ? null : setTimeout(() => { banner.hidden = true; }, kind === "error" ? 10000 : 5000);
     };
-    const hideBanner = () => { banner.hidden = true; clearTimeout(bannerTimer); };
+    /**
+     * 卡 `-222`（需求 `R163` ③）：**初始化失败态横幅不许被清掉**。
+     *
+     * 原缺陷两层：① `bootstrap()` 末尾无条件 `hideBanner()`；② error 横幅本身只活 10s。
+     * 于是「一次 `Failed to fetch`」的结果是：全空 + 没有任何理由，人只能去刷新整页。
+     *
+     * 现在两道锁：横幅 `sticky`（不挂定时器）+ 失败未解除时 `hideBanner()` 直接不生效。
+     * 失败被解除的唯一入口是 `bootstrap()` 成功（那里先把 `bootFailureSticky` 置回 false 再收起）。
+     * 这里用 `bootFailureSticky` 这个**先行声明的标志**而不是 `bootState`：`hideBanner` 定义在
+     * `bootState` 之前，直接引用 `const` 会在 TDZ 里抛 ReferenceError。
+     */
+    const hideBanner = () => {
+      if (bootFailureSticky) return; // 初始化失败未解除 ⇒ 理由必须留得住（否则又回到"全空且没有理由"）
+      banner.hidden = true;
+      clearTimeout(bannerTimer);
+    };
     let bannerTimer = null;
+    let bootFailureSticky = false;
 
     /**
      * 能力边界（真机 2026-10-29 · `:47830`「未能投递：host-unavailable」+「无法自动打开…」连撞两次）。
@@ -1572,6 +1637,10 @@
     }
 
     async function loadTasks() {
+      // 卡 `-222`：必要步失败期间，**任何**刷新路径（SSE 回流 / 60s 看护轮询 / 重新同步）都不许把
+      // 失败面板顶成一块空看板 —— 那正是「一次 Failed to fetch ⇒ 永久空白」的第二条复发路径
+      // （面板画出来只是第一条；不拦住定时刷新，人过一分钟回来还是空白）。
+      if (bootEssentialFailure()) { showBootPanel(); return; }
       const params = new URLSearchParams();
       if (state.projectId) params.set("project", state.projectId);
       if (state.priority) params.set("priority", state.priority);
@@ -1710,28 +1779,159 @@
       }
     }
 
+    /**
+     * 卡 `-222`（需求 `R163` ①–③）：`bootstrap()` **分步容错** —— 一次 `Failed to fetch` 不再永久空白。
+     *
+     * 现场（2026-11-04 · `/integrations/taskboard-workbench`）：服务端与压测全绿，问题在浏览器侧 ——
+     * 同一毫秒内 10 条 `TypeError: Failed to fetch`（`api()` ← `loadTasks()`），是连接被同时掐断，
+     * 不是某个接口 5xx。而当时的 `bootstrap()` 是**全有或全无**：`/api/meta`、`/api/projects` 两处裸
+     * `await`，任一网络层失败 ⇒ `renderCurrentView()` 永不执行 ⇒ `.board` 0 子元素、8 个下拉 0 option；
+     * `bootstrap().catch` 只弹一次 banner，**且末尾无条件 `hideBanner()` 把它抹掉**，还没有重试入口
+     * ⇒ 用户看到的就是「全空且没有任何理由」，唯一自救是刷新整页。
+     *
+     * 处置（只在前端；**不改 `/api/*` 契约**）：
+     *   ① 每步独立 `runBootStep`，一步失败**不中断**后续步骤；
+     *   ② 失败步**留占位 + 原因**（`bootState.failures`）：
+     *      · **必要步**（`meta` / `projects`）→ 整块面板（`.tb-boot-panel`）：画不出看板时如实说「哪一步、为什么」；
+     *      · **可降级步**（`health` / `context` / `settings` / `binding`）→ 常驻条（`.tb-boot-strip`）：
+     *        面板照常可用，但**缺哪几项、为什么**必须看得见（不再静默降级）；
+     *   ③ 两处都带**显式「重试」**（只重跑 `bootstrap()`，**不刷新整页**）；
+     *   ④ 有失败时**绝不 `hideBanner()`**，且失败横幅 `sticky`（不自动消失）—— 失败理由必须留得住。
+     */
+    const bootState = { running: false, at: null, failures: [] };
+    const noteBootFailure = (id, label, essential, error) => {
+      bootState.failures.push({
+        id, label, essential,
+        message: error?.message ?? String(error ?? "未知错误"),
+        code: error?.code ?? null,
+      });
+    };
+    /** 跑一步：成功返回 `{ ok:true, value }`，失败**记账后**返回 `{ ok:false, value:null }`（不抛）。 */
+    async function runBootStep(id, label, essential, run) {
+      try { return { ok: true, value: await run() }; }
+      catch (error) { noteBootFailure(id, label, essential, error); return { ok: false, value: null }; }
+    }
+    const bootEssentialFailure = () => bootState.failures.some((f) => f.essential);
+    const bootFailureLine = (f) => `✕ ${f.label} 读取失败：${f.message}${f.code ? `（${f.code}）` : ""}`;
+    /** 必要步失败的面板：**必须**能看出「哪一步、为什么、怎么再来一次」。 */
+    function bootPanel() {
+      const box = mk("div", "empty-guide tb-boot-panel");
+      box.id = "tb-boot-panel";
+      box.setAttribute("role", "alert");
+      box.appendChild(mk("div", "empty-guide-title", "面板初始化没完成：看板暂时没能画出来"));
+      box.appendChild(mk("div", "empty-guide-hint", "这不是「没有任务」—— 是初始化取数失败。下面逐步列出「哪一步」失败、失败原因；点「重试」只重跑初始化，不必刷新整页（刷新整页不是唯一出路）。"));
+      for (const f of bootState.failures) {
+        const row = mk("div", "empty-guide-hint tb-boot-failure");
+        row.dataset.bootStep = f.id;
+        row.dataset.bootEssential = f.essential ? "1" : "0";
+        row.textContent = bootFailureLine(f);
+        box.appendChild(row);
+      }
+      const bar = mk("div", "empty-guide-actions");
+      bar.appendChild(bootRetryButton("primary"));
+      box.appendChild(bar);
+      return box;
+    }
+    /** 可降级步骤失败时的常驻条：面板照常可用，但缺项与原因不静默。 */
+    function renderBootStrip() {
+      const degraded = bootState.failures.filter((f) => !f.essential);
+      bootStrip.replaceChildren();
+      if (!degraded.length) { bootStrip.hidden = true; return; }
+      bootStrip.appendChild(mk("div", "empty-guide-title", `面板已加载，但有 ${degraded.length} 项数据没读到（不是空白，只是缺这几项）`));
+      for (const f of degraded) {
+        const row = mk("div", "empty-guide-hint tb-boot-failure");
+        row.dataset.bootStep = f.id;
+        row.dataset.bootEssential = "0";
+        row.textContent = bootFailureLine(f);
+        bootStrip.appendChild(row);
+      }
+      const bar = mk("div", "empty-guide-actions");
+      bar.appendChild(bootRetryButton("ghost"));
+      bootStrip.appendChild(bar);
+      bootStrip.hidden = false;
+    }
+    /** 显式重试入口（面板与常驻条共用同一份实现；`id` 供守卫读数）。 */
+    function bootRetryButton(cls) {
+      const retry = btn("重试（只重跑初始化）", () => { void retryBootstrap(); }, cls);
+      retry.id = "tb-boot-retry";
+      return retry;
+    }
+    /** 只重跑初始化 —— **不刷新整页**（需求 `R163` ②）。 */
+    async function retryBootstrap() {
+      if (bootState.running) return; // 连点不叠加：一次只跑一轮
+      showBanner("正在重跑面板初始化…", "info");
+      try { await bootstrap(); }
+      catch (error) {
+        bootFailureSticky = true;
+        showBanner(`重试失败：${error?.message ?? error} —— 可再点「重试」，不必刷新整页。`, "error", { sticky: true });
+      }
+    }
+    /** 必要步失败 ⇒ 只画面板（不画空看板、不画空下拉）；其余视图一律让位给它。 */
+    function showBootPanel() {
+      boardScroll.hidden = false;
+      reqScroll.hidden = true; teamScroll.hidden = true; configScroll.hidden = true;
+      gateScroll.hidden = true; advanceScroll.hidden = true;
+      bootStrip.hidden = true;
+      board.replaceChildren(bootPanel());
+    }
+    /** 失败横幅：**sticky**（不自动消失），内容只列失败步 —— 成功的步不占位。 */
+    function syncBootBanner() {
+      if (!bootState.failures.length) {
+        bootFailureSticky = false;
+        hideBanner();
+        return;
+      }
+      const head = bootEssentialFailure() ? "面板初始化未完成" : "面板已加载，但有数据没读到";
+      bootFailureSticky = true; // 锁住 hideBanner：失败未解除前，任何后续收起都不许抹掉这条理由
+      showBanner(`${head}：${bootState.failures.map((f) => `${f.label}（${f.message}）`).join("；")} —— 点面板内「重试」只重跑初始化，不必刷新整页。`, "error", { sticky: true });
+    }
+
     async function bootstrap() {
-      // 先读能力位再渲染：否则首屏会先画出"能点"的按钮、几百毫秒后再置灰（闪一下更困惑）。
-      try { const h = await api("GET", "/api/health"); state.host = h?.host ?? null; } catch { state.host = null; }
-      renderHostNotice();
-      const meta = await api("GET", "/api/meta");
-      state.statuses = meta.statuses;
-      state.priorities = meta.priorities;
-      // FR-60：会话/工作区 → 项目（并把项目绑定到"初始会话"）
-      const ctxParams = new URLSearchParams();
-      if (cwd) ctxParams.set("cwd", cwd);
-      if (sessionId) ctxParams.set("session", sessionId);
-      const ctx = await api("GET", `/api/context${ctxParams.toString() ? `?${ctxParams}` : ""}`).catch(() => null);
-      const projects = await api("GET", "/api/projects");
-      if (destroyed) return;
-      state.projects = projects.projects;
-      state.projectId = ctx?.project?.id ?? projects.projects[0]?.id ?? "";
-      state.context = ctx;
-      try { const st = await api("GET", `/api/projects/${encodeURIComponent(state.projectId)}/settings`); state.loop = st.loop ?? {}; } catch { state.loop = {}; }
-      // FR-63（扩展到所有视图）：解析"本会话×本项目"绑定态，未绑定则全视图显示关联门
-      await resolveBinding(state.projectId);
-      renderCurrentView();
-      hideBanner();
+      if (bootState.running) return;
+      bootState.running = true;
+      bootState.failures = [];
+      bootState.at = new Date().toISOString();
+      try {
+        // ① 能力位（**可降级**：读不到 = 能力未知，交给服务端如实拒绝，不擅自禁用）
+        // 先读能力位再渲染：否则首屏会先画出"能点"的按钮、几百毫秒后再置灰（闪一下更困惑）。
+        const health = await runBootStep("health", "宿主能力位（/api/health）", false, () => api("GET", "/api/health"));
+        state.host = health.value?.host ?? null;
+        renderHostNotice();
+        // ② 状态 / 优先级元数据（**必要**：看板列与优先级下拉全靠它，缺了画不出列）
+        const meta = await runBootStep("meta", "状态与优先级元数据（/api/meta）", true, () => api("GET", "/api/meta"));
+        state.statuses = meta.value?.statuses ?? [];
+        state.priorities = meta.value?.priorities ?? [];
+        // ③ FR-60：会话/工作区 → 项目（**可降级**：拿不到就按项目列表第一项）
+        const ctxParams = new URLSearchParams();
+        if (cwd) ctxParams.set("cwd", cwd);
+        if (sessionId) ctxParams.set("session", sessionId);
+        const ctx = await runBootStep("context", "会话上下文（/api/context）", false,
+          () => api("GET", `/api/context${ctxParams.toString() ? `?${ctxParams}` : ""}`));
+        // ④ 项目列表（**必要**：没有项目就没有取数范围）
+        const projects = await runBootStep("projects", "项目列表（/api/projects）", true, () => api("GET", "/api/projects"));
+        const projectList = projects.value?.projects ?? [];
+        if (destroyed) return;
+        state.projects = projectList;
+        state.projectId = ctx.value?.project?.id ?? projectList[0]?.id ?? "";
+        state.context = ctx.value ?? null;
+        // ⑤ 项目配置（**可降级**：读不到就按默认，不挡看板）
+        if (state.projectId) {
+          const settings = await runBootStep("settings", "项目设置（/api/projects/:id/settings）", false,
+            () => api("GET", `/api/projects/${encodeURIComponent(state.projectId)}/settings`));
+          state.loop = settings.value?.loop ?? {};
+        }
+        // ⑥ FR-63（扩展到所有视图）：解析"本会话×本项目"绑定态，未绑定则全视图显示关联门（**可降级**）
+        await resolveBinding(state.projectId);
+        if (destroyed) return;
+        // 必要步失败 ⇒ 画「哪一步、为什么」的面板 + 重试；**不画空看板**
+        if (bootEssentialFailure()) { showBootPanel(); syncBootBanner(); return; }
+        renderCurrentView();
+        // 卡 `-222` ③：失败态横幅**不被清** —— 只有全部成功才 hideBanner（原实现无条件 hide ⇒ 唯一理由被抹掉）
+        if (bootState.failures.length) { renderBootStrip(); syncBootBanner(); }
+        else { bootStrip.hidden = true; bootStrip.replaceChildren(); bootFailureSticky = false; hideBanner(); }
+      } finally {
+        bootState.running = false;
+      }
     }
     // 会话×项目 绑定态解析（FR-63 → 全视图生效）
     async function resolveBinding(projectId) {
@@ -1739,7 +1939,11 @@
       try {
         const c = await api("GET", `/api/context?session=${encodeURIComponent(sessionId)}&project=${encodeURIComponent(projectId)}`);
         state.binding = { projectId, bound: c.sessionBound !== false, mainSessionId: c.mainSessionId ?? null, association: c.association ?? null, sessionOrigin: c.sessionOrigin ?? null };
-      } catch { state.binding = { projectId, bound: true, mainSessionId: null, association: null }; }
+      } catch (error) {
+        state.binding = { projectId, bound: true, mainSessionId: null, association: null };
+        // 卡 `-222` ①：绑定态也是 bootstrap 的一步 —— 失败要留原因（项目内切换时不算 boot 步骤，不记账）
+        if (bootState.running) noteBootFailure("binding", "会话绑定态（/api/context?project=…）", false, error);
+      }
     }
     const isBlocked = () => Boolean(sessionId) && state.binding.projectId === state.projectId && state.binding.bound === false;
     function hideGate() { gateScroll.hidden = true; }
@@ -1946,6 +2150,9 @@
     }
 
     function renderCurrentView() {
+      // 卡 `-222`（需求 `R163` ①）：必要步失败 ⇒ 任何视图切换都只画「哪一步失败、为什么」的面板，
+      // 不画空看板、不画只剩占位项的下拉（旧实现这里照样渲染 ⇒ 人看到的是「全空且没有理由」）。
+      if (bootEssentialFailure()) { showBootPanel(); return; }
       if (isBlocked()) { void showBlockedGate(); return; }
       hideGate();
       if (view === "req") void renderRequirements();
@@ -2243,7 +2450,8 @@
     // 能力门是**渲染后**才知道要不要置灰的（区块/抽屉随时新建）⇒ 观察 DOM 变化，把新出现的宿主依赖按钮一并置灰。
     // 只观察 childList（不观察 attributes），故 `disabled/title` 的写入不会再触发自己。
     try { new MutationObserver(() => { try { applyHostGate(); } catch { /* ignore */ } }).observe(doc.body, { childList: true, subtree: true }); } catch { /* ignore */ }
-    bootstrap().catch((error) => showBanner(`初始化失败：${error.message}`, "error"));
+    // 卡 `-222`：这一步只是**兜底**（每步已各自容错）—— 真抛出时也留住理由并指到「重试」，不给人「只剩刷新整页」。
+    bootstrap().catch((error) => showBanner(`初始化失败：${error?.message ?? error} —— 点面板内「重试」可重跑初始化（不必刷新整页）。`, "error", { sticky: true }));
 
     // FR-41：进度可见（SSE 失效信号 → 重取）
     let boardEvents = null;
@@ -2491,6 +2699,41 @@
       return box;
     }
 
+    /**
+     * 卡 `-227`（需求 `R168`）：从「会话关联」**直接跳到那条会话**。
+     *
+     * 真机批注（2026-11-05）：「增加会话关联对应主会话以及相关会话的直接跳转能力」。
+     * 此前这两行列的只有截断标识（`session-70a0bcda…`）与存活胶囊 —— 想看一眼那条会话在聊什么，
+     * 只能记住/复制标识回侧栏翻。**面板里没有任何入口能把人送到那条会话**。
+     *
+     * 口径（与 `-211` 同一教训：**能跳才叫跳转**）：
+     *   ① 优先**客户端导航**（`options.openSession`；实机里它走 `uiWorkspace.openSession` / 路由）；
+     *   ② 成功后再把该会话的视图偏好改写成「对话」页 —— 否则嵌套宿主按上次偏好把标签页弹回看板，
+     *      "跳过去了但看到的还是看板"（真机取证见 `bringConversationToFront` 注释）；
+     *   ③ 没有通道 / 宿主拒绝 ⇒ **复制标识 + 如实说明**，绝不说"已打开"（那是 `-211` 之前的老毛病）。
+     * 能力门：按钮文案固定「打开会话」，`HOST_BUTTON_LABELS` 里已有该条 ⇒ `applyHostGate` 按
+     * `openSession` 能力位统一置灰并补 title，不需要这里再判一次。
+     */
+    const openSessionJump = (sid) => {
+      const target = String(sid ?? "").trim();
+      if (!target) { showBanner("没有可打开的会话标识", "error"); return; }
+      const short = target.length > 18 ? `${target.slice(0, 18)}…` : target;
+      if (!openHostSession) {
+        void copyText(target);
+        showBanner(`本实例没有宿主会话通道，无法直接跳转 —— 已复制会话标识 ${short}，可在侧栏搜索`, "error");
+        return;
+      }
+      let result = null;
+      try { result = openHostSession(target); } catch (error) { result = { ok: false, reason: error?.message ?? String(error) }; }
+      if (result?.ok) {
+        bringConversationToFront(doc, target);
+        showBanner(`已打开会话 ${short}（若仍停在「任务工作台」页，点上方「对话」即可看历史）`, "info");
+        return;
+      }
+      void copyText(target);
+      showBanner(`打开会话失败：${result?.reason ?? "宿主未接受该会话"} —— 已复制会话标识 ${short}`, "error");
+    };
+
     async function renderConfig() {
       configRoot.replaceChildren(mk("p", "hint", "加载配置…"));
       try {
@@ -2505,7 +2748,7 @@
         box.appendChild(mk("h2", null, `任务工作台 · 配置`));
         box.appendChild(mk("p", "hint", `配置对象：${state.projectId}（${projName}）${sessionId ? " · 会话内" : " · 全局入口"} — 用上方“项目”下拉切换；下方所有保存都作用于该项目。`));
         // 开局向导（团队先行七步 + 复制指令）
-        const [gSettings, gDocs, gItems, gTasks, gNorms, gSpec] = await Promise.all([
+        const [gSettings, gDocs, gItems, gTasks, gNorms, gSpec, gTeams] = await Promise.all([
           api("GET", `/api/projects/${encodeURIComponent(state.projectId)}/settings`).catch(() => ({})),
           api("GET", `/api/requirements/docs?project=${encodeURIComponent(state.projectId)}`).catch(() => ({ docs: [] })),
           api("GET", `/api/requirements/items?project=${encodeURIComponent(state.projectId)}`).catch(() => ({ items: [] })),
@@ -2514,6 +2757,9 @@
           api("GET", `/api/projects/${encodeURIComponent(state.projectId)}/norms`).catch(() => null),
           // 卡 `-220`（R161）：随包人读文档的位置（包内默认 / 项目存放 / 生效来源）
           api("GET", `/api/projects/${encodeURIComponent(state.projectId)}/docs`).catch(() => null),
+          // 卡 `-228`（R169）：第 4 步「创建执行团队」的真实判据 —— 工作区 `.agent-teams/` 里的第三方团队。
+          // 官方团队是常量（永远在）⇒ 不能拿 `teams.length>0` 当「已创建」，否则这一步恒绿＝假绿。
+          api("GET", `/api/projects/${encodeURIComponent(state.projectId)}/agent-teams`).catch(() => null),
         ]);
         const gDoc = (gDocs.docs || [])[0] || null;
         const gItemsAll = gItems.items || [];
@@ -2522,28 +2768,64 @@
         const gEnv = Object.keys(gSettings.envConfig || {}).length > 0;
         const gRoster = (gSettings.teamTemplate?.roles || []).length > 0;
         const gIntake = gDoc ? /##\s*资料清单/.test(gDoc.body || "") : false;
-        const gOpen = gItemsAll.filter((i) => i.status === "open").length;
+        // 卡 `-228`（R169）：**「已确认」= 非 draft**。原来只数 `open` ⇒ 已交付（done/closed）的条目
+        // 一律不算 ⇒ 本项目 164 条全确认却显示「已确认 3」（真机读数，2026-11-05）。
         const gDraft = gItemsAll.filter((i) => i.status === "draft").length;
+        const gConfirmed = gItemsAll.filter((i) => i.status !== "draft").length;
+        const gThirdPartyTeams = (gTeams?.teams || []).filter((t) => t.source !== "official").length;
         const gProg = gTasksAll.filter((t) => ["in_progress", "in_review", "blocked"].includes(t.status)).length;
         const guide = mk("section", "config-card");
-        guide.appendChild(mk("h3", null, "开局向导（团队先行）"));
+        guide.appendChild(mk("h3", null, "开局向导（团队先行 · 7 步）"));
         const engine = gSettings.teamTemplate?.engine ?? "instruction";
         const gcopy = (label, text) => btn(label, () => { void copyText(text).then((ok) => showBanner(ok ? `已复制：${label}` : `复制失败：浏览器拒绝了剪贴板写入 —— 请手动选择复制（${label}）`, ok ? "info" : "error")); });
-        const srow = (ok, n, title, ...actions) => { const r = mk("div", "config-row"); r.appendChild(pill(`${ok ? "✅" : "○"} 第 ${n} 步`, ok ? "ok" : "warn")); r.appendChild(mk("span", null, title)); const right = mk("span", "config-actions"); right.append(...actions); r.appendChild(right); return r; };
+        /**
+         * 卡 `-228`（R169）· 三态步骤条：`true` ✅ / `false` ○（**确知**未做）/ `null` ◐ 待核验。
+         *
+         * 原来只有布尔，于是两件「非布尔事实」被硬塞成 `false`：① 第 4 步「创建执行团队」本机没有
+         * 可核验产物；② 「开局提示词」根本不是步骤。结果两行永久 ○ —— 既像「一直没做」，又让人以为
+         * 还有两件事没做完（真机批注：「为什么开局提示词在第八步」）。
+         * 口径：**没有信号时如实说「待核验」，不谎报成未做，也不谎报成已完成**（同 FR-84 存活胶囊三态）。
+         */
+        const srow = (state, n, title, ...actions) => {
+          const r = mk("div", "config-row");
+          const badge = state === true
+            ? pill(`✅ 第 ${n} 步`, "ok")
+            : state === false
+              ? pill(`○ 第 ${n} 步`, "warn")
+              : pill(`◐ 第 ${n} 步`, "", "本机没有可核验信号 —— 不等于没做，需要人工确认");
+          r.appendChild(badge);
+          r.appendChild(mk("span", null, title));
+          const right = mk("span", "config-actions"); right.append(...actions); r.appendChild(right);
+          return r;
+        };
+        // 开工语 —— **不是第 8 步**：它是新会话发给队长的**第一条消息**（`KICKOFF_PROMPT` 的 ①–⑧ 就是
+        // 下面这 7 步的完整流程），复制即用，没有「做完」这个状态，因此不编号、不参与 ✅/○。
+        const kickoffRow = mk("div", "config-row");
+        kickoffRow.appendChild(pill("开工语", "warn", "新会话首条 —— 不是步骤，不编号也没有完成态"));
+        kickoffRow.appendChild(mk("span", null, "新会话首条：把这句发给队长（它驱动下面 1–7 步）"));
+        const kickoffRight = mk("span", "config-actions");
+        kickoffRight.appendChild(gcopy("复制开局提示词", KICKOFF_PROMPT));
+        kickoffRow.appendChild(kickoffRight);
+        guide.appendChild(kickoffRow);
+        guide.appendChild(mk("p", "hint", "「开工语」不是步骤：它没有 ✅，复制进新会话即可；下面的 1–7 步才是可核验的进度。"));
         guide.append(
           srow(gBound, 1, "绑定项目 / 会话", mk("span", "hint", info.project ? `${info.project.id}${sessionId ? (info.sessionBound === false ? "（未绑定）" : " · 已绑定会话") : " · 全局入口"}` : "（未解析）")),
           srow(gEnv, 2, "项目环境与约束", mk("span", "hint", gEnv ? "已配置" : "未配置（见下方卡片）")),
+          // 第 3 步保留**唯一**的复制入口（第 4 步原来又发一个同样的按钮，属重复动作）。
           srow(gRoster, 3, `执行团队模板 · 引擎=${engine}`, mk("span", "hint", gRoster ? `${(gSettings.teamTemplate?.roles || []).length} 个角色` : "未配置"), gcopy("复制团队创建指令", teamPrompt(engine))),
-          srow(false, 4, "创建执行团队（对应引擎）", gcopy(`复制创建指令（${engine}）`, teamPrompt(engine))),
+          // 第 4 步口径：真发现第三方团队 ⇒ ✅；读不到或没有产物 ⇒ ◐ 待核验（官方团队是常量，不能当「已创建」）。
+          srow(gThirdPartyTeams > 0 ? true : null, 4, "创建执行团队（对应引擎）",
+            mk("span", "hint", gTeams === null ? "本机读不到团队清单（服务端较旧）" : gThirdPartyTeams > 0 ? `已发现 ${gThirdPartyTeams} 个第三方团队（.agent-teams/）` : "本机无产物：团队由队长在新会话里按第 3 步指令创建")),
           srow(gIntake, 5, "引入项目资料", mk("span", "hint", gIntake ? `已引入（条目 ${gItemsAll.length}）` : "未引入（见下方卡片）")),
-          srow(gOpen > 0, 6, "确认需求条目", mk("span", "hint", `待确认 ${gDraft} · 已确认 ${gOpen}`), btn("去需求页", () => setView("req"))),
+          srow(gConfirmed > 0, 6, "确认需求条目", mk("span", "hint", `待确认 ${gDraft} · 已确认 ${gConfirmed}`), btn("去需求页", () => setView("req"))),
           srow(gTasksAll.length > 0, 7, "生成看板任务", mk("span", "hint", `任务 ${gTasksAll.length}（进行中/待验 ${gProg}）`), btn("去看板", () => setView("board"))),
-          srow(false, 8, "开局提示词（新会话首条）", gcopy("复制开局提示词", KICKOFF_PROMPT)),
         );
         box.appendChild(guide);
         if (stale) box.appendChild(mk("p", "hint", "当前服务端为旧版（无 /api/context）：请重启 web profile 后重试。"));
         const card = (title, hint) => { const c = mk("section", "config-card"); c.appendChild(mk("h3", null, title)); if (hint) c.appendChild(mk("p", "hint", hint)); return c; };
-        const row = (label, ...nodes) => { const r = mk("div", "config-row"); r.appendChild(mk("span", null, label)); const right = mk("span", "config-actions"); right.append(...nodes); r.appendChild(right); return r; };
+        // 卡 `-227`：label 允许直接传节点 —— 会话行需要给标签挂 `title`（完整会话标识），
+        // 而纯字符串会被 `mk` 重新包一层，改不动它。传字符串时行为一字不变。
+        const row = (label, ...nodes) => { const r = mk("div", "config-row"); r.appendChild(label && label.nodeType ? label : mk("span", null, label)); const right = mk("span", "config-actions"); right.append(...nodes); r.appendChild(right); return r; };
 
         const bind = card("当前绑定", "工作区 → 项目 → 需求文档（初始绑定）");
         bind.appendChild(kvList([
@@ -2785,6 +3067,7 @@
           try {
             const k = await api("GET", `/api/projects/${encodeURIComponent(state.projectId)}/kickoff`);
             lastKickoff = k;
+            alignGapState(k);
             const wrap = mk("div", "kickoff-steps");
             wrap.appendChild(mk("div", `kickoff-verdict ${k.ready ? "ok" : "warn"}`, `${k.ready ? "✔ " : "⚠ "}${k.verdict}`));
             if (!k.readable) wrap.appendChild(mk("p", "hint", "项目未配置工作区目录（workspacePath）⇒ 文件类判据无法自检（设置里填上工作区即可）。"));
@@ -2807,11 +3090,51 @@
             src.appendChild(link);
             wrap.appendChild(src);
             alignBody.replaceChildren(wrap);
-          } catch (e) { alignBody.replaceChildren(mk("div", "empty-note", `自检失败：${e.message}（服务端旧版本需重载插件才有该端点）`)); }
+          } catch (e) { alignBody.replaceChildren(mk("div", "empty-note", `自检失败：${e.message}（服务端旧版本需重载插件才有该端点）`)); alignGapState(null); }
         };
+        // 卡 `-229`（需求 R170）：把**当前实时缺口**引入主对话（不是复制到剪贴板就结束）。
+        // 零缺口 = 自检 `ready`（六步全 done ⇒ 没有任何未通过判据）⇒ 置灰 + 明说「开局已对齐」。
+        // 不挂 `data-needs-host`：无宿主会话通道时服务端会回带正文，本按钮仍要有用（降级为复制 + 如实说明未投递）。
+        const alignGapCount = (k) => (k?.missing ?? []).reduce((n, s) => n + (s.todo?.length ?? 0), 0);
+        const gapHint = mk("span", "hint", "自检完成后可点");
+        const gapBtn = btn("引入主对话", () => void announceGaps(), "primary");
+        gapBtn.disabled = true;
+        const alignGapState = (k) => {
+          const n = alignGapCount(k);
+          const aligned = Boolean(k?.ready) || (k ? n === 0 : false);
+          gapBtn.disabled = !k || aligned;
+          gapBtn.title = !k ? "自检完成后可点" : aligned ? "开局已对齐：没有缺口可引入" : `把当前 ${n} 项缺口引入项目主会话`;
+          gapHint.textContent = !k ? "自检完成后可点" : aligned ? "开局已对齐" : `缺口 ${n} 项（按依赖顺序引入）`;
+        };
+        const announceGaps = async () => {
+          if (!lastKickoff) { showBanner("请先「重新自检」拿到当前缺口", "error"); return; }
+          if (lastKickoff.ready) { showBanner("开局已对齐：没有缺口可引入", "info"); return; }
+          gapBtn.disabled = true;
+          try {
+            const r = await api("POST", `/api/projects/${encodeURIComponent(state.projectId)}/kickoff/announce`, {});
+            if (r?.delivered) {
+              showBanner(`已把 ${r?.gaps?.count ?? "?"} 项缺口引入主会话 ${String(r.sessionId ?? "").slice(0, 12)}…（按依赖顺序推进；每完成一项回本页点「重新自检」）`, "info");
+            } else if (r?.prompt) {
+              const copied = await copyText(r.prompt);
+              showBanner(`未投递（${r?.reason === "host-unavailable" ? "本实例没有宿主会话通道" : (r?.reason ?? "原因未知")}）：缺口清单${copied ? "已复制到剪贴板" : "复制失败，请点「复制对齐清单」手动投递"} —— 这不是「已引入」；下一步：${r?.nextAction ?? "到 DSH 内的任务工作台重试"}`, "error");
+            } else {
+              showBanner(`未投递：${r?.reason ?? "未知原因"}；请点「复制对齐清单」手工投递`, "error");
+            }
+          } catch (e) {
+            const fallback = e?.details?.prompt ?? null;
+            const copied = fallback ? await copyText(fallback) : false;
+            const why = e?.code === "NO_MAIN_SESSION"
+              ? "该项目还没有主会话：先在本卡「会话关联」重建/绑定主会话，再点「引入主对话」"
+              : `投递失败：${e?.message ?? e}${e?.code ? `（${e.code}）` : ""}`;
+            showBanner(`${why}${fallback ? `；缺口清单${copied ? "已复制到剪贴板" : "复制失败，请点「复制对齐清单」手动投递"}（未投递）` : ""}`, "error");
+          } finally { alignGapState(lastKickoff); }
+        };
+
         const alignBar = mk("div", "btn-row");
         alignBar.append(
-          btn("重新自检", () => void refreshAlign(), "primary"),
+          btn("重新自检", () => void refreshAlign()),
+          gapBtn,
+          gapHint,
           btn("复制对齐清单", () => {
             const k = lastKickoff;
             if (!k) { showBanner("请先「重新自检」拿到清单", "error"); return; }
@@ -2884,7 +3207,15 @@
         };
         const mainRow = sessList.main ?? (state.context?.mainSessionId ? { sessionId: state.context.mainSessionId, liveness: null } : null);
         if (mainRow) {
-          links.appendChild(row(`主会话 · ${String(mainRow.sessionId).slice(0, 14)}…`, livenessPill(mainRow.liveness), sessList.staleMain ? btn("重建并绑定主会话", rebindMain, "primary") : mk("span", "hint", "")));
+          // 卡 `-227`：主会话行加「打开会话」；标签挂 `title`（截断文本不再丢完整标识）。
+          const mainLabel = mk("span", null, `主会话 · ${String(mainRow.sessionId).slice(0, 14)}…`);
+          mainLabel.title = String(mainRow.sessionId);
+          links.appendChild(row(
+            mainLabel,
+            livenessPill(mainRow.liveness),
+            hostBtn("打开会话", () => openSessionJump(mainRow.sessionId)),
+            sessList.staleMain ? btn("重建并绑定主会话", rebindMain, "primary") : mk("span", "hint", ""),
+          ));
         }
         // FR-84 补口（2026-10-22）：**不新建会话**的接续出口（宿主建会话不可用时的保底路径）。
         const bindBar = mk("div", "tb-bind-bar");
@@ -2918,9 +3249,13 @@
         links.appendChild(probeLine);
         if ((sessList.sessions ?? []).length) {
           for (const s of sessList.sessions) {
+            // 卡 `-227`：每条相关会话都能直接跳过去（待批准的也允许 —— 存在不代表不能用来看历史）。
+            const sessLabel = mk("span", null, `${s.status === "approved" ? "✅ 已批准" : "⏳ 待批准"} · ${String(s.sessionId).slice(0, 14)}…`);
+            sessLabel.title = String(s.sessionId);
             links.appendChild(row(
-              `${s.status === "approved" ? "✅ 已批准" : "⏳ 待批准"} · ${String(s.sessionId).slice(0, 14)}…`,
+              sessLabel,
               livenessPill(s.liveness),
+              hostBtn("打开会话", () => openSessionJump(s.sessionId)),
               s.status === "pending" ? btn("批准", async () => {
                 try { await api("POST", `/api/projects/${encodeURIComponent(state.projectId)}/sessions/approve`, { sessionId: s.sessionId }); showBanner("已批准关联", "info"); await renderConfig(); }
                 catch (e) { showBanner(`批准失败：${e.message}`, "error"); }
@@ -3142,7 +3477,32 @@
       return { folders: merged, files, folderCount, fileTotal, byteTotal };
     }
 
-    /** FR-96：渲染文件夹树 —— 叶子是文件；节点可展开/收起，**默认展开**（不隐藏任何文件）。 */
+    /**
+     * 卡 `-226`（需求 `R167`）：**文件类型徽标**的 kind —— 纯呈现，只决定图标的底色与字母。
+     *
+     * 真机批注（2026-11-05）：「引入文件的样式我希望引用 dsh 侧边栏的文件列表样式」。
+     * DSH 侧栏的每个文件前有一个按类型着色的小图标（`.mjs` 琥珀 / `.md` 绿 / `.json` 橙），
+     * 扫一眼就能分辨「这是代码还是文档」。这里**不引入图标字体、不引外链资源**，只用 14×14 的
+     * 圆角色块 + 8px 字母（纯 CSS 绘制），所以离线、随包、零请求。
+     * ⚠️ 它**不参与** FR-96 的树结构 / 排序 / 计数 —— 那部分（`buildFileFolderTree`）一字未改。
+     */
+    function fileKind(name) {
+      const n = String(name ?? "").toLowerCase();
+      if (/\.(mjs|cjs|js|jsx)$/.test(n)) return "js";
+      if (/\.(ts|tsx|mts|cts)$/.test(n)) return "ts";
+      if (/\.(md|markdown|mdx)$/.test(n)) return "md";
+      if (/\.json$/.test(n)) return "json";
+      if (/\.ya?ml$/.test(n)) return "yaml";
+      if (/\.(png|jpe?g|gif|svg|webp|ico)$/.test(n)) return "img";
+      if (/\.(css|scss|less)$/.test(n)) return "css";
+      if (/\.(sh|bash|zsh)$/.test(n)) return "sh";
+      return "file";
+    }
+    const FILE_KIND_LABEL = { js: "JS", ts: "TS", md: "MD", json: "{}", yaml: "YML", img: "IMG", css: "CSS", sh: "SH", file: "·" };
+
+    /** FR-96：渲染文件夹树 —— 叶子是文件；节点可展开/收起，**默认展开**（不隐藏任何文件）。
+     *  卡 `-226`：叶子行由「名字 + spacer + 体积胶囊」改为「类型图标 + 名字 + 定宽体积列」，
+     *  与 DSH 侧栏文件列表同一套语言；`ul`/`li`/`details`/`summary` 的**结构不变**（既有 11 项守卫照旧）。 */
     function renderFileTree(tree) {
       const wrap = mk("div", "req-tree");
       const walk = (node, container) => {
@@ -3162,7 +3522,11 @@
           for (const f of node.files) {
             const li = mk("li", "req-file");
             li.title = f.path;
-            li.append(mk("span", "req-file-name", f.name), mk("span", "spacer"), pill(`${f.bytes} B`));
+            const kind = fileKind(f.name);
+            const icon = mk("span", "req-file-icon", FILE_KIND_LABEL[kind] ?? "·");
+            icon.dataset.kind = kind;
+            icon.setAttribute("aria-hidden", "true");
+            li.append(icon, mk("span", "req-file-name", f.name), mk("span", "req-file-size", `${f.bytes} B`));
             ul.appendChild(li);
           }
           container.appendChild(ul);
@@ -3406,7 +3770,9 @@
               mk("span", "hint", `${tree.folderCount} 个文件夹 · 根级文件 ${tree.files.length} · 合计 ${(tree.byteTotal / 1024).toFixed(1)} KB`),
             );
             fs.appendChild(head);
-            const bar = mk("div", "field-inline");
+            // 卡 `-226`：工具条不再用 `.field-inline`（那个是表单行，`align-items: flex-end` 会贴底），
+            // 改为树自己的紧凑工具栏（左侧起头、与树的左内边距对齐）。
+            const bar = mk("div", "req-tree-tools");
             bar.append(btn("全部展开", () => setAllFolders(fs, true)), btn("全部收起", () => setAllFolders(fs, false)));
             fs.appendChild(bar);
             fs.appendChild(renderFileTree(tree));
@@ -3457,7 +3823,10 @@
         const newTitle = mk("input");
         newTitle.type = "text";
         newTitle.placeholder = "新条目标题";
-        const createRow = mk("div", "field-inline");
+        // 卡 `-225`（需求 `R166`）：真机批注「同类输入框&按钮都挤在左侧」。三段（新建 / 筛选 / 批量）
+        // 现在各自成行并挂在 `.req-toolbar` 里 —— 行内左右分组、控件同高，行距由容器统一给。
+        // 不再套 `.field-inline`（全局表单类，`align-items: flex-end` 会把同排控件压得基线不齐）。
+        const createRow = mk("div", "req-toolbar-row req-toolbar-create");
         // 真机批注 2026-10-28「新建条目点击无效」：此前标题为空时**静默 return** —— 点了没反应、
         // 也没有任何提示，被读成按钮坏了。口径：空标题必须**当场说话**并把焦点送回输入框；
         // 另外支持回车提交（填完标题顺手敲回车是常态）。
@@ -3478,7 +3847,8 @@
           event.preventDefault();
           void createItem();
         });
-        itemBody.appendChild(createRow);
+        const reqToolbar = mk("div", "req-toolbar");
+        reqToolbar.appendChild(createRow);
         const filt = mk("select");
         // FR-91：新增「已完成 / 已关闭」——需求层此前没有"做完了没有"的落点
         for (const [v, l] of [["all", "全部状态"], ["draft", "待确认"], ["open", "在办"], ["done", "已完成"], ["closed", "已关闭"]]) { const o = mk("option"); o.value = v; o.textContent = l; filt.appendChild(o); }
@@ -3489,11 +3859,13 @@
         search.placeholder = "搜索编号 / 标题";
         search.value = reqState.q ?? "";
         search.addEventListener("change", () => { reqState.q = search.value.trim(); void renderRequirements(); });
-        const fr = mk("div", "field-inline");
-        fr.append(filt, search);
-        itemBody.appendChild(fr);
-        // U-1：下一步引导（团队先行后的收敛路径）——单行，避免拥挤
-        itemBody.appendChild(mk("p", "hint", `下一步：确认条目 → 生成看板任务 → 授权开工 → 派发执行　（待确认 ${draftCount} · 已确认 ${openCount}）`));
+        const fr = mk("div", "req-toolbar-row req-toolbar-filter");
+        // U-1：下一步引导（团队先行后的收敛路径）。卡 `-225`：从独占一行改为**并到筛选行右侧**
+        // （宽视口右对齐、窄视口自动换行），不再让左侧控件与右侧长提示之间空出一大片。
+        const nextHint = mk("p", "hint req-toolbar-hint", `下一步：确认条目 → 生成看板任务 → 授权开工 → 派发执行　（待确认 ${draftCount} · 已确认 ${openCount}）`);
+        fr.append(filt, search, nextHint);
+        reqToolbar.appendChild(fr);
+        itemBody.appendChild(reqToolbar);
         if (reqState.candidates.length) {
           const cs = mk("div", "drawer-section");
           cs.appendChild(mk("h3", null, `待确认候选（${reqState.candidates.length}）`));
@@ -3540,9 +3912,12 @@
             : "逐行从既有 GET /api/requirements/items/:ref/completion 取数：关联任务全部收口的需求会显示「可收口」";
         };
         // 批量工具条（默认多选 → 批量生成任务）
-        const bulkBar = mk("div", "field-inline");
+        // 卡 `-225`：批量条拆成「左＝已选 N」+「右＝动作组」。此前六个元素从左往右平铺，
+        // 蓝色主按钮夹在中间、删除紧挨生成 —— 既难扫也危险（误点批量删除）。
+        const bulkBar = mk("div", "req-bulk-bar");
+        const bulkActions = mk("div", "req-bulk-actions");
         bulkBar.append(
-          mk("span", "hint", `已选 ${reqState.selected.size}`),
+          mk("span", "hint req-bulk-count", `已选 ${reqState.selected.size}`),
           btn("全选可见", () => { for (const it of visible) reqState.selected.add(it.identifier); void renderRequirements(); }),
           btn("清除选择", () => { reqState.selected.clear(); void renderRequirements(); }),
           btn("批量确认", async () => {
@@ -3572,8 +3947,11 @@
             reqState.selected.clear();
             showBanner(failed.length ? `已删除 ${ok} 条，失败 ${failed.length} 条（首条：${failed[0]}）` : `已删除 ${ok} 条`, failed.length ? "error" : "info");
             await renderRequirements();
-          }),
+          }, "danger"),
         );
+        // 五个动作整体挪到右侧动作组（顺序保持：全选 → 清除 → 批量确认 → 批量生成 → 批量删除）
+        bulkActions.append(...Array.from(bulkBar.querySelectorAll(":scope > button")));
+        bulkBar.appendChild(bulkActions);
         itemBody.appendChild(bulkBar);
         const ul = mk("ul", "req-list");
         for (const it of visible) {
@@ -4043,6 +4421,10 @@
       } catch (error) {
         host.replaceChildren(head, mk("p", "hint", `加载失败：${error.message}`));
       }
+      // 卡 `-224`：本区块是**异步后补**的（`void fillTaskTeam(...)`，晚于 openTaskDetail 的收尾归一），
+      // 且它在未归因时会追加一个 primary「去归因」—— 这里补一次归一，否则「一屏一个主按钮」会被
+      // 后到的按钮破坏（验证台实测：primary=2，两条都在团队区块与「下一步」区）。
+      normalizeActionTiers();
     }
     /** FR-42/47：从任务详情发起一次团队派发（单任务；引擎经 /api/teams 决定，默认 P2 指令降级）。 */
     async function dispatchTeam(identifier, onDone) {
@@ -4472,13 +4854,20 @@
         }
         // 入口口径与卡片、下一步面板同一份（executionEntry）：未归因的可开工卡在抽屉里也给「去归因」。
         const drawerEntry = executionEntry(t);
-        if (drawerEntry === "attribute") ops.appendChild(btn("去归因（关联需求条目）", () => { void openAttributionEntry(t); }, "primary"));
+        // 卡 `-224`：标题栏**不承担主按钮**。归因是「下一步」区的主动作（服务端 `goto-attribution`），
+        // 标题栏只保留一条 `link` 指针（与 FR-89「下一列 → 处置见『下一步』」同一先例：
+        // 同一动作不摆两个同等权重的平行入口）。
+        if (drawerEntry === "attribute") {
+          const gotoAttr = btn("去归因（见「归因」区）", () => { void openAttributionEntry(t); }, "link");
+          gotoAttr.title = "等同于「下一步」区的「去归因（关联需求条目）」：展开并滚到下方「归因」区块";
+          ops.appendChild(gotoAttr);
+        }
         // 第九报：待办池卡在抽屉里也要有显式入口（此前只有「下一列」按钮，得靠人自己推断那是授权）。
         if (drawerEntry === "authorize") ops.appendChild(btn("授权开工（移出待办池）", async () => {
           if (!window.confirm(`把 ${t.identifier} 移出「待办池」→「可开工」？授权只是放行，仍需人点「启动执行」或由团队/执行循环认领。`)) return;
           const ok = await moveTask(t, "todo");
           if (ok) showBanner(`${t.identifier} 已授权开工（待办池 → 可开工）。下一步：点「启动执行」，或让它被团队/执行循环认领。`, "info");
-        }, "primary"));
+        }, "secondary"));
         if (drawerEntry === "start") ops.appendChild(btn("启动执行", async () => {
           if (!window.confirm(`启动执行会尝试新建/切换会话（可能切换主视图）。${execRunning ? "\n\n⚠ 该任务已有执行会话正在执行且未返回结论，继续会被拒绝（EXECUTION_ALREADY_RUNNING）。" : ""}确认继续？`)) return;
           try { await api("POST", `/api/tasks/${ref}/execute`, undefined); closeDrawer(); await loadTasks(); }
@@ -4486,11 +4875,11 @@
             // 与卡片入口同一份处置（含「打开并高亮归因入口」），不再各写一套措辞。
             await handleExecutionFailure(e, ref, t);
           }
-        }, "primary"));
+        }, "secondary"));
         if (t.status === "in_progress") {
           const r2 = mk("div", "btn-row");
           r2.append(
-            btn("提交待验收", async () => { try { await api("POST", `/api/tasks/${ref}/execution/review`, {}); closeDrawer(); await loadTasks(); } catch (e) { showBanner(e.message, "error"); } }, "primary"),
+            btn("提交待验收", async () => { try { await api("POST", `/api/tasks/${ref}/execution/review`, {}); closeDrawer(); await loadTasks(); } catch (e) { showBanner(e.message, "error"); } }, "secondary"),
             btn("标记失败", async () => { try { await api("POST", `/api/tasks/${ref}/execution/fail`, { evidence: "手动标记失败" }); closeDrawer(); await loadTasks(); } catch (e) { showBanner(e.message, "error"); } }),
             btn("退回待办（重新派发）", async () => {
               const extra = execRunning ? "\n\n⚠ 该任务已有执行会话正在执行中；退回后会释放任务级锁，但再次下发仍会被拒（需等会话结束）。" : "";
@@ -4502,7 +4891,7 @@
           );
           ops.appendChild(r2);
         }
-        if (t.status === "blocked") ops.appendChild(btn("重试", async () => { try { await api("POST", `/api/tasks/${ref}/execution/retry`, {}); closeDrawer(); await loadTasks(); } catch (e) { showBanner(e.message, "error"); } }, "primary"));
+        if (t.status === "blocked") ops.appendChild(btn("重试", async () => { try { await api("POST", `/api/tasks/${ref}/execution/retry`, {}); closeDrawer(); await loadTasks(); } catch (e) { showBanner(e.message, "error"); } }, "secondary"));
         ops.appendChild(btn("拆解为子任务", async () => {
           if (!window.confirm("按任务描述自动拆解为关联子任务？（无编号行则生成 实现/验证 两条）")) return;
           try { const r = await api("POST", `/api/tasks/${ref}/decompose`, {}); showBanner(`已生成子任务：${(r.children || []).map((c) => c.identifier).join("、")}（待办池）`, "info"); closeDrawer(); await loadTasks(); }
@@ -5299,6 +5688,8 @@
           for (const staleNextStep of Array.from(drawerBody.querySelectorAll(".drawer-section.next-step"))) staleNextStep.remove();
           drawerBody.insertBefore(sec, drawerBody.firstChild); // 放最前：先回答"该干嘛"，再看明细
         }
+        // 卡 `-224`：所有区块（含刚插到最前面的「下一步」）都渲染完后，统一收敛主按钮层级。
+        normalizeActionTiers();
       } catch (error) {
         if (renderSeq !== detailRenderSeq) return; // 已被更新的一代取代 ⇒ 不要把失败占位压到新一代的成品上
         drawerActions.replaceChildren();
