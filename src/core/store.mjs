@@ -38,7 +38,7 @@ import { HUMAN_REVIEW_LABEL, assertConclusion, categoryLabel, conclusionOutcome,
 // 项目记忆（2026-10-28 拍板 D-M1）：L2 记忆条目，与内核表同库；**不是第二真源**（必带 provenance）。
 import { createMemoryApi } from "./memory.mjs";
 
-export const SCHEMA_VERSION = 13; // 13：交付物证据 task_evidence + 授权快照 task_mandates（0-B · 卡 -197）；12：契约快照
+export const SCHEMA_VERSION = 14; // 14：项目设置 flow_inject_policy（P5 档 C · 卡 -210）；13：交付物证据 task_evidence + 授权快照 task_mandates（0-B · 卡 -197）；12：契约快照
 // 条目化数量口径（卡 `-169` P4②）：定义在 requirements.mjs（纯模块），此处转发以便调用方就近取用。
 export { clampElaborateLimit, DEFAULT_ELABORATE_LIMIT, MAX_ELABORATE_LIMIT, ELABORATE_PREVIEW_SIZE };
 
@@ -64,12 +64,16 @@ export function normalizeAcceptance(value) {
 /**
  * 任务级「复核动作」（命令）归一：空串/未传 → `null` ＝**回落**（任务级 → 项目 `envConfig.verifyCommand`
  * → 内置默认），只有显式写了命令才覆盖。长度上限与 FR-90 的 `normalizeVerifyCommand` **同口径**
- * （常量从 `verify.mjs` 取，避免两份）。
+ * （常量从 `verify.mjs` 取，避免两份）；超限**抛错不截断**（截断会把命令切成语法错误 ⇒ 自动复核 exit 2）。
  */
 export function normalizeTaskVerifyCommand(value) {
   if (value === undefined || value === null) return null;
   const s = String(value).trim();
-  return s === "" ? null : s.slice(0, VERIFY_MAX_COMMAND);
+  if (s === "") return null;
+  if (s.length > VERIFY_MAX_COMMAND) {
+    throw new TbError("USAGE_ERROR", `复核命令过长（${s.length} 字符 > 上限 ${VERIFY_MAX_COMMAND}）：请压短后再提交（旧行为是静默截断，截断后命令会变成语法错误）`, { length: s.length, max: VERIFY_MAX_COMMAND });
+  }
+  return s;
 }
 
 // ---- 尝试记录与事件流（FR-82） ------------------------------------------------
@@ -242,6 +246,9 @@ create table if not exists project_settings (
   env_config text not null default '{}',
   team_template text not null default '{}',
   loop_config text not null default '{}',
+  -- P5 档 C（卡 -210 · 需求 R128）：开局注入策略 off（默认）/ main-only / main+exec / all。
+  -- 读点在 index.js 的 createSession() 出口与 src/core/flow-inject.mjs；默认 off ⇒ 零行为变化。
+  flow_inject_policy text not null default 'off',
   updated_at text not null
 );
 create table if not exists project_sessions (
@@ -603,6 +610,85 @@ function insertRequirementItem(db, { id, projectId, docId, title, description, a
   return identifier;
 }
 
+// ---------------- 卡 `-234`（需求 `R171`）：需求条目「简写」与「报错要能照抄」 ----------------
+/**
+ * 简写形态：`R170`（只有序号，不带项目前缀）。
+ *
+ * 为什么简写**必须带 projectId 才解析**：identifier 是 `<项目id>-R<序号>`，同一个序号在**多个项目**里都可能
+ * 存在；没有项目范围就只能猜，而猜必然选错（卡里明令禁止把简写做成跨项目模糊匹配）。
+ * 没有项目范围时不是「猜一个」，而是报错并把各项目的候选列出来（列候选 ≠ 解析）。
+ */
+const REQUIREMENT_SHORT_REF = /^R([1-9]\d*)$/;
+/** 报错体里给几条例目示例：够照抄，又不把错误体撑大。 */
+const REQUIREMENT_REF_EXAMPLES = 5;
+
+/** 取若干条「可照抄」的 identifier（给了项目就只取该项目的 —— 跨项目示例会把人带偏）。 */
+function requirementRefExamples(db, projectId) {
+  const rows = projectId
+    ? db.prepare("select identifier from requirement_items where project_id = ? order by created_at, rowid limit ?").all(projectId, REQUIREMENT_REF_EXAMPLES)
+    : db.prepare("select identifier from requirement_items order by created_at, rowid limit ?").all(REQUIREMENT_REF_EXAMPLES);
+  return rows.map((row) => row.identifier);
+}
+
+/**
+ * `REQUIREMENT_NOT_FOUND` 的**唯一**构造点（错误码一字不改：下游按 `code` 分支）。
+ *
+ * 两条硬口径（卡 `-234`）：
+ *   ① **不得谎报**：`R170` 这条不存在 ≠ 需求不存在；「写法没被认出来」更不等于「数据没有」。
+ *   ② **报错就是文档**：`details` 里必须带可直接照抄的完整标识（`hint` + `examples`），
+ *      调用方不必再去翻文档就知道该写什么。
+ */
+function buildRequirementNotFoundError(db, ref, options = {}) {
+  const raw = typeof ref === "string" ? ref.trim() : String(ref ?? "");
+  const projectId = typeof options?.projectId === "string" ? options.projectId.trim() : "";
+  const examples = requirementRefExamples(db, projectId);
+  const exampleText = examples.length ? examples.join(" / ") : "（库里暂无条目）";
+  // 没给项目时示例只能跨项目取 —— 必须标明「不限项目」，否则等于暗示这条在本项目里可用。
+  const exampleLabel = projectId === "" ? "库里现有条目（不限项目）" : "本项目可用条目";
+  const short = REQUIREMENT_SHORT_REF.exec(raw);
+  if (short) {
+    const sequence = Number(short[1]);
+    const resolvedIdentifier = projectId === "" ? null : formatRequirementIdentifier(projectId, sequence);
+    if (resolvedIdentifier) {
+      // 已按项目解析成完整标识，仍然查不到 ⇒ 是「条目不存在」，不是「写法不对」。
+      return new TbError("REQUIREMENT_NOT_FOUND", `需求条目不存在：${raw}（简写已按项目 ${projectId} 解析为 ${resolvedIdentifier}，该项目内没有这条）`, {
+        ref: raw,
+        refKind: "short",
+        projectId,
+        resolvedIdentifier,
+        hint: `\`${raw}\` 这种简写只在「给定项目」内解析：本次按 \`${projectId}\` 解析成 \`${resolvedIdentifier}\`，照样查不到 ⇒ 是**条目不存在**，不是写法没被认出来。可照抄的${exampleLabel}：${exampleText}。`,
+        examples,
+      });
+    }
+    // 没有项目范围：**不猜**。把各项目里同序号的全标识列成候选，让人自己挑一条。
+    const candidates = db
+      .prepare("select identifier from requirement_items where identifier like ? order by created_at, rowid limit ?")
+      .all(`%-R${sequence}`, REQUIREMENT_REF_EXAMPLES)
+      .map((row) => row.identifier);
+    const suggest = candidates[0] ?? examples[0] ?? `<项目id>-R${sequence}`;
+    return new TbError("REQUIREMENT_NOT_FOUND", `需求条目引用无法解析：${raw} —— 简写缺少项目范围（同一序号在多个项目里都可能存在，未做跨项目猜测）；请写完整标识，如 ${suggest}`, {
+      ref: raw,
+      refKind: "short",
+      projectId: null,
+      resolvedIdentifier: null,
+      candidates,
+      hint: `简写 \`${raw}\` 必须带项目才能解析。两条路：① 写完整标识（形如 \`<项目id>-R${sequence}\`）${candidates.length ? `，库里现有：${candidates.join(" / ")}` : ""}；② 走带项目的入口（如 \`POST /api/tasks\` 给 projectId，简写即按该项目解析）。`,
+      examples,
+    });
+  }
+  // 非简写：id / 完整标识 / 其它形态 —— 统一补上「能照抄的写法」，message 保持原文（真·不存在）。
+  const kind = parseRequirementIdentifier(raw) ? "identifier" : "other";
+  return new TbError("REQUIREMENT_NOT_FOUND", `需求条目不存在：${raw}`, {
+    ref: raw,
+    refKind: kind,
+    ...(projectId === "" ? {} : { projectId }),
+    hint: kind === "identifier"
+      ? `\`${raw}\` 是完整标识形态（\`<项目id>-R<序号>\`），本次就是按完整标识查的 ⇒ 该条目确实不存在。可照抄的${exampleLabel}：${exampleText}。`
+      : `\`${raw}\` 既不是条目 id、也不是 \`<项目id>-R<序号>\` 形态；可用写法：完整标识（如 \`${examples[0] ?? "<项目id>-R<序号>"}\`）或简写 \`R<序号>\`（需带项目）。`,
+    examples,
+  });
+}
+
 function isConstraintError(error, needle) {
   const message = String(error?.message ?? "");
   return message.includes("UNIQUE constraint failed") && message.includes(needle);
@@ -680,7 +766,7 @@ export function migrateRequirementSeq(db) {
   const projectColumns = db.prepare("pragma table_info(projects)").all().map((row) => row.name);
   const taskColumns = db.prepare("pragma table_info(tasks)").all().map((row) => row.name);
   const candidateColumns = db.prepare("pragma table_info(requirement_candidates)").all().map((row) => row.name);
-  const result = { addedReqSeqColumn: false, addedTaskRequirementColumn: false, addedCandidateSourceColumn: false, addedTaskSessionColumn: false, addedProjectSessionColumn: false, addedClaimColumn: false, addedFailureColumn: false, addedBlockColumn: false, addedRunColumn: false, addedReviewColumn: false, addedCommentEditColumn: false, addedBoardPositionColumn: false };
+  const result = { addedReqSeqColumn: false, addedTaskRequirementColumn: false, addedCandidateSourceColumn: false, addedTaskSessionColumn: false, addedProjectSessionColumn: false, addedClaimColumn: false, addedFailureColumn: false, addedBlockColumn: false, addedRunColumn: false, addedReviewColumn: false, addedCommentEditColumn: false, addedBoardPositionColumn: false, addedFlowInjectPolicyColumn: false };
   if (!projectColumns.includes("next_req_seq")) {
     db.exec("alter table projects add column next_req_seq integer not null default 1");
     result.addedReqSeqColumn = true;
@@ -693,6 +779,11 @@ export function migrateRequirementSeq(db) {
   if (psColumns.length && !psColumns.includes("loop_config")) {
     db.exec("alter table project_settings add column loop_config text not null default '{}'");
     result.addedLoopColumn = true;
+  }
+  // P5 档 C（卡 `-210`）：老库补 `flow_inject_policy`。默认 `off` ⇒ **迁移本身不改变任何行为**。
+  if (psColumns.length && !psColumns.includes("flow_inject_policy")) {
+    db.exec("alter table project_settings add column flow_inject_policy text not null default 'off'");
+    result.addedFlowInjectPolicyColumn = true;
   }
   const depColumns = db.prepare("pragma table_info(task_dependencies)").all().map((row) => row.name);
   if (depColumns.length && !depColumns.includes("reason")) {
@@ -1331,7 +1422,8 @@ export function openStore(options = {}) {
         // 归因校验必须在**同一事务内**：条目不存在 / 跨项目 ⇒ 整笔回滚（连 next_seq 一起回滚，
         // 不留编号空洞、不留孤儿卡）。
         if (requirementRef !== "") {
-          const item = store.requireRequirementItemRef(requirementRef);
+          // 卡 `-234`：建卡**一定**有 projectId ⇒ 简写 `R170` 在这里按本项目解析（不用跨项目猜）。
+          const item = store.requireRequirementItemRef(requirementRef, { projectId });
           if (item.projectId !== projectId) {
             throw new TbError("DEPENDENCY_CROSS_PROJECT", `条目与任务必须同项目（条目 ${item.projectId}，任务 ${projectId}）`, { requirementProjectId: item.projectId, taskProjectId: projectId });
           }
@@ -1747,14 +1839,33 @@ export function openStore(options = {}) {
     },
 
     // ---------------------------------------------------------------- 需求条目（FR-35）
-    getRequirementItemRef(ref) {
+    /**
+     * 需求条目引用解析：条目 id / 完整 identifier（`<项目id>-R<序号>`）/ **简写 `R170`**。
+     *
+     * 卡 `-234`（需求 `R171`）：此前只认前两种，于是「照着需求编号写」的人写 `R170` 直接吃
+     * `需求条目不存在：R170` —— 把「写法没被认出来」说成「数据没有」，引导人去查数据。
+     *
+     * 简写**只在给定 `projectId` 的范围内**解析（`R170` → `<projectId>-R170`，DB 唯一约束保证不打嗝）；
+     * 没给 `projectId` 时**不猜**（跨项目同序号必然选错），交给 `requireRequirementItemRef` 报错并列候选。
+     *
+     * @param {string} ref
+     * @param {{ projectId?: string }} [options]
+     */
+    getRequirementItemRef(ref, options = {}) {
       if (typeof ref !== "string" || ref.trim() === "") return null;
       const value = ref.trim();
-      return store.getRequirementItemById(value) ?? store.getRequirementItemByIdentifier(value);
+      const direct = store.getRequirementItemById(value) ?? store.getRequirementItemByIdentifier(value);
+      if (direct) return direct;
+      const short = REQUIREMENT_SHORT_REF.exec(value);
+      if (!short) return null;
+      const projectId = typeof options?.projectId === "string" ? options.projectId.trim() : "";
+      if (projectId === "") return null;
+      return store.getRequirementItemByIdentifier(formatRequirementIdentifier(projectId, Number(short[1])));
     },
-    requireRequirementItemRef(ref) {
-      const item = store.getRequirementItemRef(ref);
-      if (!item) throw new TbError("REQUIREMENT_NOT_FOUND", `需求条目不存在：${ref}`, { ref });
+    /** 同上，查不到就抛 `REQUIREMENT_NOT_FOUND`（错误码不变；`details` 带可直接照抄的完整标识）。 */
+    requireRequirementItemRef(ref, options = {}) {
+      const item = store.getRequirementItemRef(ref, options);
+      if (!item) throw buildRequirementNotFoundError(db, ref, options);
       return item;
     },
     getRequirementItemById(id) {
@@ -3122,21 +3233,23 @@ export function openStore(options = {}) {
       store.requireProject(projectId);
       const row = db.prepare("select * from project_settings where project_id = ?").get(projectId);
       const parse = (s) => { try { return JSON.parse(s); } catch { return {}; } };
+      // `flowInjectPolicy`：P5 档 C（卡 `-210`）的开局注入策略；无设置行 / 老库（列已迁移，默认 `off`）一律 `off`。
       return row
-        ? { projectId, envConfig: parse(row.env_config), teamTemplate: parse(row.team_template), loop: parse(row.loop_config), updatedAt: row.updated_at }
-        : { projectId, envConfig: {}, teamTemplate: {}, loop: {}, updatedAt: null };
+        ? { projectId, envConfig: parse(row.env_config), teamTemplate: parse(row.team_template), loop: parse(row.loop_config), flowInjectPolicy: row.flow_inject_policy ?? "off", updatedAt: row.updated_at }
+        : { projectId, envConfig: {}, teamTemplate: {}, loop: {}, flowInjectPolicy: "off", updatedAt: null };
     },
-    saveProjectSettings(projectId, { envConfig, teamTemplate, loop } = {}) {
+    saveProjectSettings(projectId, { envConfig, teamTemplate, loop, flowInjectPolicy } = {}) {
       store.requireProject(projectId);
       const current = store.getProjectSettings(projectId);
       const nextEnv = envConfig === undefined ? current.envConfig : envConfig;
       const nextTpl = teamTemplate === undefined ? current.teamTemplate : teamTemplate;
       const nextLoop = loop === undefined ? current.loop : loop;
+      const nextPolicy = flowInjectPolicy === undefined ? (current.flowInjectPolicy ?? "off") : flowInjectPolicy;
       const ts = nowIso();
       db.prepare(
-        `insert into project_settings (project_id, env_config, team_template, loop_config, updated_at) values (?,?,?,?,?)
-         on conflict(project_id) do update set env_config = excluded.env_config, team_template = excluded.team_template, loop_config = excluded.loop_config, updated_at = excluded.updated_at`,
-      ).run(projectId, JSON.stringify(nextEnv ?? {}), JSON.stringify(nextTpl ?? {}), JSON.stringify(nextLoop ?? {}), ts);
+        `insert into project_settings (project_id, env_config, team_template, loop_config, flow_inject_policy, updated_at) values (?,?,?,?,?,?)
+         on conflict(project_id) do update set env_config = excluded.env_config, team_template = excluded.team_template, loop_config = excluded.loop_config, flow_inject_policy = excluded.flow_inject_policy, updated_at = excluded.updated_at`,
+      ).run(projectId, JSON.stringify(nextEnv ?? {}), JSON.stringify(nextTpl ?? {}), JSON.stringify(nextLoop ?? {}), String(nextPolicy ?? "off"), ts);
       return store.getProjectSettings(projectId);
     },
     /** 列出团队执行记录（可按目标任务过滤），并带出目标任务编号/标题，供工作台"归属团队"视图使用。 */

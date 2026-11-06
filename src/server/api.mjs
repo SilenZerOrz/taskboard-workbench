@@ -36,7 +36,7 @@ const HOST_UNAVAILABLE_NEXT = "该实例没有宿主会话通道（独立进程�
 import { buildDebugDispatchPrompt } from "../core/debug-dispatch.mjs";
 import { buildSplitAskPrompt } from "../core/split-ask.mjs";
 import { buildReviewEvidence, formatVerifyComment, normalizeVerifyCommand, summarizeVerifyOutput, VERIFY_DEFAULT_COMMAND } from "../core/verify.mjs";
-import { evaluateKickoff } from "../core/kickoff.mjs";
+import { buildGapPrompt, buildKickoffTodos, collectGaps, evaluateKickoff } from "../core/kickoff.mjs";
 import { deriveEmptyState } from "../core/empty-state.mjs";
 // 2026-10-28 拍板 E1–E3 / D-M1–D-M5：项目推进清单（纯投影 + 幂等回写）与项目记忆（L2 条目 + L3 召回）。
 import { buildAdvance, renderAdvanceBlock, applyDecision } from "../core/advance.mjs";
@@ -50,6 +50,8 @@ import { resolveCliExecutor, executeTaskWithCli, buildTaskPrompt, cliArgsFor, cl
 import { DEFAULT_FAILURE_LIMIT } from "../core/store.mjs";
 // 卡 `-177`（2026-10-29 · 口径 X）：acceptance 缺省口径与 MCP **共用同一份**，不在本文件另写判断。
 import { markAcceptance, acceptanceFlag } from "../core/acceptance.mjs";
+// P5 档 C（卡 `-210`）：开局注入的唯一实现（内容仍由 `buildFlowBlock()` 生成，本文件不复制正文）。
+import { FLOW_INJECT_MANUAL, FLOW_INJECT_ROLES, injectFlow, normalizeFlowInjectPolicy } from "../core/flow-inject.mjs";
 
 export const API_SCHEMA_VERSION = 2;
 
@@ -340,6 +342,59 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
       });
       return { status: 200, payload: { project: project.id, workspacePath: project.workspacePath ?? null, readable: facts.readable, ...report } };
     }
+    // 卡 `-229`（需求 R170）：配置页「引入主对话」—— 把**当前实时缺口**投给项目主会话。
+    // 与上方 GET /kickoff 严格分离：GET 只读（注释见上，绝不写任何数据）；本路由只做「现算缺口 + 投递 + 审计」，
+    // 同样**不改任何完成度数据**。缺口由 collectGaps(evaluateKickoff(...)) 投影 ⇒ 完成度真源仍只有 evaluateKickoff。
+    const projectKickoffAnnounceRoute = /^\/api\/projects\/([^/]+)\/kickoff\/announce$/.exec(pathname);
+    if (projectKickoffAnnounceRoute) {
+      if (method !== "POST") throw new TbError("USAGE_ERROR", "kickoff/announce 仅支持 POST");
+      const project = store.requireProject(decodeURIComponent(projectKickoffAnnounceRoute[1]));
+      // 每次现算（与 GET /kickoff 同一份自检数据源），保证「投出去的条目数 = 配置页未完成项数」。
+      const settings = store.getProjectSettings(project.id);
+      const facts = collectKickoffFacts(project.workspacePath ?? null);
+      const report = evaluateKickoff({
+        files: facts.files,
+        settings,
+        custom: { reviewerRole: hasReviewerRole(settings?.teamTemplate), engineerExecutor: hasEngineerExecutor(settings?.teamTemplate) },
+      });
+      const gaps = collectGaps(report);
+      // 卡 `-230`：同一次聚合出**结构化 todolist**（一步一条、依赖顺序、每条带可执行判据）。
+      const todos = buildKickoffTodos({ project, gaps });
+      // 卡 `t20`（需求 `R170`）：缺口注入必须带「关联需求」—— 否则执行侧建的卡会被归因门拒（EXECUTION_NOT_ATTRIBUTED）。
+      // 候选只取**本项目未关闭**的条目：已关闭的条目建出来的卡同样过不了归因门（等价于未归属）。
+      const requirements = store
+        .listRequirementItems({ projectId: project.id })
+        .filter((it) => it.status !== "closed")
+        .map((it) => ({ identifier: it.identifier, title: it.title }));
+      // 显式指定的那条要**先校验再拼正文**：不存在的引用不得静默降级成「未指定」（那会建出一堆无归属的卡）。
+      let requirement = null;
+      const requirementRef = body.requirement == null ? "" : String(body.requirement).trim();
+      if (requirementRef !== "") {
+        // 卡 `-234`：本路由一定知道项目 ⇒ 简写 `R170` 按本项目解析。
+        const item = store.requireRequirementItemRef(requirementRef, { projectId: project.id });   // 不存在 ⇒ REQUIREMENT_NOT_FOUND
+        if (item.projectId !== project.id) {
+          throw new TbError("REQUIREMENT_NOT_FOUND", `需求条目不属于本项目：${requirementRef}`, { ref: requirementRef, projectId: project.id });
+        }
+        requirement = { identifier: item.identifier, title: item.title };
+      }
+      const prompt = buildGapPrompt({ project, gaps, todos, requirement, requirements });
+      const summary = { step: gaps.step, done: gaps.done, total: gaps.total, count: gaps.items.length, todos: todos.length };
+      const sid = body.sessionId ? String(body.sessionId) : (project.initialSessionId ?? null);
+      if (!sid) throw new TbError("NO_MAIN_SESSION", "该项目还没有主会话：先在开局流程绑主会话，或用 body.sessionId 指定", { projectId: project.id, gaps: summary, todos, prompt, requirement, requirements });
+      const hostPort = store.hostSessionPort;
+      if (!hostPort || typeof hostPort.sendPrompt !== "function") {
+        // 与本文件 split-ask 同口径：投不进去也要给人能做的事 —— 正文原样回带（前端据此降级，不得谎称已投递）。
+        // 新增 host-unavailable 投递点须同步校准 `tests/host-gate.test.mjs` 的计数（守卫按该字面量出现次数钉住）。
+        return { status: 200, payload: { project: project.id, sessionId: sid, delivered: false, reason: "host-unavailable", hostCapabilities: null, nextAction: HOST_UNAVAILABLE_NEXT, gaps: summary, todos, prompt, requirement, requirements, block: prompt } };
+      }
+      let sent = null;
+      try { sent = await hostPort.sendPrompt(sid, prompt); } catch (e) { sent = { sent: false, reason: e?.message ?? "error" }; }
+      const delivered = Boolean(sent?.sent ?? sent?.delivered);
+      try {
+        store.recordAudit({ actor: body.actor ?? "board", action: "kickoff-announce", target: project.id, allowed: delivered, reason: delivered ? "delivered" : (sent?.reason ?? "delivery-failed"), detail: `session=${sid} gaps=${gaps.items.length} checks=${gaps.done}/${gaps.total} steps=${gaps.step}` });
+      } catch { /* 审计失败不阻断投递结论（投递已生效时谎报失败会诱发重复注入） */ }
+      return { status: 200, payload: { project: project.id, sessionId: sid, delivered, reason: delivered ? null : (sent?.reason ?? "delivery-failed"), gaps: summary, todos, prompt, requirement, requirements, block: prompt } };
+    }
     // 项目设置（FR-56）：项目环境约束 + agent 执行团队模板
     const projectSettingsRoute = /^\/api\/projects\/([^/]+)\/settings$/.exec(pathname);
     if (projectSettingsRoute) {
@@ -356,10 +411,73 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
           if (roles.length) assertTeamTemplate({ roles, qualityGates: tpl?.qualityGates });
           else assertQualityGates({ qualityGates: tpl?.qualityGates });
         }
-        const saved = store.saveProjectSettings(project.id, { envConfig: body.envConfig, teamTemplate: body.teamTemplate, loop: body.loop });
+        // P5 档 C（卡 `-210`）：`flowInjectPolicy` 是**切换注入行为**的配置 ⇒ 写前校验（非法值不落库）。
+        // 未传 = 保持不变（老前端 / 只改 envConfig 的调用方零影响）。
+        let flowInjectPolicy;
+        if (body.flowInjectPolicy !== undefined) flowInjectPolicy = normalizeFlowInjectPolicy(body.flowInjectPolicy, { strict: true });
+        const saved = store.saveProjectSettings(project.id, { envConfig: body.envConfig, teamTemplate: body.teamTemplate, loop: body.loop, flowInjectPolicy });
         return { status: 200, payload: saved };
       }
       throw new TbError("USAGE_ERROR", "settings 仅支持 GET 或 PUT");
+    }
+    // 开局注入（P5 档 C · 卡 `-210`）：档 C 的**人工出口**（`tb-flow inject --session`）+ 审计查询。
+    // 内容与自动注入**共用** `src/core/flow-inject.mjs`（同一个 `buildFlowBlock()`）—— 本文件不复制正文。
+    const projectFlowRoute = /^\/api\/projects\/([^/]+)\/flow\/(inject|injections)$/.exec(pathname);
+    if (projectFlowRoute) {
+      const project = store.requireProject(decodeURIComponent(projectFlowRoute[1]));
+      const action = projectFlowRoute[2];
+      const configuredPolicy = store.getProjectSettings(project.id).flowInjectPolicy ?? "off";
+      if (action === "injections") {
+        if (method !== "GET") throw new TbError("USAGE_ERROR", "flow/injections 仅支持 GET");
+        const rows = store.listFlowInjections({ projectId: project.id, sessionId: searchParams.get("sessionId") ?? undefined });
+        return { status: 200, payload: { projectId: project.id, policy: configuredPolicy, injections: rows } };
+      }
+      if (method !== "POST") throw new TbError("USAGE_ERROR", "flow/inject 仅支持 POST");
+      const sessionId = String(body.sessionId ?? "").trim();
+      if (!sessionId) throw new TbError("USAGE_ERROR", "缺 sessionId：要投进哪个会话（tb-flow inject --session <id>）");
+      // 角色：显式优先；不传就按「是不是项目主会话」推（推错只会少注，不会把完整版塞进执行会话）。
+      const role = body.role === undefined || body.role === null || String(body.role).trim() === ""
+        ? (sessionId === project.initialSessionId ? "main" : "exec")
+        : String(body.role).trim();
+      if (!FLOW_INJECT_ROLES.includes(role)) {
+        throw new TbError("USAGE_ERROR", `role 只能是 ${FLOW_INJECT_ROLES.join(" / ")}`, { role });
+      }
+      const port = store.hostSessionPort;
+      // 人工一次性投递：审计记 `manual`（显式绕过 `off`，但**子 agent 仍不注入** —— 硬规则不因人工放开）。
+      const result = await injectFlow({
+        store,
+        deliver: (sid, text) => (port && typeof port.sendPrompt === "function"
+          ? port.sendPrompt(sid, text)
+          : Promise.resolve({ sent: false, reason: "host-unavailable" })),
+        projectId: project.id,
+        sessionId,
+        role,
+        policy: FLOW_INJECT_MANUAL,
+        source: body.source ?? "api",
+      });
+      if (!result.injected) {
+        return { status: 200, payload: {
+          delivered: false, sessionId, role, policy: result.policy, reason: result.reason,
+          nextAction: result.reason === "host-unavailable" ? HOST_UNAVAILABLE_NEXT : null,
+          // 投不进去也要给出人能做的事：正文原样回带，手工粘贴即可（与本文件 split-ask 同口径）。
+          prompt: result.text ?? null, digest: result.digest ?? null, chars: result.chars ?? 0,
+        } };
+      }
+      try {
+        store.recordAudit({
+          actor: "board", action: "flow-inject", target: project.id, allowed: true, reason: role,
+          detail: JSON.stringify({ sessionId, policy: result.policy, version: result.version, digest: result.digest, chars: result.chars, source: result.source }),
+        });
+      } catch { /* 审计失败不影响投递结论（投递已生效，谎报失败会诱发重复注入） */ }
+      return { status: 200, payload: {
+        delivered: true, sessionId, role, policy: result.policy, version: result.version,
+        contractVersion: result.contractVersion, digest: result.digest, chars: result.chars,
+        injection: {
+          id: result.injectionId, projectId: project.id, sessionId, policy: result.policy,
+          contractVersion: result.contractVersion, digest: result.digest, injectedAt: result.injectedAt,
+        },
+        auditRecorded: result.auditRecorded, source: result.source,
+      } };
     }
     // 项目级机器规范（卡 `-216` / 需求 `R160`）：看板到底读的是哪份、要不要生成 / 恢复副本。
     const projectNormsRoute = /^\/api\/projects\/([^/]+)\/norms$/.exec(pathname);
@@ -548,6 +666,9 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
       const created = await port.createSession({
         cwd: project.workspacePath ?? undefined,
         title: mainSessionName,
+        // P5 档 C（卡 `-210`）：声明角色 —— 只有 `main` 才吃「完整版装载块」。
+        role: "main",
+        projectId: project.id,
       });
       const sessionId = created?.sessionId ?? null;
       if (!sessionId) throw new TbError("SESSION_CREATE_FAILED", "宿主未能创建会话", { reason: created?.reason ?? null });
@@ -1088,6 +1209,9 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
             preset,
             cwd: store.getProject(execTask.projectId)?.workspacePath ?? undefined,
             title: sessionName,
+            // P5 档 C（卡 `-210`）：执行会话 ⇒ 只吃「摘要版」（`main-only` 下**不注入**）。
+            role: "exec",
+            projectId: execTask.projectId,
           });
           if (created?.sessionId) {
             sessionId = created.sessionId;

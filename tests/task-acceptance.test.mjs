@@ -40,7 +40,7 @@ test("归一：验收标准只截断不改写；复核动作空串＝未指定�
   assert.equal(normalizeTaskVerifyCommand(""), null, "空串＝回落项目设置，不是空命令");
   assert.equal(normalizeTaskVerifyCommand("   "), null);
   assert.equal(normalizeTaskVerifyCommand("  npm test  "), "npm test");
-  assert.equal(normalizeTaskVerifyCommand("x".repeat(VERIFY_MAX_COMMAND + 50)).length, VERIFY_MAX_COMMAND);
+  assert.throws(() => normalizeTaskVerifyCommand("x".repeat(VERIFY_MAX_COMMAND + 50)), (e) => e.code === "USAGE_ERROR", "超限必须报错，不得静默截断（会切成语法错误）");
 });
 
 test("store：添加任务时即记录；可编辑、可清空（清空复核动作 ⇒ 回落）", () => {

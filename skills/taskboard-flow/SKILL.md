@@ -84,6 +84,6 @@ requires_contract: v1
 | --- | --- |
 | [`references/steps/S0.md`](./references/steps/S0.md) … [`S7.md`](./references/steps/S7.md) | 每步的详细做法、命令示例、判据读数长什么样 |
 | [`references/errors.md`](./references/errors.md) | 错误码 → 该做什么（含"别重试同一请求"的那些） |
-| [`references/injection.md`](./references/injection.md) | 三档装载的细节 + 分层注入策略（档 C 预埋，未启用） |
+| [`references/injection.md`](./references/injection.md) | 三档装载的细节 + 分层注入策略（档 C 已实现·默认 `off`） |
 | `spec/norms/flow.md` | 机器版主流程（运行时唯一真源，随包；`norm_get { norm:"flow" }`） |
 | `spec/norms/card-update.md` | 卡片更新规范（`card_progress` 的 `norm_digest` 就取它） |

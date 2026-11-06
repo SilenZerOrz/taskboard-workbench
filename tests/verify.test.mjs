@@ -45,11 +45,12 @@ function draftFor(overrides = {}) {
   return buildHumanReviewDraft({ ...buildHumanReviewContext(input), ...input, classification });
 }
 
-test("命令归一：空 → 默认命令；两端空白去掉；超长按上限截断", () => {
+test("命令归一：空 → 默认命令；两端空白去掉；超长**报错不截断**（t22）", () => {
   assert.equal(normalizeVerifyCommand(), VERIFY_DEFAULT_COMMAND);
   assert.equal(normalizeVerifyCommand("   "), VERIFY_DEFAULT_COMMAND);
   assert.equal(normalizeVerifyCommand("  npm run check  "), "npm run check");
-  assert.equal(normalizeVerifyCommand("x".repeat(500)).length, VERIFY_MAX_COMMAND);
+  assert.throws(() => normalizeVerifyCommand("x".repeat(VERIFY_MAX_COMMAND + 1)), (e) => e.code === "USAGE_ERROR" && e.message.includes(String(VERIFY_MAX_COMMAND + 1)) && e.message.includes(String(VERIFY_MAX_COMMAND)), "超限必须报错（含实际长度与上限），不得静默截断");
+  assert.equal(normalizeVerifyCommand("x".repeat(VERIFY_MAX_COMMAND)).length, VERIFY_MAX_COMMAND, "恰好等于上限允许");
 });
 
 test("结论口径：通过 / 失败（带退出码）/ 超时", () => {

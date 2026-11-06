@@ -234,7 +234,9 @@ test("FR-95-13：任务「启动执行」建会话 = 【任务】+ 标题 + 时�
 
 test("FR-95-14：宿主端口接线 —— 建完再 rename（不指望 create 收 title）", () => {
   const source = read("index.js");
-  assert.match(source, /async createSession\(\{ preset, cwd, title \} = \{\}\)/);
+  // P5 档 C（卡 `-210`）给签名加了 `role` / `projectId`（注入分流用）—— 判据从「逐字签名」改成「关键形状仍成立」，
+  // 否则每次加一个带默认值的参数都会误红，而这条测试真正要守的是「建完再 rename」。
+  assert.match(source, /async createSession\(\{[^}]*\bcwd\b[^}]*\btitle\b[^}]*\} = \{\}\)/);
   assert.match(source, /sc\.rename\(\{ sessionId, title \}\)/, "必须调宿主的 rename({sessionId,title})");
   assert.match(source, /async renameSession\(sessionId, title\)/);
   assert.match(source, /return \{ renamed: false, reason: "rename-unavailable" \}/, "无 rename 能力要如实拒绝");

@@ -34,7 +34,9 @@ const css = readFileSync(join(ROOT, "web", "tokens.css"), "utf8");
 
 test("A 能力位：启动读 /api/health 落 state.host，且「未知」不擅自禁用", () => {
   assert.match(app, /api\("GET", "\/api\/health"\)/, "启动必须读一次 /api/health");
-  assert.match(app, /state\.host = h\?\.host \?\? null/, "能力位必须落到 state.host");
+  // 卡 `-222` 把这一步改成分步容错的 `runBootStep`（返回值取 host），**行为不变**：/api/health → state.host
+  // （缺省 null = 未知）。这里只钉行为形状（`?.host ?? null` 落到 state.host），不再钉当时那个局部变量名。
+  assert.match(app, /state\.host = (?:h|health\.value)\?\.host \?\? null/, "能力位必须落到 state.host");
   const gate = app.slice(app.indexOf("function applyHostGate()"), app.indexOf("function renderHostNotice()"));
   assert.match(gate, /if \(!caps\) return;/, "能力未知（health 未回 / 老宿主不报）时不得擅自禁用，交给服务端如实拒绝");
   assert.match(app, /host: null,/, "state 必须有 host 字段（默认 null = 未知）");
@@ -64,7 +66,7 @@ test("D 服务端：host-unavailable 的 nextAction 必须准确，并回带 pro
   assert.ok(!apiSrc.includes('nextAction: "检查宿主会话通道后重试"'), "旧 nextAction 必须消失：它把「能力缺失」说成「临时故障」，人会一直重试永不成立的条件");
   assert.match(apiSrc, /const HOST_UNAVAILABLE_NEXT = "/, "必须有统一措辞常量");
   const uses = apiSrc.match(/nextAction: HOST_UNAVAILABLE_NEXT/g) ?? [];
-  assert.equal(uses.length, 3, `三处 host-unavailable 都要用它（实际 ${uses.length}）`);
+  assert.equal(uses.length, 4, `四处 host-unavailable 投递点都要用它（实际 ${uses.length}）——新增投递点须同步校准本计数，别再用局部别名绕过守卫`);
   assert.match(apiSrc, /reason: "host-unavailable", hostCapabilities: null, nextAction: HOST_UNAVAILABLE_NEXT, prompt \}/, "投递类必须回带 prompt（能力缺失时人可手工投递）");
 });
 

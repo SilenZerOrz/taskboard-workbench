@@ -23,6 +23,8 @@ import { createEventHub } from "./src/server/events.mjs";
 import { runExecutionLoop, listLoopProjects } from "./src/core/loop.mjs";
 import { createLlmElaborator } from "./src/host/ai-elaborator.mjs";
 import { createTeamEnginePort } from "./src/host/team-engine.mjs";
+// P5 档 C（卡 `-210`）：开局注入的唯一实现 —— 宿主建会话出口与 `tb-flow inject` 共用同一段判定。
+import { injectFlow } from "./src/core/flow-inject.mjs";
 
 export const name = "taskboard-workbench";
 export const inject = ["webServer"];
@@ -34,19 +36,25 @@ export const PREFIX = "/integrations/taskboard-workbench";
  *
  * 对齐 agent-teams 的**懒取**模式：不在 apply 时 eager 取服务，而是每次调用时经 `getService(name)` 现取，
  * 因此服务在插件之后出现/被替换时自然生效（无需 eager 注入）。
- * - createSession({preset,cwd,title})：`sessionController.create()`（退回 `sessions.create`）；`cwd` 透传工作区；
+ * - createSession({preset,cwd,title,role,projectId})：`sessionController.create()`（退回 `sessions.create`）；`cwd` 透传工作区；
  *   宿主 `create()` **不收 title** ⇒ `title` 走**建完再 `rename()`**（改名失败如实回 `titleApplied:false` + 原因，不谎报）；
  *   **尝试**预置内容，失败不抛错。
+ *   **P5 档 C（卡 `-210`）**：建完按项目 `flow_inject_policy` 做**开局注入**（`main`=完整版 / `exec`+`related`=摘要版 /
+ *   `subagent`=不注入）；注入异常**只回 `injection.reason`，不阻断会话创建**（见 `src/core/flow-inject.mjs`）。
  * - renameSession(id, title)：会话改名（2026-10-23 命名约束的宿主出口）。
  * - sendPrompt(id, text)：**任务下发**。经 `sessionController.prompt({mode:"queue"})` 把指令投递给该会话的 Agent。
  * - openSession(id)：宿主侧无此能力（返回 ui-workspace-unavailable）；会话切换由**客户端** uiWorkspace 完成（见 lib/client.js）。
  * - getCurrentSessionId()：宿主工具面才有 `exec.agent?.id`，此处恒返回 null（接口占位）。
  */
-export function createHostSessionPort({ getService, getCtx } = {}) {
+export function createHostSessionPort({ getService, getCtx, getStore } = {}) {
   const sessions = () => getService?.("sessions");
   const sessionController = () => getService?.("sessionController");
   const agents = () => getService?.("agents");
   const uiWorkspace = () => getService?.("uiWorkspace");
+  /** 注入用 store（懒取）：宿主未给 store（单测 / 纯 adapter 用法）⇒ 一律不注入，行为与接线前完全一致。 */
+  const store = () => {
+    try { return getStore?.() ?? null; } catch { return null; }
+  };
   const mkRequestId = () =>
     (globalThis.crypto?.randomUUID?.() ?? `tb-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   // ---- 作用域取服务（FR-71 投递修复）------------------------------------------
@@ -227,12 +235,33 @@ export function createHostSessionPort({ getService, getCtx } = {}) {
     const r = await renameSession(sessionId, title);
     return { titleApplied: Boolean(r.renamed), titleReason: r.renamed ? null : (r.reason ?? "rename-failed") };
   }
+  /**
+   * P5 档 C（卡 `-210`）：建会话后的**开局注入**出口。
+   *
+   * 三条纪律：
+   *   ① **绝不抛错**：`injectFlow()` 自身不抛，这里再兜一层 —— 注入失败只回 `injection.reason`，
+   *      **会话创建照旧成功**（验收 ⑤：失败不改行为）；
+   *   ② **按 policy × role 分流**：判定在 `src/core/flow-inject.mjs`（唯一实现），这里只负责「把 store 和
+   *      投递通道递过去」；`role` 由调用方声明（主会话 `main` / 任务执行会话 `exec`）——
+   *      **没声明就不注入**（宁可少注，不可错注；`role-unknown`）；
+   *   ③ **内容只有一处生成**：`injectFlow()` 内部调 `buildFlowBlock()`（完整版逐字节等于 `tb-flow start`）。
+   */
+  async function injectOpeningFlow({ sessionId, role, projectId, cwd }) {
+    const st = store();
+    if (!sessionId || !st) return { injected: false, reason: st ? "no-session" : "no-store" };
+    try {
+      return await injectFlow({ store: st, deliver, sessionId, role: role ?? null, projectId: projectId ?? null, cwd: cwd ?? null, policy: null, source: "createSession" });
+    } catch (error) {
+      console.error(`[taskboard-workbench] flow inject failed: ${error?.message ?? error}`);
+      return { injected: false, reason: error?.code ?? String(error?.message ?? error ?? "inject-error") };
+    }
+  }
   return {
     /** 动态可用性：能否建会话 / 投递指令。 */
     get available() {
       return typeof sessionController()?.create === "function" || typeof sessions()?.create === "function";
     },
-    async createSession({ preset, cwd, title } = {}) {
+    async createSession({ preset, cwd, title, role = null, projectId = null } = {}) {
       const sc = (await scopedSessionController("tb-session:new")) ?? sessionController();
       if (typeof sc?.create === "function") {
         try {
@@ -244,7 +273,9 @@ export function createHostSessionPort({ getService, getCtx } = {}) {
           const sessionId = typeof created === "string" ? created : (created?.sessionId ?? created?.id ?? null);
           const named = await applyTitle(sessionId, title);
           const presetApplied = sessionId && preset ? (await deliver(sessionId, preset)).sent : false;
-          return { sessionId, presetApplied, titleApplied: named.titleApplied, titleReason: named.titleReason };
+          // 开局注入排在「预置指令」之后：先给人/agent 看这一轮的任务，再补流程护栏（顺序可观测、可测）。
+          const injection = await injectOpeningFlow({ sessionId, role, projectId, cwd });
+          return { sessionId, presetApplied, titleApplied: named.titleApplied, titleReason: named.titleReason, injection };
         } catch (error) {
           console.error(`[taskboard-workbench] sessionController.create failed: ${error?.message ?? error}`);
         }
@@ -263,7 +294,8 @@ export function createHostSessionPort({ getService, getCtx } = {}) {
       }
       const namedFallback = await applyTitle(sessionId, title);
       const presetApplied = sessionId && preset ? (await deliver(sessionId, preset)).sent : false;
-      return { sessionId, presetApplied, titleApplied: namedFallback.titleApplied, titleReason: namedFallback.titleReason };
+      const injection = await injectOpeningFlow({ sessionId, role, projectId, cwd });
+      return { sessionId, presetApplied, titleApplied: namedFallback.titleApplied, titleReason: namedFallback.titleReason, injection };
     },
     /**
      * 会话改名（2026-10-23 用户命名约束「【任务】/【项目】+ 时间/备注」的宿主出口）。
@@ -513,7 +545,8 @@ export function apply(ctx, config) {
   })();
   const runtime = createPluginRuntime({ dataDir: config?.dataDir ?? hostDataDir, aiElaborator });
   // 挂载宿主会话能力（懒取服务）；api 层经 store.hostSessionPort 使用。
-  runtime.store.hostSessionPort = createHostSessionPort({ getService: (name) => ctx?.get?.(name), getCtx: () => ctx });
+  // `getStore`：P5 档 C（卡 `-210`）注入用 —— 只读项目设置 + 写 `flow_injections` 审计；不给 store 则一律不注入。
+  runtime.store.hostSessionPort = createHostSessionPort({ getService: (name) => ctx?.get?.(name), getCtx: () => ctx, getStore: () => runtime.store });
   // 团队引擎端口（默认 P2 指令降级；TEAM_ENGINE=agent-teams 切 P1）。
   const teamEngineMode = config?.teamEngine ?? process.env.TEAM_ENGINE ?? "instruction";
   runtime.store.teamEnginePort = createTeamEnginePort({ getService: (name) => ctx?.get?.(name), mode: teamEngineMode });

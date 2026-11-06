@@ -88,6 +88,8 @@ export const ERROR_CATEGORY = Object.freeze({
   AGENT_CANNOT_FINALIZE: EXIT.DATA,
 
   // 冲突
+  // 卡 `-229`（R170）：开局缺口投递时项目还没绑主会话 ⇒ 冲突类（先绑/重建主会话再重试；非数据错误）
+  NO_MAIN_SESSION: EXIT.CONFLICT,
   VERSION_CONFLICT: EXIT.CONFLICT,
   PROJECT_EXISTS: EXIT.CONFLICT,
   // FR-03：非空项目不得删除（仍有任务/需求条目/需求文档正文）⇒ 冲突，须先清空

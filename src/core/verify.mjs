@@ -13,21 +13,29 @@
  * 跑命令的 I/O 在 `../server/verify.mjs`（有超时与输出截断），本模块保持纯函数以便单测。
  */
 
+import { TbError } from "./errors.mjs";
 import { latestProgressComment } from "./watchdog.mjs";
 
 /** 证据评论前缀与默认命令（项目未配置时的兜底）。 */
 export const VERIFY_COMMENT_PREFIX = "【自动复核】";
 export const VERIFY_DEFAULT_COMMAND = "npm test";
-/** 命令长度与输出尾段上限：评论是给人看的证据，不是日志搬运。 */
-export const VERIFY_MAX_COMMAND = 300;
+/** 命令长度上限：**2000**（原 300 是"手敲命令"的尺寸；开局缺口命令是**机器生成**的，
+ *  一步要覆盖 2–4 条判据，实测最长 1133 字符 —— 300 会让生成侧根本无法产出可存的命令）。
+ *  超限一律报错，**不静默截断**：截断会把命令切成语法错误（`-232` 自动复核 exit 2 的根因）。 */
+export const VERIFY_MAX_COMMAND = 2000;
+/** 输出尾段上限：评论是给人看的证据，不是日志搬运。 */
 export const VERIFY_MAX_TAIL = 4000;
 /** FR-94：随证据一起落盘的「本卡验收标准」上限（给人看，长文截断即可）。 */
 export const VERIFY_MAX_ACCEPTANCE = 2000;
 
-/** 命令归一：空/非字符串 → 默认命令；超长截断（防把整段脚本塞进评论）。 */
+/** 命令归一：空/非字符串 → 默认命令；超长**报错**（不再静默截断 —— 截断后命令会变成语法错误）。 */
 export function normalizeVerifyCommand(raw) {
   const s = String(raw ?? "").trim();
-  return s === "" ? VERIFY_DEFAULT_COMMAND : s.slice(0, VERIFY_MAX_COMMAND);
+  if (s === "") return VERIFY_DEFAULT_COMMAND;
+  if (s.length > VERIFY_MAX_COMMAND) {
+    throw new TbError("USAGE_ERROR", `复核命令过长（${s.length} 字符 > 上限 ${VERIFY_MAX_COMMAND}）：请压短后再提交（不再静默截断 —— 截断会把命令切成语法错误）`, { length: s.length, max: VERIFY_MAX_COMMAND });
+  }
+  return s;
 }
 
 /**

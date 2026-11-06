@@ -152,6 +152,36 @@ export function buildFlowBlock({ store, project, cwd, matchedBy } = {}) {
   };
 }
 
+/**
+ * P5 档 C（卡 `-210`）· **摘要版**装载块 —— 给执行 / 关联会话用（≤ 300 tokens）。
+ *
+ * 三条约束（为什么是「从 block 剪裁」而不是「另写一份」）：
+ *   ① **唯一真源仍是一个**：本函数只吃 `buildFlowBlock()` 的返回值（`nextStep` / `contract`），
+ *      不读库、不读 SKILL.md、不写字面量步骤 —— 八步改了这里不可能说旧话；
+ *   ② **只留护栏**：执行会话不需要八步全文（完整版 ≈2–3k tokens），只需要「别把 done 写了」
+ *      「backlog→todo 是人工授权」「回填要带什么」这三类会当场报错的东西；
+ *   ③ **确定性**：同样的 block ⇒ 逐字节同样的摘要（可比较、可审计）。
+ *
+ * @param {ReturnType<typeof buildFlowBlock>} block
+ * @returns {string} 摘要文本（以 `\n` 结尾，与完整版同一收尾约定）
+ */
+export function buildFlowSummary(block) {
+  if (!block || typeof block !== "object" || !block.nextStep) {
+    throw new Error("buildFlowSummary 需要 buildFlowBlock() 的返回值（含 nextStep），不接受裸数据");
+  }
+  const step = block.nextStep;
+  const version = block.contract?.version ?? "（未取到）";
+  return [
+    "任务看板主流程（摘要）",
+    `当前步：${step.step} · ${step.title}`,
+    "两道门：done 只能人点（GOVERNANCE_AGENT_DONE）· backlog→todo 是人工授权（EXECUTION_NOT_AUTHORIZED）",
+    "回填要带：evidence[]（file/command/url/reading）+ norm_digest（norm_get \"card-update\"）",
+    `契约：${version}（用旧版本会落 contract-warn）`,
+    "常见错误码：EXECUTION_NOT_ATTRIBUTED（先补归因）· CONTRACT_STALE / NORM_STALE（重取规范）· REVIEW_NOT_APPROVED（等人复核）",
+    "全文：`node scripts/tb-flow.mjs start`（与宿主注入同源）",
+  ].join("\n").trimEnd() + "\n";
+}
+
 /** 档 B：给项目 `AGENTS.md` 用的片段（只指路，不复制正文）。 */
 export function buildAgentsSnippet({ project, pkgPath } = {}) {
   const pkg = pkgPath ?? PKG_ROOT;

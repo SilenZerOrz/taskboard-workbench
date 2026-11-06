@@ -314,7 +314,8 @@ export function requirementUpsert({ store }, args = {}) {
   const ref = refCandidate ? refCandidate.trim() : "";
 
   if (ref !== "") {
-    const current = store.requireRequirementItemRef(ref);
+    // 卡 `-234`：MCP 这里已解析出项目 ⇒ 简写 `R170` 按本项目解析（不再因为「没写全」被判不存在）。
+    const current = store.requireRequirementItemRef(ref, { projectId: project.id });
     if (current.projectId !== project.id) {
       throw fail("DEPENDENCY_CROSS_PROJECT", `条目属于别的项目：${ref}（${current.projectId}）`, { requirement: ref, requirementProject: current.projectId, project: project.id });
     }
@@ -361,7 +362,7 @@ export function requirementChange({ store }, args = {}) {
   const { project } = resolveProject(store, args);
   const ref = [args.requirement, args.id].find((x) => typeof x === "string" && x.trim() !== "");
   if (!ref) throw fail("USAGE_ERROR", "requirement_change 需要 requirement（条目编号或 id）", {});
-  const item = store.requireRequirementItemRef(ref.trim());
+  const item = store.requireRequirementItemRef(ref.trim(), { projectId: project.id });   // 卡 `-234`：简写按本项目解析
   if (item.projectId !== project.id) {
     throw fail("DEPENDENCY_CROSS_PROJECT", `条目属于别的项目：${ref}（${item.projectId}）`, { requirement: ref, requirementProject: item.projectId, project: project.id });
   }
