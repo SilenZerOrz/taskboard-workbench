@@ -10,6 +10,16 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 
 export const EVIDENCE_FIELDS = Object.freeze(["verdict", "deviation", "boundary", "artifacts"]);
+
+/**
+ * `kind` 的**唯一枚举**（FR-106 · 0-B-b）：证据条目可用的五类。
+ * 为什么要收在一处：MCP 的 `card_progress.evidence[]`、MCP 的 `card_evidence_submit`、
+ * HTTP 的 `POST /api/tasks/:ref/evidence` 三个入口都要判同一套值 ——
+ * 各写一份必然漂移（此前 tools.mjs 里就有一份只到 `reading` 的副本）。
+ */
+export const EVIDENCE_KINDS = Object.freeze(["file", "command", "url", "reading", "commit"]);
+
+/** 真正参与 `artifact_refs` 核验的 kind（其余**逐条不进** `artifact_refs` ⇒ 行级 `unchecked`）。 */
 export const EVIDENCE_REF_KINDS = Object.freeze(["commit", "file"]);
 
 const text = (v) => (typeof v === "string" ? v.trim() : "");
@@ -37,6 +47,24 @@ export function normalizeArtifactRefs(refs) {
     out.push(note ? { kind, ref, note } : { kind, ref });
   }
   return out;
+}
+
+/**
+ * **入口层**白名单校验（FR-106 第 3 条）：`artifact_refs[].kind` 不在 `{commit,file}` 内就**显式报错**。
+ *
+ * 与 `normalizeArtifactRefs` 的分工必须区分清楚：
+ *   · **规则层**（`normalizeArtifactRefs`）继续**静默丢弃**非法项 —— 契约不变，`tests/task-evidence.test.mjs` D 组钉着；
+ *   · **入口层**（MCP / HTTP 的写入口）先跑这里，非法即整笔拒（`INVALID_ARTIFACT_REF`）⇒ 调用方拿得到真原因。
+ * 只在入口层做，是为了不改动任何既有规则层行为。
+ */
+export function artifactRefKindProblems(refs) {
+  if (!Array.isArray(refs)) return [];
+  const bad = [];
+  refs.forEach((r, index) => {
+    const kind = text(r?.kind);
+    if (!EVIDENCE_REF_KINDS.includes(kind)) bad.push({ index, kind: kind || null, allowedKinds: [...EVIDENCE_REF_KINDS] });
+  });
+  return bad;
 }
 
 /**

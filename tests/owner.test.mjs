@@ -67,7 +67,7 @@ test("存储：owner 字段读写与过滤（不再写进 labels）", () => {
     assert.equal(stats.ownedTasks, 0, "两个任务的 owner 都为空");
     assert.equal(stats.legacyOwnerLabels, 0);
     // FR-79/FR-82/FR-83/FR-81 + FR-50（team_members.executor）：schema 版本 10
-    assert.equal(stats.schemaVersion, 14); // 14：+ project_settings.flow_inject_policy（P5 档 C · -210）；13：+ task_evidence / task_mandates（0-B · -197）；12：+ 契约快照（project_contract / flow_injections · P1）
+    assert.equal(stats.schemaVersion, 15); // 14：+ project_settings.flow_inject_policy（P5 档 C · -210）；13：+ task_evidence / task_mandates（0-B · -197）；12：+ 契约快照（project_contract / flow_injections · P1）
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
@@ -118,7 +118,7 @@ test("迁移：老库的 owner:<role> 标签搬进 owner 字段，labels 被清�
 
     const store = openStore({ dataDir: dir });
     try {
-      assert.deepEqual(store.migration, { addedOwnerColumn: true, migratedTasks: 2, strippedLabels: 2, addedReqSeqColumn: true, addedTaskRequirementColumn: true, addedCandidateSourceColumn: false, addedTaskSessionColumn: true, addedProjectSessionColumn: true, addedClaimColumn: true, addedFailureColumn: true, addedBlockColumn: true, addedRunColumn: true, addedReviewColumn: true, addedHumanReviewColumn: true, addedTaskAcceptanceColumn: true, addedTaskVerifyCommandColumn: true, addedCommentEditColumn: true, addedBoardPositionColumn: true, addedTeamMemberExecutorColumn: false, addedFlowInjectPolicyColumn: false });
+      assert.deepEqual(store.migration, { addedOwnerColumn: true, migratedTasks: 2, strippedLabels: 2, addedReqSeqColumn: true, addedTaskRequirementColumn: true, addedCandidateSourceColumn: false, addedTaskSessionColumn: true, addedProjectSessionColumn: true, addedClaimColumn: true, addedFailureColumn: true, addedBlockColumn: true, addedRunColumn: true, addedReviewColumn: true, addedHumanReviewColumn: true, addedTaskAcceptanceColumn: true, addedTaskVerifyCommandColumn: true, addedCommentEditColumn: true, addedBoardPositionColumn: true, addedTeamMemberExecutorColumn: false, addedFlowInjectPolicyColumn: false, addedEvidenceHashColumn: false });
       assert.equal(store.stats().tasks, 2, "迁移前后任务数必须不变");
       const one = store.getTaskRef("legacy-1");
       assert.equal(one.owner, "engineer");
@@ -137,7 +137,7 @@ test("迁移：老库的 owner:<role> 标签搬进 owner 字段，labels 被清�
     // 幂等：再次打开同一库不重复迁移、不丢数据
     const again = openStore({ dataDir: dir });
     try {
-      assert.deepEqual(again.migration, { addedOwnerColumn: false, migratedTasks: 0, strippedLabels: 0, addedReqSeqColumn: false, addedTaskRequirementColumn: false, addedCandidateSourceColumn: false, addedTaskSessionColumn: false, addedProjectSessionColumn: false, addedClaimColumn: false, addedFailureColumn: false, addedBlockColumn: false, addedRunColumn: false, addedReviewColumn: false, addedCommentEditColumn: false, addedBoardPositionColumn: false, addedTeamMemberExecutorColumn: false, addedFlowInjectPolicyColumn: false });
+      assert.deepEqual(again.migration, { addedOwnerColumn: false, migratedTasks: 0, strippedLabels: 0, addedReqSeqColumn: false, addedTaskRequirementColumn: false, addedCandidateSourceColumn: false, addedTaskSessionColumn: false, addedProjectSessionColumn: false, addedClaimColumn: false, addedFailureColumn: false, addedBlockColumn: false, addedRunColumn: false, addedReviewColumn: false, addedCommentEditColumn: false, addedBoardPositionColumn: false, addedTeamMemberExecutorColumn: false, addedFlowInjectPolicyColumn: false, addedEvidenceHashColumn: false });
       assert.equal(again.stats().tasks, 3, "二次打开不得改变任务数");
       assert.equal(again.getTaskRef("legacy-1").owner, "engineer");
       assert.deepEqual(again.getTaskRef("legacy-1").labels, ["bug"]);
@@ -173,7 +173,7 @@ test("迁移：owner 已有值时以字段为准，仅清理残留标签（不�
       const again = openStore({ dataDir: dir });
       try {
         // FR-17：新增 `addedCommentEditColumn`（评论编辑留痕列，老库补列）
-        assert.deepEqual(again.migration, { addedOwnerColumn: false, migratedTasks: 0, strippedLabels: 0, addedReqSeqColumn: false, addedTaskRequirementColumn: false, addedCandidateSourceColumn: false, addedTaskSessionColumn: false, addedProjectSessionColumn: false, addedClaimColumn: false, addedFailureColumn: false, addedBlockColumn: false, addedRunColumn: false, addedReviewColumn: false, addedCommentEditColumn: false, addedBoardPositionColumn: false, addedTeamMemberExecutorColumn: false, addedFlowInjectPolicyColumn: false });
+        assert.deepEqual(again.migration, { addedOwnerColumn: false, migratedTasks: 0, strippedLabels: 0, addedReqSeqColumn: false, addedTaskRequirementColumn: false, addedCandidateSourceColumn: false, addedTaskSessionColumn: false, addedProjectSessionColumn: false, addedClaimColumn: false, addedFailureColumn: false, addedBlockColumn: false, addedRunColumn: false, addedReviewColumn: false, addedCommentEditColumn: false, addedBoardPositionColumn: false, addedTeamMemberExecutorColumn: false, addedFlowInjectPolicyColumn: false, addedEvidenceHashColumn: false });
       } finally {
         again.close();
       }

@@ -11,13 +11,18 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { buildTaskPrompt, evidenceComment } from "../src/core/executor.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const SPEC = readFileSync(join(ROOT, "docs/规范/01-协作规范.md"), "utf8");
+// 卡 `-235`（需求 `R172`）：`docs/` 不进 git（`.gitignore:23`）⇒ 干净 clone 上没有规范正本。
+// 顶层不再直接 `readFileSync`（文件缺失会让**整个测试文件** ENOENT 炸掉，连不依赖 docs 的
+// 指令侧/报告侧断言也一起丢）。改为「存在才读」，依赖它的用例按 `skip` 处理并说明原因。
+const SPEC_PATH = join(ROOT, "docs/规范/01-协作规范.md");
+const SPEC_PRESENT = existsSync(SPEC_PATH);
+const SPEC = SPEC_PRESENT ? readFileSync(SPEC_PATH, "utf8") : "";
 
 /** §一 的五段 + 回报格式：字段齐备是硬要求（§七.2 反向核查口径第 1 条）。 */
 const SECTION_1 = [
@@ -183,7 +188,8 @@ test("§二 evidenceComment：边界自查逐条呼应指令红线（含 done �
 
 // ── §三 自检清单：模板与规范正本同源 ───────────────────────────────────────────
 
-test("§三 自检：规范正本存在且五段标题与代码内断言同名（口径不分叉）", () => {
+test("§三 自检：规范正本存在且五段标题与代码内断言同名（口径不分叉）",
+  { skip: SPEC_PRESENT ? false : "docs/ 未随库（gitignored）—— 干净 clone 上无规范正本" }, () => {
   // 2026-10-27：规范合并后标题层级下沉一级（## → ###），断言改为「标题文本必须存在」而不锁死级别
   for (const title of ["一、指令格式", "二、报告格式", "三、发指令前的自检清单"]) {
     assert.match(SPEC, new RegExp(`^#{2,4} ${title}`, "m"), `规范正本缺「${title}」`);

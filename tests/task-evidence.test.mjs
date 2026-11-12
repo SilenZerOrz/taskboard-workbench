@@ -139,14 +139,14 @@ test("G 三条认领入口都冻结授权：看板 PATCH / 团队通道 / 执行
   store.close();
 });
 
-test("F 迁移可重入：同一库连开两次不报错，表在、版本 14", () => {
+test("F 迁移可重入：同一库连开两次不报错，表在、版本 15", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tb-evidence-"));
   const dbPath = path.join(dir, "t.sqlite");
   const a = openStore({ dbPath });
   a.createProject({ id: "p1", name: "P" });
   a.close();
   const b = openStore({ dbPath });
-  assert.equal(SCHEMA_VERSION, 14);
+  assert.equal(SCHEMA_VERSION, 15);
   const tables = b.rawDb ? null : null; // 走公共方法验证
   const item = b.createRequirementItem({ projectId: "p1", title: "R" });
   const t = b.createTask({ projectId: "p1", title: "T", status: "in_progress", requirementId: item.id });

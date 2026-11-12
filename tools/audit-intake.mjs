@@ -16,11 +16,11 @@
  *   node tools/audit-intake.mjs --json               # 机器可读（默认就是 JSON）
  *   node tools/audit-intake.mjs --data-dir .data --project taskboard-workbench
  */
-import { mkdtempSync, copyFileSync, existsSync, readFileSync, statSync } from "node:fs";
+import { mkdtempSync, existsSync, readFileSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve, relative, extname } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, backup } from "node:sqlite";
 import { spawn } from "node:child_process";
 import { scanProjectMaterials, buildMaterialIndex } from "../src/core/intake.mjs";
 import { resolveDataDir, resolveDbPath } from "../src/core/config.mjs";
@@ -67,7 +67,9 @@ function headingStats(docs) {
 async function runE2E({ root }) {
   const dir = mkdtempSync(join(tmpdir(), "tb-intake-audit-"));
   const copy = join(dir, "taskboard.sqlite");
-  copyFileSync(dbPath, copy);
+  // 0-B-b · F6：库已切 WAL ⇒ **不能 copyFileSync**（已提交但未 checkpoint 的页还在 `-wal` 里，
+  // 只拷主文件会漏数据）。`backup()` 与 `sqlite3 .backup` 等价，WAL 下是一致的。
+  await backup(dbPath, copy);
   // 让「290」这类实测数字钉在一个**可追溯的快照**上：同一 sha256 的库应复现同一 delta。
   const snapshot = { sourcePath: dbPath, sha256: fileSha(copy), bytes: statSync(copy).size, takenAt: new Date().toISOString() };
   const child = spawn(process.execPath, ["src/server/server.mjs"], {

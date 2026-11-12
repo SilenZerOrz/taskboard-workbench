@@ -21,7 +21,10 @@ test("「新建任务」只在看板视图显示（非看板视图不再出现�
 test("「新建项目」走统一流程 createProjectFlow：POST /api/projects + 切换项目 + 绑定本会话", () => {
   assert.ok(src.includes('async function createProjectFlow()'));
   const fn = src.slice(src.indexOf("async function createProjectFlow()"));
-  assert.ok(fn.includes('api("POST", "/api/projects", { name: name.trim(), workspacePath:'));
+  // 卡 `-240`（R176）：取值从 window.prompt 改为页面内 dialog（askNewProject），
+  // 这一行仍必须直连 `POST /api/projects` —— 换的是取值方式，不是写路径。
+  assert.ok(fn.includes('const input = await askNewProject();'));
+  assert.ok(fn.includes('api("POST", "/api/projects", { name: input.name, workspacePath: input.workspacePath });'));
   assert.ok(fn.includes('state.projectId = r.project.id;'));
   assert.ok(fn.includes('await resolveBinding(state.projectId);'));
   assert.ok(src.includes('newProject.addEventListener("click", () => void createProjectFlow());'));

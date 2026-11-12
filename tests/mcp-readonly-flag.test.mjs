@@ -25,7 +25,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SERVER = path.join(ROOT, "src", "mcp", "server.mjs");
 
 const READ_TOOLS = ["flow_start", "norm_get", "project_info", "requirement_list", "workbench_audit"];
-const ALL_TOOLS = [...READ_TOOLS, "card_create", "card_progress", "requirement_change", "requirement_upsert"];
+const ALL_TOOLS = [...READ_TOOLS, "card_create", "card_evidence_submit", "card_progress", "requirement_change", "requirement_upsert"];
 
 const printTools = (extra = []) => {
   const out = spawnSync(process.execPath, [SERVER, "--print-tools", ...extra], { encoding: "utf8" });
@@ -83,7 +83,7 @@ test("P3 回滚开关 · --read-only", async (t) => {
 
   const defPrint = printTools();
   assert.equal(defPrint.readOnly, false, "默认必须是 readOnly:false");
-  assert.deepEqual([...defPrint.tools].sort(), [...ALL_TOOLS].sort(), "默认仍是 9 件（默认零变化）");
+  assert.deepEqual([...defPrint.tools].sort(), [...ALL_TOOLS].sort(), "默认清单必须与注册表一致（默认零变化）");
 
   // C：stdio 只读模式 —— 清单过滤 + 写工具调用被拒（工具错误，不是协议错误）
   const ro = startServer(dir, ["--read-only"]);

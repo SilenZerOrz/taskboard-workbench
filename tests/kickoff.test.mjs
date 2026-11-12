@@ -6,7 +6,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import os from "node:os";
@@ -480,6 +480,24 @@ test("判据命令：六步逐条实测（正例本仓 0 / 反例空目录非 0�
     res.end(JSON.stringify(payload));
   });
   const emptyDir = mkdtempSync(path.join(os.tmpdir(), "tb-kickoff-empty-"));
+  // 卡 `-235`（需求 `R172`）：正例原先跑在 `ROOT`（作者本机仓库）上，而六步的 `paths` 判据里有
+  // `AGENTS.md` / `docs/规范` 等 **gitignored** 内容 —— 干净 clone 上必然缺 ⇒ 本用例必红。
+  // 改为**自造最小满配夹具目录**：`paths` 判据由夹具满足，`setting` / `custom` 判据由下面的假服务给。
+  const fixtureDir = mkdtempSync(path.join(os.tmpdir(), "tb-kickoff-fixture-"));
+  for (const rel of [
+    "CODE_STYLE.md",                       // ① style-doc
+    "eslint.config.mjs",                   // ① linter
+    ".prettierrc",                         // ① formatter
+    "README.md",                           // ② readme
+    "CONTRIBUTING.md",                     // ② contributing
+    "CHANGELOG.md",                        // ② changelog
+    ".github/PULL_REQUEST_TEMPLATE.md",    // ③ pr-template
+    "docs/规范/README.md",                  // ⑤ knowledge（+ ② contributing 的备选路径）
+  ]) {
+    const p = path.join(fixtureDir, rel);
+    mkdirSync(path.dirname(p), { recursive: true });
+    writeFileSync(p, "# fixture（卡 -235：最小满配，只求判据可核，不代表真实内容）\n");
+  }
   try {
     await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
     const port = server.address().port;
@@ -496,17 +514,34 @@ test("判据命令：六步逐条实测（正例本仓 0 / 反例空目录非 0�
     const rows = [];
     for (const todo of todos) {
       payload = FULL;
-      const pos = await run(todo.verifyCommand, ROOT, base);
+      const pos = await run(todo.verifyCommand, fixtureDir, base);
       payload = EMPTY;
       const neg = await run(todo.verifyCommand, emptyDir, base);
       rows.push(`${todo.index}.${todo.stepId}: 正例=${pos.status} 反例=${neg.status}`);
-      assert.equal(pos.status, 0, `${todo.step}：满配 + 本仓必须通过（实际 ${pos.status}，stderr=${pos.stderr.slice(0, 300)}）\n命令：${todo.verifyCommand}`);
+      assert.equal(pos.status, 0, `${todo.step}：满配 + 最小夹具必须通过（实际 ${pos.status}，stderr=${pos.stderr.slice(0, 300)}）\n命令：${todo.verifyCommand}`);
       assert.notEqual(neg.status, 0, `${todo.step}：空配 + 空目录不得假绿（实际 ${neg.status}，stderr=${neg.stderr.slice(0, 300)}）\n命令：${todo.verifyCommand}`);
     }
-    console.log(`六步实测：\n${rows.join("\n")}`);
+    console.log(`六步实测（最小夹具）：\n${rows.join("\n")}`);
+
+    // 卡 `-235`：本机守真实性 —— 本仓若同时具备 `AGENTS.md` + `docs/规范`（作者本机形态），
+    // 六步在真仓库上也必须全 0；干净 clone 缺这些 gitignored 内容时**跳过**（不红、不静默放过）。
+    const localFull = existsSync(path.join(ROOT, "AGENTS.md")) && existsSync(path.join(ROOT, "docs/规范"));
+    if (localFull) {
+      const localRows = [];
+      for (const todo of todos) {
+        payload = FULL;
+        const r = await run(todo.verifyCommand, ROOT, base);
+        localRows.push(`${todo.index}.${todo.stepId}: 本仓=${r.status}`);
+        assert.equal(r.status, 0, `${todo.step}：本机全配仓库也必须通过（实际 ${r.status}，stderr=${r.stderr.slice(0, 300)}）\n命令：${todo.verifyCommand}`);
+      }
+      console.log(`六步实测（本机全配仓库）：\n${localRows.join("\n")}`);
+    } else {
+      console.log("六步实测（本机全配仓库）：跳过 —— 缺 AGENTS.md 或 docs/规范（干净 clone 形态）");
+    }
   } finally {
     server.close();
     server.closeAllConnections?.();
     rmSync(emptyDir, { recursive: true, force: true });
+    rmSync(fixtureDir, { recursive: true, force: true });
   }
 });

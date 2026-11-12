@@ -25,6 +25,8 @@ import { evaluateSubmittedContract, loadNorms, NORM_IDS, sha256 } from "../core/
 import { TbError } from "../core/errors.mjs";
 import { matchProjectForCwd } from "../core/binding.mjs";
 import { markAcceptance, acceptanceFlag } from "../core/acceptance.mjs";
+import { EVIDENCE_KINDS, EVIDENCE_REF_KINDS, artifactRefKindProblems } from "../core/evidence.mjs";
+import { ticketStage } from "../core/ticket-stage.mjs";
 
 /** 包根目录（仓库里 = 仓库根；npm 包里 = package 根）。`spec/norms` 在两处都随包存在。 */
 export const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -211,7 +213,10 @@ export function workbenchAudit({ store }, args = {}) {
 
 /* --------------------------------------------------- P3：写工具 + 条目列表 ---- */
 
-const EVIDENCE_KINDS = Object.freeze(["file", "command", "url", "reading"]);
+// `EVIDENCE_KINDS` 现在只有一处定义（`src/core/evidence.mjs`）—— 三个入口共用，避免各写一份漂移。
+// `card_progress` 只收**过程性证据**（command/url/reading/file）；`commit` 属交付证据（`card_evidence_submit`），
+// 从同一个枚举里派生而不是另写一份，这样新增 kind 时只改一处。
+const PROCESS_EVIDENCE_KINDS = Object.freeze(EVIDENCE_KINDS.filter((k) => k !== "commit"));
 /** 条目「版本」：`requirement_items` 没有 version 列 ⇒ 用**内容摘要**当乐观锁（纯读、可重算、与行数无关）。 */
 const REQ_VERSION_FIELDS = Object.freeze(["title", "description", "acceptance", "priority", "status"]);
 
@@ -250,7 +255,7 @@ function normalizeEvidence(list) {
     throw fail(
       "EVIDENCE_REQUIRED",
       "回填进度必须带 evidence[]（非空数组），每项 {kind, ref, note?}；只写「已完成」三个字不算证据",
-      { allowedKinds: EVIDENCE_KINDS },
+      { allowedKinds: PROCESS_EVIDENCE_KINDS },
     );
   }
   return list.map((raw, i) => {
@@ -258,8 +263,8 @@ function normalizeEvidence(list) {
       throw fail("EVIDENCE_INVALID", `evidence[${i}] 必须是对象 {kind, ref, note?}`, { index: i });
     }
     const kind = String(raw.kind ?? "").trim();
-    if (!EVIDENCE_KINDS.includes(kind)) {
-      throw fail("EVIDENCE_INVALID", `evidence[${i}].kind 必须是 ${EVIDENCE_KINDS.join(" / ")} 之一`, { index: i, received: kind, allowedKinds: EVIDENCE_KINDS });
+    if (!PROCESS_EVIDENCE_KINDS.includes(kind)) {
+      throw fail("EVIDENCE_INVALID", `evidence[${i}].kind 必须是 ${PROCESS_EVIDENCE_KINDS.join(" / ")} 之一`, { index: i, received: kind, allowedKinds: EVIDENCE_KINDS });
     }
     const ref = String(raw.ref ?? "").trim();
     if (ref === "") {
@@ -586,6 +591,59 @@ export function cardProgress({ store }, args = {}) {
   };
 }
 
+/* ---------------- card_evidence_submit（写 · 交付证据 · FR-106 / 0-B-b） ---------------- */
+
+/**
+ * 交付证据写入口（MCP 侧）。与 HTTP `POST /api/tasks/:ref/evidence` **同源**。
+ *
+ * 刻意**不接受**「只给 `evidence[]`」的调用形态：`store.addTaskEvidence` 的四字段硬门会整笔拒，
+ * 工具一上线就是死的。要写过程性证据（command / url / reading）请走 `card_progress`；
+ * 这里只写**交付证据**（verdict / deviation / boundary / artifacts）。
+ */
+export function cardEvidenceSubmit({ store, agentId }, args = {}) {
+  const ref = [args.card, args.ref, args.task]
+    .find((x) => typeof x === "string" && x.trim() !== "")?.trim() ?? "";
+  if (ref === "") throw fail("USAGE_ERROR", "card_evidence_submit 需要 card（任务编号或 id）", {});
+  const task = store.requireTaskRef(ref);
+
+  const submittedRefs = args.artifact_refs ?? args.artifactRefs;
+  const badKinds = artifactRefKindProblems(submittedRefs);
+  if (badKinds.length) {
+    throw fail("INVALID_ARTIFACT_REF", `artifact_refs 只接受 ${EVIDENCE_REF_KINDS.join(" / ")}（非法项：第 ${badKinds.map((b) => b.index + 1).join("、")} 项）`, { problems: badKinds });
+  }
+
+  const evidence = store.addTaskEvidence(task.identifier, {
+    verdict: args.verdict,
+    deviation: args.deviation,
+    boundary: args.boundary,
+    artifacts: args.artifacts,
+    artifactRefs: submittedRefs,
+    // 身份不是自报：默认取**进程身份**（`--agent-id`），显式 `actor_id` 只在测试里用。
+    actor: args.actor_id ?? agentId ?? "agent",
+  });
+
+  const after = store.requireTaskRef(task.identifier);
+  return {
+    card: {
+      identifier: after.identifier,
+      status: after.status,
+      version: after.version,
+      requirementId: after.requirementId ?? null,
+    },
+    evidence: {
+      id: evidence.id,
+      deduped: Boolean(evidence.deduped),
+      refsState: evidence.refsState,
+      evidenceHash: evidence.evidenceHash ?? null,
+      actor: evidence.actor,
+      artifacts: evidence.artifacts,
+      artifactRefs: evidence.artifactRefs,
+    },
+    ticketStage: ticketStage(after, { evidence, comments: store.listComments(after.id) }),
+    contract: contractReadout(store, task.projectId, args.contract),
+  };
+}
+
 /* ------------------------------------------------------------------ 注册表 ---- */
 
 const ok = (schema) => schema;
@@ -734,6 +792,39 @@ export const TOOLS = Object.freeze([
     handler: cardCreate,
   },
   {
+    name: "card_evidence_submit",
+    description: "提交交付证据（写）。四字段**必填**：verdict / deviation / boundary / artifacts（缺一 ⇒ EVIDENCE_INCOMPLETE，零落库）。artifact_refs 只接受 commit / file（其余 ⇒ INVALID_ARTIFACT_REF）。同指纹重复提交幂等（返回首次结果、不增行）。与 HTTP POST /api/tasks/:ref/evidence 同源。",
+    inputSchema: ok({
+      type: "object",
+      required: ["card", "verdict", "deviation", "boundary", "artifacts"],
+      properties: {
+        card: { type: "string", description: "任务编号或 id" },
+        verdict: { type: "string", description: "判定（做了什么、结论是什么）" },
+        deviation: { type: "string", description: "偏离说明（没按原计划做的部分都写这里；不写=隐藏信息）" },
+        boundary: { type: "string", description: "边界自查（未取得/无法判定的读数必须明说）" },
+        artifacts: { type: "array", items: { type: "string" }, description: "产物路径 / 命令 / 指纹（非空）" },
+        artifact_refs: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              kind: { type: "string", enum: [...EVIDENCE_REF_KINDS] },
+              ref: { type: "string" },
+              note: { type: "string" },
+            },
+            required: ["kind", "ref"],
+            additionalProperties: false,
+          },
+          description: "需要核验的产物引用（仅 commit / file）",
+        },
+        contract: { type: "object", description: "调用方用的契约（warn 档：只留痕不阻断）" },
+      },
+      additionalProperties: false,
+    }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    handler: cardEvidenceSubmit,
+  },
+  {
     name: "card_progress",
     description: "回填进度（写）。**证据必填**（evidence[] 非空，每项 {kind:file|command|url|reading, ref, note?}）+ **norm_digest 必填**（card-update 规范的 sha256）。状态走执行侧门：done 只能人点。",
     inputSchema: ok({
@@ -747,7 +838,7 @@ export const TOOLS = Object.freeze([
           items: {
             type: "object",
             properties: {
-              kind: { type: "string", enum: ["file", "command", "url", "reading"] },
+              kind: { type: "string", enum: [...PROCESS_EVIDENCE_KINDS] },
               ref: { type: "string" },
               note: { type: "string" },
             },

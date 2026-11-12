@@ -6,7 +6,7 @@
  * 幂等：项目已存在且有任务则跳过（重复跑安全）。
  * 用法：TB_DATA_DIR=<目录> node tools/seed-docs.mjs      # 默认与插件同默认目录（os.tmpdir()/tb-workbench-mvp-a）
  */
-import { copyFileSync, existsSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 
 import { resolveDataDir, resolveDbPath } from "../src/core/config.mjs";
@@ -18,7 +18,13 @@ const REPLACE = process.argv.includes("--replace") || process.env.SEED_REPLACE =
 function resetDatabase(dbPath) {
   if (existsSync(dbPath)) {
     const backup = `${dbPath}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-    try { copyFileSync(dbPath, backup); console.log(`[replace] 已备份：${backup}`); } catch (e) { console.warn(`[replace] 备份失败（继续）：${e.message}`); }
+    // 0-B-b · F6：库已切 WAL ⇒ 不能拷贝主文件（漏 `-wal` 里未 checkpoint 的已提交页）。
+    // `VACUUM INTO` 是同步的、且跨 journal 模式都给一致快照（等价 `.backup`）。
+    try {
+      const src = new DatabaseSync(dbPath);
+      try { src.exec(`vacuum into '${backup.replace(/'/g, "''")}'`); } finally { src.close(); }
+      console.log(`[replace] 已备份：${backup}`);
+    } catch (e) { console.warn(`[replace] 备份失败（继续）：${e.message}`); }
   }
   const db = new DatabaseSync(dbPath);
   // 全新/空的 DB 里还没有任何表：此时无可清空，交给 openStore 建表即可（否则 delete from tasks 会报 no such table）。

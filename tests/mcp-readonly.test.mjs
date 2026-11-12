@@ -3,7 +3,7 @@
  *
  * 判据（对齐方案 §6.1/§6.2/§7.3）：
  *   A stdio 握手：`initialize` 回协议版本 + `tools` 能力 + serverInfo
- *   B `tools/list`：**只读恰好五件**（`readOnlyHint` 不得跑到写四件上），共 9 个工具
+ *   B `tools/list`：**只读恰好五件**（`readOnlyHint` 不得跑到写件上），共 10 个工具
  *   C `flow_start`：项目 + contract_version + gaps（未归因 / 未绑定 / 待确认候选）+ 下一步建议
  *   D `project_info`：计数与库内一致
  *   E `norm_get`：正文 + digest；未知规范 ⇒ `NORM_NOT_FOUND`（工具错误，不是协议错误）
@@ -84,12 +84,12 @@ test("P2 · MCP 只读四工具（stdio 握手 + 只读保证）", async (t) => 
     assert.ok(init.result.capabilities.tools);
     child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
 
-    // B 工具清单：P2 只读四件 + P3 写四件与条目列表（共 9）
+    // B 工具清单：P2 只读四件 + P3 写四件与条目列表 + 0-B-b 交付证据（共 10）
     // 这里守的是**只读那四件的边界**：readOnlyHint 必须恰好在它们身上 ——
     // 写工具若被误标 readOnlyHint，客户端会以为「调用无副作用」而放心重试（那才是灾难）。
     const list = await rpc("tools/list", {});
     const names = list.result.tools.map((x) => x.name).sort();
-    assert.deepEqual(names, ["card_create", "card_progress", "flow_start", "norm_get", "project_info",
+    assert.deepEqual(names, ["card_create", "card_evidence_submit", "card_progress", "flow_start", "norm_get", "project_info",
       "requirement_change", "requirement_list", "requirement_upsert", "workbench_audit"]);
     const readOnly = list.result.tools.filter((x) => x.annotations?.readOnlyHint).map((x) => x.name).sort();
     // P3 的 `requirement_list` 也是纯读（只是 P2 没做），所以这里列 5 件；**写四件一个都不许进来**。

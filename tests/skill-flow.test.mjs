@@ -5,7 +5,7 @@
  *   A frontmatter 齐全（`name` / `version` / `updated` / `applies_to` / `requires_contract`）
  *   B 八步一步不缺：S0…S7 全在；表头含**六栏**（入口 / 前置门 / 判据 / 证据落点 / 失败处置 / 对应 FR）；
  *     每行这六栏**都非空**（空一格＝这一步没写完）
- *   C 每步「入口」里点名的工具**必须真实存在**于 `src/mcp/tools.mjs`；反向：注册表里的 9 个工具
+ *   C 每步「入口」里点名的工具**必须真实存在**于 `src/mcp/tools.mjs`；反向：注册表里的全部工具
  *     **每一个都必须在 skill 里被提到**（防"加了工具没人知道"）
  *   D `requires_contract` 与当前契约材料主版本一致（`v1`）—— 哈希版本没法比大小，只能比主版本
  *   E **档 A / 档 B 同源**：`buildFlowBlock()`（进程内）=== MCP prompt `taskboard.flow`（真子进程）
@@ -72,7 +72,7 @@ test("P4/B 八步一步不缺 · 六栏齐全 · 每格非空", () => {
 });
 
 /* ---------------- C ---------------- */
-test("P4/C 入口点名的工具真实存在 + 9 个工具逐个被提到", () => {
+test("P4/C 入口点名的工具真实存在 + 注册表里的工具逐个被提到", () => {
   const headerCells = cells(HEADER);
   const entryIdx = headerCells.indexOf("入口");
   assert.ok(entryIdx >= 0);

@@ -8,7 +8,8 @@
  * 用法：
  *   node src/mcp/server.mjs --data-dir <dir>     # 由 MCP 客户端作为子进程拉起
  *   node src/mcp/server.mjs --print-tools        # 打印工具清单（调试 / 守卫测试用）
- *   node src/mcp/server.mjs --read-only          # **只读模式**（P3 的回滚开关）：写四件不出现在 tools/list，调用即 READ_ONLY_MODE
+ *   node src/mcp/server.mjs --read-only          # **只读模式**（P3 的回滚开关）：写件不出现在 tools/list，调用即 READ_ONLY_MODE
+ *   node src/mcp/server.mjs --agent-id <id>      # 0-B-b：登记进程级本地身份（缺省生成匿名 id 落盘）
  *
  * 传输：newline-delimited JSON-RPC 2.0（MCP stdio transport）。
  * stdout **只允许**出现协议消息；日志一律走 stderr（否则客户端解析失败）。
@@ -37,9 +38,9 @@ const ACTIVE_TOOLS = READ_ONLY ? TOOLS.filter((t) => t.annotations?.readOnlyHint
 const ACTIVE_NAMES = ACTIVE_TOOLS.map((t) => t.name);
 
 if (has("--help") || has("-h")) {
-  process.stderr.write(`taskboard-workbench MCP server（9 个工具：只读五 / 写四 · prompt 1）
-用法: node src/mcp/server.mjs [--data-dir <dir>] [--print-tools] [--read-only]
-只读: --read-only 关闭写四件（card_create / card_progress / requirement_upsert / requirement_change）——P3 的回滚开关
+  process.stderr.write(`taskboard-workbench MCP server（${TOOL_NAMES.length} 个工具：只读五 / 写五 · prompt 1）
+用法: node src/mcp/server.mjs [--data-dir <dir>] [--agent-id <id>] [--print-tools] [--read-only]
+只读: --read-only 关闭写件（card_create / card_progress / card_evidence_submit / requirement_upsert / requirement_change）——P3 的回滚开关
 工具: ${TOOL_NAMES.join(", ")}
 提示: prompt taskboard.flow（= node scripts/tb-flow.mjs start 的输出）
 数据: --data-dir > $TB_DATA_DIR > 默认（同 Web/CLI）
@@ -56,10 +57,22 @@ if (has("--print-tools")) {
 
 const dataDir = argOf("--data-dir") ?? process.env.TB_DATA_DIR ?? undefined;
 const store = openStore({ dataDir, env: process.env });
-const ctx = { store };
+// 0-B-b（FR-108）：**进程级本地身份**。`--agent-id` 显式给就复用那一行；不给就生成匿名 id 并落盘
+// （不是"每次调用一个新 id" —— 同一进程内只有一个 id，重启才可能换）。
+// 注意边界：`token_hash` 只是建表留接口，stdio MCP **没有鉴权通道**，这里**不宣称鉴权生效**。
+// ⚠ `--read-only` 是**零写入**的回滚开关：只读模式下**不登记**（登记本身是一条 insert），
+// 用一个不落库的进程内身份代替 —— 否则"只读"会变成"只读 + 悄悄写一行 agents"。
+const agent = READ_ONLY
+  ? { id: argOf("--agent-id") ?? "readonly", created: false, persisted: false }
+  : { ...store.registerAgent({
+    id: argOf("--agent-id") ?? undefined,
+    displayName: argOf("--agent-name") ?? "",
+    kind: "agent",
+  }), persisted: true };
+const ctx = { store, agentId: agent.id };
 let skillMeta = null;
 try { skillMeta = readSkill().meta; } catch { /* skill 缺失时不影响工具面；prompts/* 会报出具体原因 */ }
-process.stderr.write(`[tb-mcp] ready dataDir=${store.dataDir} readOnly=${READ_ONLY} tools=${ACTIVE_NAMES.join(",")} prompt=taskboard.flow skill=${skillMeta ? `v${skillMeta.version}` : "missing"}\n`);
+process.stderr.write(`[tb-mcp] ready dataDir=${store.dataDir} readOnly=${READ_ONLY} agent=${agent.id}${agent.created ? "(new)" : ""} tools=${ACTIVE_NAMES.join(",")} prompt=taskboard.flow skill=${skillMeta ? `v${skillMeta.version}` : "missing"}\n`);
 
 const SERVER_INFO = { name: "taskboard-workbench", version: pkg.version };
 const DEFAULT_PROTOCOL = "2025-06-18";

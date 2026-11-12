@@ -11,7 +11,7 @@
  *      api 三个建会话点都带 title，任务执行会话同时补 `cwd`（否则落在进程目录）。
  */
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -243,7 +243,7 @@ test("FR-95-14：宿主端口接线 —— 建完再 rename（不指望 create �
   assert.match(source, /titleApplied: named\.titleApplied, titleReason: named\.titleReason/);
 });
 
-test("FR-95-15：api 三处建会话点 + 命名规范文档落盘", () => {
+test("FR-95-15：api 三处建会话点", () => {
   const source = read("src/server/api.mjs");
   assert.match(source, /import \{ taskSessionTitle, projectMainSessionTitle \} from "\.\.\/core\/session-naming\.mjs";/);
   assert.match(source, /const mainSessionName = projectMainSessionTitle\(project\.name, \{ note: project\.initialSessionId \? "重建" : null \}\);/);
@@ -252,10 +252,17 @@ test("FR-95-15：api 三处建会话点 + 命名规范文档落盘", () => {
   assert.match(source, /sessionName = taskSessionTitle\(execTask\.title\);/);
   assert.match(source, /title: sessionName,/);
   assert.match(source, /cwd: store\.getProject\(execTask\.projectId\)\?\.workspacePath \?\? undefined/);
-  // 命名口径必须有规范文档承接（否则只是代码里的约定）
-  const doc = read("docs/规范/01-协作规范.md");
-  for (const needle of ["【任务】", "【项目】", "重绑", "评审"]) assert.ok(doc.includes(needle), `规范文档缺「${needle}」`);
 });
+
+// 命名口径必须有规范文档承接（否则只是代码里的约定）。
+// 卡 `-235`（需求 `R172`）：`docs/` 不进 git ⇒ 干净 clone 上没有这份规范。断言**不删**：
+// 文档在就按内容校验，不在就 `skip` 并说明 —— 不得把「缺文档」伪装成「通过」。
+const COLLAB_DOC = path.join(ROOT, "docs/规范/01-协作规范.md");
+test("FR-95-15b：命名规范文档落盘（docs 未随库时跳过）",
+  { skip: existsSync(COLLAB_DOC) ? false : "docs/ 未随库（gitignored）—— 干净 clone 上无规范正本" }, () => {
+    const doc = read("docs/规范/01-协作规范.md");
+    for (const needle of ["【任务】", "【项目】", "重绑", "评审"]) assert.ok(doc.includes(needle), `规范文档缺「${needle}」`);
+  });
 
 // ------------------------------------------- E. 回包带名字：UI 才有东西可展示（2026-10-26 补）
 

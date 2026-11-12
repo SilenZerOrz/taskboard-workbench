@@ -7,7 +7,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { openStore } from "../src/core/store.mjs";
@@ -73,6 +73,11 @@ test("FR-22 · 开局提示词：不再指「仓库 spec/团队agent.md」，改
 });
 
 test("FR-22 · 规范正本随包路径可达（文件确实存在于仓库内、可被 npm pack 读取）", () => {
-  assert.match(root, /03taskboard_workbench\/?$/, "测试运行在仓库根");
+  // 卡 `-235`（需求 `R172`）：原判据钉的是**目录名** `03taskboard_workbench`，而干净 clone 的目录名由人决定
+  // （`git clone <url>` 默认取仓库名，改个名就红）⇒ 直接让「clone 即绿」不成立。改为按**路径**核验：
+  // 规范正本必须真实可读且非空。注意 `fs.realpathSync` 修不了原判据 —— 钉的是目录名，不是软链。
+  const specPath = fileURLToPath(new URL("../spec/\u56e2\u961fagent.md", import.meta.url));
+  assert.ok(existsSync(specPath), `规范正本须存在：${specPath}`);
+  assert.ok(statSync(specPath).size > 0, "规范正本文件不得为空");
   assert.ok(spec.length > 0, "规范正本非空");
 });

@@ -4,7 +4,7 @@
  * owner 为 tasks 正式列（t24）——老库的 `owner:<role>` 标签在打开时一次性迁移（幂等）。
  * 注意：tasks_owner_idx 只在迁移函数里创建（老库建表语句是 no-op，提前建索引会因缺列失败）。
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
@@ -31,14 +31,15 @@ import {
   deriveDetailState,
 } from "./requirements.mjs";
 import { TEAM_WRITABLE_STATUSES } from "./team.mjs";
-import { evidenceProblems, normalizeArtifactRefs, verifyArtifactRefs } from "./evidence.mjs";
+import { evidenceProblems, makeResolver, normalizeArtifactRefs, verifyArtifactRefs } from "./evidence.mjs";
 import { REVIEW_SOURCE_STATUSES, REVIEW_IDLE_MS, detectReviewDeadlock, reviewReturnStatus } from "./review.mjs";
 import { NOTIFY_DELIVERY_MODES, buildNotifyMessage, normalizeDeliveryMode, selectNotifyEvents } from "./notify.mjs";
 import { HUMAN_REVIEW_LABEL, assertConclusion, categoryLabel, conclusionOutcome, isHumanReviewTask, validateHumanReviewDraft } from "./human-review.mjs";
 // 项目记忆（2026-10-28 拍板 D-M1）：L2 记忆条目，与内核表同库；**不是第二真源**（必带 provenance）。
 import { createMemoryApi } from "./memory.mjs";
+import { createLeaseApi } from "./instance-lease.mjs";
 
-export const SCHEMA_VERSION = 14; // 14：项目设置 flow_inject_policy（P5 档 C · 卡 -210）；13：交付物证据 task_evidence + 授权快照 task_mandates（0-B · 卡 -197）；12：契约快照
+export const SCHEMA_VERSION = 15; // 15：agents / agent_sessions + task_evidence.evidence_hash + WAL（0-B-b · 卡 -239）；14：项目设置 flow_inject_policy（P5 档 C · 卡 -210）；13：交付物证据 task_evidence + 授权快照 task_mandates（0-B · 卡 -197）；12：契约快照
 // 条目化数量口径（卡 `-169` P4②）：定义在 requirements.mjs（纯模块），此处转发以便调用方就近取用。
 export { clampElaborateLimit, DEFAULT_ELABORATE_LIMIT, MAX_ELABORATE_LIMIT, ELABORATE_PREVIEW_SIZE };
 
@@ -288,6 +289,8 @@ create table if not exists task_evidence (
   verdict text not null, deviation text not null default '', boundary text not null default '',
   artifacts text not null default '[]', artifact_refs text not null default '[]',
   refs_state text not null default 'unchecked',
+  -- 0-B-b（FR-106 第 5 条）：同一份证据重复提交按指纹幂等（返回首次结果、不增行）
+  evidence_hash text,
   actor text not null, task_version integer not null, created_at text not null
 );
 create index if not exists task_evidence_task_idx on task_evidence(task_id, created_at);
@@ -297,6 +300,24 @@ create table if not exists task_mandates (
   id text primary key, task_id text not null references tasks(id) on delete cascade,
   requirement_ref text, contract_version text, norms_digest text,
   scope text not null default '', claim_owner text, claim_source text, created_at text not null
+);
+-- agent 身份（FR-108 / 0-B-b）：**进程级本地身份**，不是鉴权体系。
+-- token_hash 只建表留接口 —— stdio MCP 没有鉴权通道，令牌要等 S3 才有载体；
+-- 所以**任何地方都不得以「有这张表」为由宣称鉴权已生效**。
+create table if not exists agents (
+  id text primary key,
+  kind text not null default 'agent' check (kind in ('human','agent')),
+  display_name text not null default '',
+  token_hash text,
+  permission_profile text,
+  created_at text not null
+);
+-- 身份 ≠ 会话：会话绑定只是 agent 的**可选**属性（未绑定会话的本地 agent 同样有身份）。
+create table if not exists agent_sessions (
+  agent_id text not null references agents(id) on delete cascade,
+  session_id text,
+  bound_at text not null,
+  primary key (agent_id, session_id)
 );
 create index if not exists task_mandates_task_idx on task_mandates(task_id, created_at);
 
@@ -700,11 +721,36 @@ function rowToTaskEvidence(row) {
     id: row.id, taskId: row.task_id,
     verdict: row.verdict, deviation: row.deviation, boundary: row.boundary,
     artifacts: safeJsonArray(row.artifacts), artifactRefs: safeJsonArray(row.artifact_refs),
-    refsState: row.refs_state, actor: row.actor, taskVersion: row.task_version, createdAt: row.created_at,
+    refsState: row.refs_state, evidenceHash: row.evidence_hash ?? null,
+    actor: row.actor, taskVersion: row.task_version, createdAt: row.created_at,
+  };
+}
+function rowToAgent(row) {
+  return {
+    id: row.id, kind: row.kind, displayName: row.display_name,
+    // 注意：**不回传 token_hash 原文之外的任何东西** —— 这里只如实标注"有没有登记过"，
+    // 不把哈希值抛给调用方（哈希本身也不该在 UI/日志里流转）。
+    hasTokenHash: Boolean(row.token_hash),
+    permissionProfile: row.permission_profile ?? null, createdAt: row.created_at,
   };
 }
 function safeJsonArray(raw) {
   try { const v = JSON.parse(raw ?? "[]"); return Array.isArray(v) ? v : []; } catch { return []; }
+}
+/**
+ * 证据指纹（FR-106 第 5 条 / 0-B-b）：同一次回填重复调用不该长第二行。
+ *
+ * 为什么用 sha256 而不是拿内容建唯一索引：内容列是 JSON 文本，顺序一变就不等；
+ * 指纹先归一（固定字段序 + 归一后的 refs），同一份证据无论怎么传都得到同一个值。
+ * 与 `src/mcp/tools.mjs` 的 `evidenceHash` **不是一回事**：那个给评论去重、只覆盖 `evidence[]`。
+ */
+function evidenceFingerprint({ verdict, deviation, boundary, artifacts, refs }) {
+  const material = JSON.stringify({
+    verdict, deviation, boundary,
+    artifacts: [...artifacts],
+    refs: (refs ?? []).map((r) => [r.kind, r.ref, r.note ?? ""]),
+  });
+  return createHash("sha256").update(material).digest("hex").slice(0, 32);
 }
 
 export function migrateOwnerField(db) {
@@ -759,6 +805,24 @@ export function migrateTeamMembers(db) {
     return { addedTeamMemberExecutorColumn: true };
   }
   return { addedTeamMemberExecutorColumn: false };
+}
+
+/**
+ * 迁移（幂等，0-B-b）：老库的 `task_evidence` 补 `evidence_hash` 列 + 指纹索引。
+ *
+ * 为什么必须用迁移而不是只改建表语句：`create table if not exists` 对已存在的表是 no-op，
+ * 老库（schema 14）不会自动长出新列 —— 那样「幂等提交」在存量库上会直接报 no column。
+ */
+export function migrateTaskEvidenceHash(db) {
+  const columns = db.prepare("pragma table_info(task_evidence)").all().map((row) => row.name);
+  if (columns.length === 0) return { addedEvidenceHashColumn: false };
+  if (!columns.includes("evidence_hash")) {
+    db.exec("alter table task_evidence add column evidence_hash text");
+    db.exec("create index if not exists task_evidence_hash_idx on task_evidence(task_id, evidence_hash)");
+    return { addedEvidenceHashColumn: true };
+  }
+  db.exec("create index if not exists task_evidence_hash_idx on task_evidence(task_id, evidence_hash)");
+  return { addedEvidenceHashColumn: false };
 }
 
 /** 迁移（幂等）：老库的 projects 表补 `next_req_seq` 列（需求条目编号序列）。 */
@@ -1000,8 +1064,14 @@ export function openStore(options = {}) {
     db = new DatabaseSync(dbPath);
     db.exec("pragma foreign_keys = on");
     db.exec("pragma busy_timeout = 5000");
+    // 0-B-b · F6：`WAL` —— 读写不互相阻塞（Web 读看板时 MCP/CLI 仍可写）。
+    // **连带义务**：备份不能只拷 `.sqlite`（已提交但未 checkpoint 的页在 `-wal` 里），
+    // 必须走 `.backup` / `VACUUM INTO`；`tools/baseline-metrics.mjs` 已用 `backup()`，
+    // `tools/audit-intake.mjs` 与 `tools/seed-docs.mjs` 本轮一并改掉 `copyFileSync`。
+    // `:memory:` 不支持 WAL（也无意义），显式跳过。
+    if (dbPath !== ":memory:") db.exec("pragma journal_mode = wal");
     db.exec(SCHEMA_SQL);
-    migration = { ...migrateOwnerField(db), ...migrateRequirementSeq(db), ...migrateTeamMembers(db) };
+    migration = { ...migrateOwnerField(db), ...migrateRequirementSeq(db), ...migrateTeamMembers(db), ...migrateTaskEvidenceHash(db) };
   } catch (error) {
     const wrapped = new TbError(
       "STORE_UNAVAILABLE",
@@ -2611,12 +2681,38 @@ export function openStore(options = {}) {
     },
     // ---------------- 评审流程（FR-83） ----------------
     /**
+     * 缺省评审者（卡 `-244` / 需求 `R178`）：项目团队模板里含 `review` 的角色名。
+     *
+     * 为什么要有：`requestReview` 不传 reviewer 时原来一律留空，而 `detectReviewDeadlock`
+     * 对「reviewer 为空且超过阈值」**必然**产出 `unassigned` 死锁（`review.mjs:73-79`）——
+     * 即「待验收」只要没人手填评审者就注定变高危诊断。真机里 8 张卡 reviewer 全空、
+     * vibe-5/6 挂 37 分钟，就是这条的产物。
+     * 找不到 review 角色（或项目没配团队模板）⇒ 仍返回 null，**旧行为一字不变**。
+     */
+    pickDefaultReviewer(projectId) {
+      try {
+        const roles = store.getProjectSettings(projectId)?.teamTemplate?.roles;
+        const norm = (name) => String(name ?? "").trim().toLowerCase();
+        if (Array.isArray(roles)) {
+          const hit = roles.map((r) => norm(r?.role ?? r)).find((n) => n.includes("review"));
+          if (hit) return hit;
+        } else if (roles && typeof roles === "object") {
+          const hit = Object.keys(roles).map(norm).find((n) => n.includes("review"));
+          if (hit) return hit;
+        }
+      } catch { /* 项目设置读不到 ⇒ 不指派，保持旧行为 */ }
+      return null;
+    },
+    /**
      * 请求评审（FR-83 的一等流程）：进「待验收」+ **指派评审者** + 记下**来源列**（返工退回哪一列）。
      * 释放实现认领（FR-77）；执行成功照 FR-78 记账；事件流写 `review_requested`。
      */
     requestReview(ref, { reviewer = null, dependsOn = null, comment = "", actor = "team", now = null } = {}) {
       const task = store.requireTaskRef(ref);
       const at = new Date(now ?? Date.now()).toISOString();
+      // 卡 `-244`（R178）：显式传了的优先；没传就按项目团队模板补一个评审角色，
+      // 否则「待验收」必然在阈值后变成 `unassigned` 评审死锁。
+      const assigned = reviewer ?? store.pickDefaultReviewer(task.projectId);
       // 来源列：第一次提交时记下当前列；返工后重提则**沿用**上次来源列（保证返工总回同一实现列）
       const source = task.status === "in_review"
         ? (task.reviewSourceStatus ?? "in_progress")
@@ -2627,13 +2723,17 @@ export function openStore(options = {}) {
               review_depends_on = case when ? is null then review_depends_on else ? end,
               claim_lock = null, claim_expires = null, claim_owner = null, last_heartbeat_at = null,
               version = version + 1, updated_at = ? where id = ?`,
-      ).run(reviewer, at, source, dependsOn, dependsOn, at, task.id);
+      ).run(assigned, at, source, dependsOn, dependsOn, at, task.id);
       if (comment) store.addComment(task.id, { body: comment });
       store.markTaskSucceeded(task.identifier); // FR-78：产出已提交待验收 = 本次执行成功
-      store.recordTaskEvent(task.id, { type: "status_changed", from: task.status, to: "in_review", actor });
-      store.recordTaskEvent(task.id, { type: "review_requested", to: "in_review", actor, detail: `${reviewer ? `指派评审者 ${reviewer}` : "未指派评审者"}·来源列 ${source}${comment ? `｜${comment}` : ""}` });
+      // 卡 `-245`（R178）：已经在「待验收」再点一次，是同态迁移 —— 不写空转事件
+      // （真机 8 卡攒了 16 条 `in_review→in_review`，纯日志噪音）。`review_requested` 照写，动作本身要留痕。
+      if (task.status !== "in_review") {
+        store.recordTaskEvent(task.id, { type: "status_changed", from: task.status, to: "in_review", actor });
+      }
+      store.recordTaskEvent(task.id, { type: "review_requested", to: "in_review", actor, detail: `${assigned ? `指派评审者 ${assigned}` : "未指派评审者"}·来源列 ${source}${comment ? `｜${comment}` : ""}` });
       const next = store.getTaskById(task.id);
-      if (!reviewer) {
+      if (!assigned) {
         try { store.addComment(task.id, { body: `待评审（未指派评审者）：${REVIEW_IDLE_MS / 60000} 分钟无人处理将产出「评审死锁」诊断。` }); } catch { /* ignore */ }
       }
       return { task: next, review: { state: next.reviewState, reviewer: next.reviewer, sourceStatus: source, round: next.reviewRound }, deadlock: detectReviewDeadlock(store, next) };
@@ -2828,6 +2928,15 @@ export function openStore(options = {}) {
      * 不留半条记录。`refs_state` 由调用方给定的 `resolve` 决定（不给则 `unchecked`）：解不开的
      * `artifact_refs` 永远不许被当作"已校验通过"。
      */
+    /**
+     * 写一条交付物证据（FR-106 的唯一落库点：MCP `card_evidence_submit` 与 HTTP `POST /api/tasks/:ref/evidence` 都走这里）。
+     *
+     * 三条口径（0-B-b 卡 `-239`）：
+     *   ① **四字段硬门**在事务前 —— 缺一即 `EVIDENCE_INCOMPLETE`，零落库（既有行为，不改）；
+     *   ② **核验 root 绑 `project.workspacePath`** —— 不传 `resolve` 时用项目工作区，**不用 `process.cwd()`**
+     *      （MCP 子进程的 cwd 是客户端目录，拿它核验等于核到别的仓库）；
+     *   ③ **同指纹幂等** —— 同一张卡上 `evidenceHash` 相同 ⇒ 返回首次那条，不增行。
+     */
     addTaskEvidence(ref, input = {}) {
       const task = store.requireTaskRef(ref);
       const problems = evidenceProblems(input);
@@ -2836,15 +2945,28 @@ export function openStore(options = {}) {
       }
       const artifacts = (Array.isArray(input.artifacts) ? input.artifacts : []).map((a) => String(a).trim()).filter(Boolean);
       const refs = normalizeArtifactRefs(input.artifactRefs);
-      const verified = verifyArtifactRefs(refs, input.resolve);
+      // 核验器：调用方给就用调用方的（测试注入），否则**必须**按项目工作区建。
+      let resolver = input.resolve;
+      if (typeof resolver !== "function") {
+        const project = store.getProject(task.projectId);
+        resolver = makeResolver({ root: project?.workspacePath ?? null });
+      }
+      const verified = verifyArtifactRefs(refs, resolver);
+      const verdict = String(input.verdict).trim();
+      const deviation = String(input.deviation ?? "").trim();
+      const boundary = String(input.boundary ?? "").trim();
+      const evidenceHash = evidenceFingerprint({ verdict, deviation, boundary, artifacts, refs });
+      const existing = db.prepare("select * from task_evidence where task_id = ? and evidence_hash = ? order by created_at, rowid limit 1").get(task.id, evidenceHash);
+      if (existing) return { ...rowToTaskEvidence(existing), deduped: true };
       const id = randomUUID();
       const at = nowIso();
       db.prepare(
-        `insert into task_evidence (id, task_id, verdict, deviation, boundary, artifacts, artifact_refs, refs_state, actor, task_version, created_at)
-         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(id, task.id, String(input.verdict).trim(), String(input.deviation ?? "").trim(), String(input.boundary ?? "").trim(),
-        JSON.stringify(artifacts), JSON.stringify(refs), verified.state, String(input.actor ?? "agent"), Number(task.version), at);
-      return store.getTaskEvidenceById(id);
+        `insert into task_evidence (id, task_id, verdict, deviation, boundary, artifacts, artifact_refs, refs_state, evidence_hash, actor, task_version, created_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(id, task.id, verdict, deviation, boundary,
+        JSON.stringify(artifacts), JSON.stringify(refs), verified.state, evidenceHash,
+        String(input.actor ?? "agent"), Number(task.version), at);
+      return { ...store.getTaskEvidenceById(id), deduped: false };
     },
     getTaskEvidenceById(id) {
       const row = db.prepare("select * from task_evidence where id = ?").get(id);
@@ -2853,6 +2975,42 @@ export function openStore(options = {}) {
     listTaskEvidence(ref) {
       const task = store.requireTaskRef(ref);
       return db.prepare("select * from task_evidence where task_id = ? order by created_at, rowid").all(task.id).map(rowToTaskEvidence);
+    },
+    /**
+     * 登记 agent 身份（FR-108 / 0-B-b）—— **进程级本地身份**，不是鉴权。
+     *
+     * 幂等：同一个 `id` 再登记**复用已有行**（不新建、不换 id），只补空字段。
+     * `tokenHash` 只落接口位：stdio MCP 没有鉴权通道，**本轮不宣称鉴权生效**。
+     */
+    registerAgent(input = {}) {
+      const declared = typeof input.id === "string" ? input.id.trim() : "";
+      const id = declared !== "" ? declared : `anon-${randomUUID()}`;
+      const existing = db.prepare("select * from agents where id = ?").get(id);
+      const at = nowIso();
+      if (existing) {
+        // 只补空字段，不覆盖已登记的值（否则重启时传不同 display_name 会把历史身份改掉）。
+        db.prepare("update agents set display_name = case when display_name = '' then ? else display_name end, permission_profile = coalesce(permission_profile, ?) where id = ?")
+          .run(String(input.displayName ?? "").trim(), input.permissionProfile ?? null, id);
+        return { ...rowToAgent(db.prepare("select * from agents where id = ?").get(id)), created: false };
+      }
+      db.prepare("insert into agents (id, kind, display_name, token_hash, permission_profile, created_at) values (?, ?, ?, ?, ?, ?)")
+        .run(id, input.kind === "human" ? "human" : "agent", String(input.displayName ?? "").trim(),
+          input.tokenHash ?? null, input.permissionProfile ?? null, at);
+      return { ...rowToAgent(db.prepare("select * from agents where id = ?").get(id)), created: true };
+    },
+    getAgent(id) {
+      const row = db.prepare("select * from agents where id = ?").get(String(id));
+      return row ? rowToAgent(row) : null;
+    },
+    listAgents() {
+      return db.prepare("select * from agents order by created_at, rowid").all().map(rowToAgent);
+    },
+    bindAgentSession(agentId, sessionId) {
+      if (!store.getAgent(agentId)) throw new TbError("AGENT_NOT_FOUND", `未登记的 agent：${agentId}`, { agentId });
+      if (sessionId === null || sessionId === undefined || String(sessionId).trim() === "") return null;
+      db.prepare("insert or ignore into agent_sessions (agent_id, session_id, bound_at) values (?, ?, ?)")
+        .run(String(agentId), String(sessionId), nowIso());
+      return { agentId: String(agentId), sessionId: String(sessionId) };
     },
     /** 有效证据 = 最新一条（历史留档但不再生效）。 */
     latestTaskEvidence(ref) {
@@ -3590,6 +3748,13 @@ export function openStore(options = {}) {
         legacyOwnerLabels: count("select count(*) as n from tasks where labels like '%owner:%'"),
         dbPath,
         dataDir,
+        // 卡 `-237`：`role` = writer | follower；follower 表示「另一个实例正持有写者租约」。
+        // 这里刻意用 **现读**（fresh）：health 是给「我现在能不能写」这个判断看的，
+        // 吃 15s 的本地缓存会让提示滞后于事实。
+        role: typeof store.instanceRoleFresh === "function" ? store.instanceRoleFresh() : "writer",
+        leaseOwner: typeof store.instanceLeaseOwnerFresh === "function" ? store.instanceLeaseOwnerFresh() : null,
+        // 卡 `-236`：默认目录搬家后的**只读**迁移提示（空新库 + 有数据的旧库）。由宿主侧探测后挂上，探测不到就是 null。
+        dataDirHint: store.dataDirHint ?? null,
         schemaVersion: SCHEMA_VERSION,
         migration,
       };
@@ -3598,6 +3763,8 @@ export function openStore(options = {}) {
 
   // 项目记忆：同库、同事务语义，但**不感知** MCP/CLI/Web（只是用例层的又一扇门）。
   Object.assign(store, createMemoryApi({ db, nowIso, randomUUID }));
+  // 卡 `-237`（R173）：多实例单写者租约（不 acquire 的调用方恒 writer ⇒ 零行为变化）。
+  Object.assign(store, createLeaseApi({ db, nowIso, randomUUID }));
 
   return store;
 }

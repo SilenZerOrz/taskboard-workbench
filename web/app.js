@@ -537,7 +537,7 @@
     // FR-28：会话内**默认按本会话收敛**（档位＝`session:<本会话标识>`，可用「全部」一键切回）；
     // 拿不到 sessionId（非会话作用域入口）时保持「全部」，并由工具栏明写降级文案（见 NO_SESSION_NOTICE）。
     const defaultSessionScope = sessionId ? `${SESSION_SCOPE_CURRENT_PREFIX}${sessionId}` : "";
-    const state = { statuses: [], priorities: [], projects: [], tasks: [], projectId: "", priority: "", label: "", sessionScope: defaultSessionScope, session: sessionId, keyword: "", loop: {}, host: null, binding: { projectId: null, bound: true, mainSessionId: null, association: null }, showArchived: false, collapsedSections: [], touchedSections: [], emptyState: null, dragTask: null, dragEl: null };
+    const state = { statuses: [], priorities: [], projects: [], tasks: [], projectId: "", priority: "", label: "", sessionScope: defaultSessionScope, session: sessionId, keyword: "", loop: {}, host: null, instanceRole: "writer", leaseOwner: null, dataDir: "", dataDirHint: null, binding: { projectId: null, bound: true, mainSessionId: null, association: null }, showArchived: false, collapsedSections: [], touchedSections: [], emptyState: null, dragTask: null, dragEl: null };
     let editing = null;
     let destroyed = false;
 
@@ -683,6 +683,18 @@
     const hostNotice = mk("div", "banner warn");
     hostNotice.hidden = true;
     hostNotice.setAttribute("role", "status");
+    /**
+     * 卡 `-236` / `-237`（需求 `R173`）· **只读跟随者**常驻条。
+     *
+     * 真机 2026-11-10：dsh web 与 dsh desktop 同时打开同一个库时，同一时刻只允许一个实例写
+     * （租约在库里，见 `src/core/instance-lease.mjs`）。后起的那个窗口**能看不能写**，
+     * 但它如果什么都不说，用户点「新建任务」只会收到一条 409 —— 不如在顶上直接讲清楚
+     * 「谁在写、要写去哪里、对端退出后会自己接管」。
+     * 与一次性 `banner` 分开：这条是**状态**，要一直留到角色变化为止。
+     */
+    const followerNotice = mk("div", "banner warn");
+    followerNotice.hidden = true;
+    followerNotice.setAttribute("role", "status");
     // 卡 `-222`（需求 `R163` ①）：**可降级步骤**失败时的常驻条 —— 「面板能用，但这几项没读到」。
     // 与一次性 `banner` 分开：条里要**留住原因**并带「重试」按钮；banner 到时会自动消失。
     // 复用 `.empty-guide` 既有排版（只在 tokens.css 补一条宽度收敛，不新增取数通道）。
@@ -717,6 +729,8 @@
     shell.append(header, toolbar, banner, connNotice, hostNotice, boardScroll, reqScroll, teamScroll, configScroll, gateScroll, advanceScroll);
     // 卡 `-222`：常驻条挂在「能力提示」与各视图之间（单独插，不改上面那条已被 FR-20 守卫钉住的挂载行）。
     try { shell.insertBefore(bootStrip, boardScroll); } catch { /* ignore */ }
+    // 卡 `-236`/`-237`：只读跟随者条同样单独插，挂载行不动。
+    try { shell.insertBefore(followerNotice, boardScroll); } catch { /* ignore */ }
 
     // 任务详情抽屉（含"归属团队 / 执行会话"关联）
     const drawerBackdrop = mk("div", "tb-drawer-backdrop");
@@ -994,6 +1008,110 @@
     shell.appendChild(dialog);
     root.replaceChildren(shell);
 
+    /**
+     * 宿主内嵌环境（Electron / 受限 webview）**不实现浏览器原生 prompt()** —— 调用即抛
+     * `prompt() is not supported`，于是「新建项目」这类入口从可用变成直接报错。这里用**页面内原生
+     * `<dialog>` 表单**替代，样式复用既有 `dialog` / `.field` / `.dialog-actions`（与「新建任务」
+     * 对话框同一套），不引入第二套弹窗体系，也不引入前端框架。
+     *
+     * 契约：返回 `{ [name]: string }`；`取消 / Esc / 点遮罩` 一律 resolve(`null`) ——
+     * 调用方**先判 null 再发请求** ⇒ 取消路径零副作用（不产生半截项目、不写事件流）。
+     * 必填校验在本地做（不依赖原生 `required` 的冒泡提示，宿主里的呈现不可控）：
+     * 留空则改写提示文案并聚焦，**不关闭对话框、不提交**。
+     */
+    function askFields({ title, hint = "", fields = [], submit = "确定" }) {
+      return new Promise((resolve) => {
+        const d = mk("dialog");
+        const form = mk("form");
+        form.method = "dialog";
+        d.appendChild(mk("h2", null, title));
+        const controls = new Map();
+        fields.forEach((spec, index) => {
+          const wrap = mk("div", "field");
+          const id = `tb-ask-${index}-${Math.random().toString(36).slice(2, 8)}`;
+          const label = mk("label", null, spec.label ?? spec.name);
+          label.htmlFor = id;
+          const control = spec.multiline ? mk("textarea") : mk("input");
+          if (spec.multiline) control.rows = spec.rows ?? 3;
+          else control.type = "text";
+          control.id = id;
+          control.value = spec.value ?? "";
+          control.placeholder = spec.placeholder ?? "";
+          controls.set(spec.name, { control, spec });
+          wrap.append(label, control);
+          form.appendChild(wrap);
+        });
+        const hintEl = mk("p", "hint", hint);
+        form.appendChild(hintEl);
+        const actions = mk("div", "dialog-actions");
+        const cancel = mk("button", "ghost", "取消");
+        cancel.type = "button";
+        const ok = mk("button", "primary", submit);
+        ok.type = "submit";
+        actions.append(cancel, ok);
+        form.appendChild(actions);
+        d.appendChild(form);
+        shell.appendChild(d);
+        let settled = false;
+        const finish = (value) => {
+          if (settled) return;
+          settled = true;
+          if (d.open) d.close();
+          d.remove();
+          resolve(value);
+        };
+        cancel.addEventListener("click", () => finish(null));
+        // Esc：`cancel` 事件在关闭前触发，拦下并走同一条「取消」路径（保证只 resolve 一次）。
+        d.addEventListener("cancel", (event) => { event.preventDefault(); finish(null); });
+        // 点遮罩＝取消；点内容不算。按坐标判断，避免把对话框内边距上的点击也当成取消。
+        d.addEventListener("click", (event) => {
+          if (event.target !== d) return;
+          const r = d.getBoundingClientRect();
+          const inside = event.clientX >= r.left && event.clientX <= r.right && event.clientY >= r.top && event.clientY <= r.bottom;
+          if (!inside) finish(null);
+        });
+        /** 收集 + 必填校验。**两条入口共用**：提交按钮的 click 与表单 submit（回车）——
+         *  只挂 submit 会赌「宿主一定派发 submit 事件」，赌输的表现是对话框关不掉也交不出去（Promise 永久挂起）。 */
+        const collect = () => {
+          const out = {};
+          for (const [name, entry] of controls) {
+            const value = String(entry.control.value ?? "");
+            if (entry.spec.required && !value.trim()) {
+              hintEl.textContent = entry.spec.requiredMessage ?? `请填写「${entry.spec.label ?? entry.spec.name}」`;
+              entry.control.focus();
+              return;
+            }
+            out[name] = value;
+          }
+          finish(out);
+        };
+        form.addEventListener("submit", (event) => { event.preventDefault(); collect(); });
+        // click 先于 submit 触发；`finish` 有 settled 守卫，双触发只会生效一次。
+        ok.addEventListener("click", (event) => { event.preventDefault(); collect(); });
+        d.showModal();
+        const first = controls.values().next().value;
+        if (first) first.control.focus();
+      });
+    }
+
+    /**
+     * 新建项目的字段表（会话绑定门 / 工具栏共用一份）—— 两个入口各自拼文案必然漂移。
+     * 返回 `{ name, workspacePath }`（工作目录留空 ⇒ `null`）；取消 ⇒ `null`（一个请求都不发）。
+     */
+    async function askNewProject() {
+      const input = await askFields({
+        title: "新建项目",
+        hint: "项目 id 由名称生成；工作目录可留空（留空＝不绑定目录）。",
+        submit: "创建",
+        fields: [
+          { name: "name", label: "项目名称 *", placeholder: "例如：水电站集控 · 测试台", required: true, requiredMessage: "项目名称不能为空（项目 id 由它生成）" },
+          { name: "workspacePath", label: "项目工作目录（绝对路径，可留空）", placeholder: "/Users/…/项目目录" },
+        ],
+      });
+      if (!input) return null;
+      return { name: input.name.trim(), workspacePath: (input.workspacePath ?? "").trim() || null };
+    }
+
     // ---------------------------------------------------------------- helpers
     /**
      * FR-95（2026-10-26 补）：会话**命名结果**的如实呈现片段 —— 供各「建会话」出口的横幅复用。
@@ -1105,6 +1223,30 @@
       if (!caps || need.every((cap) => caps[cap])) { hostNotice.hidden = true; return; }
       hostNotice.textContent = "本实例是独立进程，没有 DSH 宿主会话通道：「投给主会话 / 打开会话 / 派发团队」这类动作在这里不可用（相关按钮已置灰）。看板、建卡、改状态、评审、人工收口都照常可用；要投递或派发，请到 DSH 内的任务工作台（地址以 /integrations/taskboard-workbench 结尾的那个页面）操作。";
       hostNotice.hidden = false;
+    }
+    /** 卡 `-236`/`-237`：只读跟随者常驻条（角色来自 `/api/health` 的 `role` / `leaseOwner`）。 */
+    function renderFollowerNotice() {
+      if (state.instanceRole !== "follower") { followerNotice.hidden = true; return; }
+      const owner = state.leaseOwner;
+      const who = owner ? `${owner.host ?? "另一个宿主"} · pid ${owner.pid ?? "?"}` : "另一个工作台实例";
+      followerNotice.textContent = `本窗口只读：${who} 正在写同一个数据库（${state.dataDir || "同一 dataDir"}）。看板照常可看；新建 / 改状态 / 评论等写操作会被拒绝。要写请去那个窗口；它退出后（约 45 秒租约过期）本窗口会自动接管，无需重启。`;
+      followerNotice.hidden = false;
+    }
+    /** 角色会变（对端退出 ⇒ 自动接管），所以轻量轮询一次 `/api/health`，只更新角色，不动数据。 */
+    async function refreshInstanceRole() {
+      try {
+        const health = await api("GET", "/api/health");
+        const nextRole = health?.role === "follower" ? "follower" : "writer";
+        const changed = nextRole !== state.instanceRole;
+        state.instanceRole = nextRole;
+        state.leaseOwner = health?.leaseOwner ?? null;
+        state.dataDirHint = health?.dataDirHint ?? state.dataDirHint ?? null;
+        renderFollowerNotice();
+        if (changed && nextRole === "writer") {
+          showBanner("已接管写者租约（对端已退出），本窗口恢复读写", "info");
+          if (view === "board") void loadTasks();
+        }
+      } catch { /* 轮询失败不打扰：连接问题由 connNotice 负责 */ }
     }
     /**
      * FR-84 补口（2026-10-18 真机）：`navigator.clipboard.writeText()` 返回 **Promise**，
@@ -1896,10 +2038,16 @@
         // 先读能力位再渲染：否则首屏会先画出"能点"的按钮、几百毫秒后再置灰（闪一下更困惑）。
         const health = await runBootStep("health", "宿主能力位（/api/health）", false, () => api("GET", "/api/health"));
         state.host = health.value?.host ?? null;
+        state.instanceRole = health.value?.role === "follower" ? "follower" : "writer";
+        state.leaseOwner = health.value?.leaseOwner ?? null;
+        state.dataDirHint = health.value?.dataDirHint ?? null;
         renderHostNotice();
+        renderFollowerNotice();
         // ② 状态 / 优先级元数据（**必要**：看板列与优先级下拉全靠它，缺了画不出列）
         const meta = await runBootStep("meta", "状态与优先级元数据（/api/meta）", true, () => api("GET", "/api/meta"));
         state.statuses = meta.value?.statuses ?? [];
+        state.dataDir = meta.value?.dataDir ?? "";
+        renderFollowerNotice(); // 只读条里要写清"哪个库"，meta 回来后再刷一次文案
         state.priorities = meta.value?.priorities ?? [];
         // ③ FR-60：会话/工作区 → 项目（**可降级**：拿不到就按项目列表第一项）
         const ctxParams = new URLSearchParams();
@@ -1981,10 +2129,10 @@
       bar.append(
         btn(state.binding.association === "pending" ? "重新申请关联" : "申请关联", async () => { try { await api("POST", `/api/projects/${encodeURIComponent(state.projectId)}/sessions/request`, { sessionId }); showBanner("已提交关联申请，等待主会话批准", "info"); await resolveBinding(state.projectId); renderCurrentView(); } catch (e) { showBanner(`申请失败：${e.message}`, "error"); } }, "primary"),
         btn("新建项目（绑定本会话）", async () => {
-          const name = window.prompt("新项目名称（将据此生成项目 id）"); if (!name) return;
-          const ws = window.prompt("项目工作目录（绝对路径，可留空）");
+          const input = await askNewProject();
+          if (!input) return;
           try {
-            const r = await api("POST", "/api/projects", { name, workspacePath: ws && ws.trim() ? ws.trim() : null });
+            const r = await api("POST", "/api/projects", { name: input.name, workspacePath: input.workspacePath });
             state.projectId = r.project.id;
             state.projects = [r.project, ...projects.filter((p) => p.id !== r.project.id)];
             await resolveBinding(state.projectId); // 新项目无主会话 → 本会话成为主会话
@@ -2037,20 +2185,31 @@
       const rowActions = (item) => {
         const box = mk("div", "advance-actions");
         for (const action of (item.actions ?? [])) {
-          box.appendChild(btn(ADVANCE_ACTION_LABEL[action.code] ?? action.code, () => {
+          // 取值改走页面内 dialog ⇒ 回调必须是 async（原生 prompt() 是同步阻塞的）。
+          box.appendChild(btn(ADVANCE_ACTION_LABEL[action.code] ?? action.code, async () => {
             if (action.code === "complete") { void decide(item, "complete"); return; }
             if (action.code === "approve") { void decide(item, "approve"); return; }
             if (action.code === "retry") { void decide(item, "retry"); return; }
             if (action.code === "changes") {
-              const note = window.prompt(`#${item.taskRef} 返工说明（会写进事件流）`, "") ?? null;
-              if (note === null) return;
-              void decide(item, "changes", note);
+              const input = await askFields({
+                title: `#${item.taskRef} 返工说明`,
+                hint: "会写进事件流；可留空＝只记「返工」不写说明。",
+                submit: "提交返工",
+                fields: [{ name: "note", label: "返工说明", multiline: true, rows: 4, placeholder: "哪里不达标、要改成什么样" }],
+              });
+              if (!input) return;
+              void decide(item, "changes", input.note);
               return;
             }
             if (action.code === "choose") {
-              const conclusion = window.prompt(`#${item.taskRef} 的结论（一句话）`, "") ?? null;
-              if (conclusion === null || !conclusion.trim()) return;
-              void decide(item, conclusion.trim(), item.why);
+              const input = await askFields({
+                title: `#${item.taskRef} 的结论`,
+                hint: "一句话结论，会写进事件流。",
+                submit: "提交结论",
+                fields: [{ name: "conclusion", label: "结论 *", placeholder: "例如：同意，按子任务 B 执行", required: true, requiredMessage: "结论不能为空" }],
+              });
+              if (!input || !input.conclusion.trim()) return;
+              void decide(item, input.conclusion.trim(), item.why);
               return;
             }
             // attribute / dispatch：不在本页代做，指回既有入口（不造第二条写路径）
@@ -2370,11 +2529,10 @@
     // 「新建项目」统一入口（工具栏 / 配置页共用）—— 建完即切换，并让本会话成为该项目主会话
     // （与「会话绑定门」里的建项目同口径：POST /api/projects → resolveBinding）。
     async function createProjectFlow() {
-      const name = window.prompt("新项目名称（将据此生成项目 id）");
-      if (!name || !name.trim()) return;
-      const ws = window.prompt("项目工作目录（绝对路径，可留空）");
+      const input = await askNewProject();
+      if (!input) return;
       try {
-        const r = await api("POST", "/api/projects", { name: name.trim(), workspacePath: ws && ws.trim() ? ws.trim() : null });
+        const r = await api("POST", "/api/projects", { name: input.name, workspacePath: input.workspacePath });
         state.projectId = r.project.id;
         state.projects = [r.project, ...(state.projects ?? []).filter((p) => p.id !== r.project.id)];
         await resolveBinding(state.projectId);
@@ -2503,6 +2661,8 @@
       };
     } catch { boardEvents = null; }
     // FR-75/76：看护状态会随"阈值到达"自行变化（不产生 SSE），用轻量轮询兜底刷新看板/详情。
+    // 卡 `-237`：写者租约随时可能交接（对端退出 / 对端起来）—— 30s 刷新一次角色，只读写者身份。
+    const instancePoll = window.setInterval(() => { if (!destroyed) void refreshInstanceRole(); }, 30000);
     const watchdogPoll = window.setInterval(() => {
       if (destroyed) return;
       if (view === "board") void loadTasks();
@@ -2798,15 +2958,27 @@
           const right = mk("span", "config-actions"); right.append(...actions); r.appendChild(right);
           return r;
         };
-        // 开工语 —— **不是第 8 步**：它是新会话发给队长的**第一条消息**（`KICKOFF_PROMPT` 的 ①–⑧ 就是
+        // 开工语 —— **不是第 8 步**：它是新会话发给队长的**第一条消息**（`KICKOFF_STEPS` 的 ①–⑧ 就是
         // 下面这 7 步的完整流程），复制即用，没有「做完」这个状态，因此不编号、不参与 ✅/○。
+        //
+        // R177（卡 `-243`）：**按「配置对象」取项目，而不是按 `/api/context` 的全局绑定取** ——
+        // 页面头部写的是「配置对象：${state.projectId}」，用顶部下拉切项目时 `info.project` 并不跟着变；
+        // 若拿 `info.project` 插值，切到 B 项目后复制出来仍是 A 项目 ⇒ 与本次要修的 bug 同型。
+        const kickoffProject = (state.projects ?? []).find((p) => p.id === state.projectId)
+          ?? (info.project?.id === state.projectId ? info.project : { id: state.projectId, name: projName, workspacePath: null });
+        const kickoffText = buildKickoffPrompt(kickoffProject);
         const kickoffRow = mk("div", "config-row");
         kickoffRow.appendChild(pill("开工语", "warn", "新会话首条 —— 不是步骤，不编号也没有完成态"));
         kickoffRow.appendChild(mk("span", null, "新会话首条：把这句发给队长（它驱动下面 1–7 步）"));
         const kickoffRight = mk("span", "config-actions");
-        kickoffRight.appendChild(gcopy("复制开局提示词", KICKOFF_PROMPT));
+        kickoffRight.appendChild(gcopy("复制开局提示词", kickoffText));
         kickoffRow.appendChild(kickoffRight);
         guide.appendChild(kickoffRow);
+        // R177：**把「复制出去到底带了什么」写在界面上** —— 只有一个按钮，人分不清复制的是哪个项目／哪个目录
+        // （这正是 bug 能在界面上「看起来正常」的原因）。缺 workspacePath 时如实说会写成「请先在配置页补」。
+        guide.appendChild(mk("p", "hint", kickoffProject.workspacePath
+          ? `开工语已带上：项目 ${kickoffProject.id} · 工作目录 ${kickoffProject.workspacePath}`
+          : `⚠ 项目 ${kickoffProject.id || "（未解析）"} 未设 workspacePath —— 开工语里会写「（项目未设 workspacePath → 请先在配置页补）」，新会话仍可能回落默认项目。`));
         guide.appendChild(mk("p", "hint", "「开工语」不是步骤：它没有 ✅，复制进新会话即可；下面的 1–7 步才是可核验的进度。"));
         guide.append(
           srow(gBound, 1, "绑定项目 / 会话", mk("span", "hint", info.project ? `${info.project.id}${sessionId ? (info.sessionBound === false ? "（未绑定）" : " · 已绑定会话") : " · 全局入口"}` : "（未解析）")),
@@ -2977,9 +3149,14 @@
         const req = card("需求", "需求文档与条目的管理入口");
         req.appendChild(row("需求视图", btn("打开", () => setView("req"), "primary")));
         req.appendChild(row("新建需求条目", btn("新建", async () => {
-          const title = window.prompt("需求条目标题");
-          if (!title) return;
-          try { await api("POST", "/api/requirements/items", { projectId: state.projectId, title }); showBanner("已新建需求条目", "info"); await renderConfig(); }
+          const input = await askFields({
+            title: "新建需求条目",
+            hint: "标题写「动词开头 + 一句话」；详细内容按规范 07 在条目详情里补。",
+            submit: "创建",
+            fields: [{ name: "title", label: "需求条目标题 *", placeholder: "例如：需求条目面板工具区不再挤在左侧", required: true, requiredMessage: "需求条目标题不能为空" }],
+          });
+          if (!input) return;
+          try { await api("POST", "/api/requirements/items", { projectId: state.projectId, title: input.title.trim() }); showBanner("已新建需求条目", "info"); await renderConfig(); }
           catch (e) { showBanner(`新建失败：${e.message}`, "error"); }
         })));
         req.appendChild(row("AI 拆解（auto · 不可用即报错）", btn("拆解", async () => {
@@ -3045,6 +3222,11 @@
         opsD.appendChild(kvList([
           ["数据目录", meta?.dataDir ?? "—"],
           ["数据库", meta?.dbPath ?? "—"],
+          // 卡 `-236`/`-237`：同一个 dataDir 被多个宿主打开时，这里能一眼看出本窗口是哪个角色。
+          ["实例角色", state.instanceRole === "follower"
+            ? `只读跟随（${state.leaseOwner ? `${state.leaseOwner.host ?? "宿主"} · pid ${state.leaseOwner.pid ?? "?"}` : "对端实例"} 正在写）`
+            : "写者（可读写）"],
+          ...(state.dataDirHint ? [["数据目录提示", state.dataDirHint.hint]] : []),
           ["接口版本", meta ? `schemaVersion=${meta.schemaVersion ?? "?"}` : "—"],
           ["工作台版本", `app v${window.__TB_BOARD__?.version ?? "?"}`],
         ]));
@@ -3417,7 +3599,41 @@
       if (engine === "nanmicoder") return `请用【@nanmicoder/dsh-agent-teams】创建一个完整执行团队（approval=required，先出计划、由人确认后再启动）：agent_teams_create({ name, approval:"required", plan:{ members:[{name,role,provider,model}], tasks:[...] } })。\n${roster}\n队长=本会话(lead)：按依赖就绪派发、汇总回流。\n红线：执行侧不得置"完成"；不 commit/push/publish。`;
       return `当前为【指令降级(P2)】：不驱动团队插件，只把以下派发指令发给会话并记账。\n${roster}\n（如需真正执行，请在配置里切换到官方或 @nanmicoder 引擎。）`;
     };
-    const KICKOFF_PROMPT = "【项目开局】你是本项目队长(lead)。工作目录：<项目绝对路径>。\n① 先做「项目开局对齐」六步自检（配置页 → 项目开局对齐）：统一代码规范 / 文档驱动 / Git 协作流程 / 代码审查门 / 协作机制与知识沉淀 / 明确分工；缺哪步补哪步（依据《Vibe Coding 团队协作技巧》，对齐结果要能核验）；\n② 确认已加载「任务工作台」插件 + agent team 插件可用；\n③ 绑定项目到本会话作为初始会话；\n④ 配置「项目入口·初始化」：创建执行团队 + 约定环境约束（把①的对齐结论写进 envConfig / teamTemplate）；\n⑤ 引入项目资料（md/doc）；\n⑥ 团队完成需求梳理 → 落盘需求文档；\n⑦ 拆解成看板任务并归因；\n⑧ 授权开工 → 派发执行 → 反馈回流（执行侧不得写 done）。";
+    /**
+     * 需求 `R177`（卡 `-243`，2026-11-12 真机）：**开局提示词必须自证「哪个项目 + 哪个工作目录」**。
+     *
+     * 原实现是一条**纯静态常量**，工作目录写死成一个尖括号占位符（形如「工作目录：‹…›」）——
+     * 从任何项目配置页复制出来的文本一字不差，新会话里的 agent 拿不到项目标识 ⇒
+     * `taskboard_context` 按会话 cwd 匹配不到任何项目 ⇒ `binding.mjs` **静默回落默认项目** ⇒
+     * agent 按**别的仓库**的目录开工（真机现场：拿着 `taskboard-workbench` 的 AGENTS.md 去改另一个项目）。
+     *
+     * 口径三条：① 项目以 **id** 为准（名字只是给人看的补充）；② 工作目录写**真实绝对路径**，
+     * 不留任何字面占位符；③ 项目没设 `workspacePath` ⇒ **如实写「请先在配置页补」**，
+     * 不写空值、也不猜路径（猜出来的路径正是这条 bug 的成因）。
+     *
+     * 纯函数：只吃 `{ id, name, workspacePath }`，不碰全局状态 —— 因此可在 `new Function` 里单测（见
+     * `tests/kickoff-prompt-project.test.mjs`）。
+     */
+    /** 开局提示词的**流程正文**（①–⑧）：与项目无关，故单列；前半段「项目 / 工作目录」由 `buildKickoffPrompt` 插值。 */
+    const KICKOFF_STEPS = "① 先做「项目开局对齐」六步自检（配置页 → 项目开局对齐）：统一代码规范 / 文档驱动 / Git 协作流程 / 代码审查门 / 协作机制与知识沉淀 / 明确分工；缺哪步补哪步（依据《Vibe Coding 团队协作技巧》，对齐结果要能核验）；\n② 确认已加载「任务工作台」插件 + agent team 插件可用；\n③ 绑定项目到本会话作为初始会话；\n④ 配置「项目入口·初始化」：创建执行团队 + 约定环境约束（把①的对齐结论写进 envConfig / teamTemplate）；\n⑤ 引入项目资料（md/doc）；\n⑥ 团队完成需求梳理 → 落盘需求文档；\n⑦ 拆解成看板任务并归因；\n⑧ 授权开工 → 派发执行 → 反馈回流（执行侧不得写 done）。";
+    function buildKickoffPrompt(project) {
+      const id = String(project?.id ?? "").trim();
+      const name = String(project?.name ?? "").trim();
+      const workspacePath = String(project?.workspacePath ?? "").trim();
+      const noWorkspace = "（项目未设 workspacePath → 请先在配置页补）";
+      const head = [
+        "【项目开局】你是本项目队长(lead)。",
+        `项目：${id || "（未解析）"}${name ? `（${name}）` : ""}`,
+        `工作目录：${workspacePath || noWorkspace}`,
+      ];
+      if (workspacePath) {
+        head.push(`本会话的看板读写**只作用于**这个项目：taskboard_context 传 cwd=${workspacePath}；taskboard_* 写操作传 project=${id || "（项目 id）"}。`);
+      } else {
+        head.push("⚠ 该项目还没有工作目录：先在配置页「当前绑定」补 workspacePath，再开新会话；否则 agent 只能按 cwd 回落默认项目。");
+      }
+      head.push("若当前会话的工作目录不是它 ⇒ **不要**在这里开工：请用户在该目录重开会话（按 cwd 回落会读到别的仓库）。");
+      return `${head.join("\n")}\n${KICKOFF_STEPS}`;
+    }
     // 从需求文档里解析"资料清单" → 引入的文件列表
     function parseIntakeFiles(body) {
       const out = []; let inList = false;
@@ -4446,6 +4662,195 @@
         showBanner(`派发失败（${identifier}）：${error.message}${error.code ? `（${error.code}）` : ""}`, "error");
       }
     }
+    // ── 卡 `-238`（需求 `R174`）：执行者按卡选择 ─────────────────────────────────
+    // 前端**唯一**的执行者知识：只认 `GET /api/executors` 给的 `id` / `kind`。
+    // **不硬编码任何命令行** —— 参数在服务端注册表里，前端说了不算（改参数只改一处）。
+    // 未安装 / 被项目 `forbiddenExecutors` 禁用 ⇒ 置灰 + `title` 写明原因，不把注定被拒的路摆到人面前。
+    const AGENT_ICON_PATHS = {
+      // 16×16、单色 `currentColor`、内联（不引图标字体、不引外部资源）
+      team: [
+        "M6 7.4a2.2 2.2 0 1 0 0-4.4 2.2 2.2 0 0 0 0 4.4Z",
+        "M11 7.2a1.8 1.8 0 1 0 0-3.6 1.8 1.8 0 0 0 0 3.6Z",
+        "M2.1 13.6c0-2 1.8-3.6 3.9-3.6s3.9 1.6 3.9 3.6v.5H2.1v-.5Z",
+        "M11 9.9c1.7 0 3.1 1.2 3.1 2.7v.5h-3.2v-.5c0-1.1-.4-2-1.1-2.7",
+      ],
+      dsh: [
+        "M3.2 2.4h3.9c3.3 0 5.6 2.2 5.6 5.6s-2.3 5.6-5.6 5.6H3.2V2.4Zm2.3 2.2v6.8h1.5c2 0 3.3-1.3 3.3-3.4S9 4.6 7 4.6H5.5Z",
+        "M2.2 13.2h11.6v1.4H2.2v-1.4Z",
+      ],
+      claude: [
+        "M8 1.3l1.15 4.55 4.55-1.15-3.4 3.3 3.4 3.3-4.55-1.15L8 14.7l-1.15-4.55L2.3 11.3l3.4-3.3-3.4-3.3 4.55 1.15L8 1.3Z",
+      ],
+      codex: [
+        "M8 1.5l5.6 3.2v6.6L8 14.5 2.4 11.3V4.7L8 1.5Zm0 3L4.8 6.3v3.4L8 11.5l3.2-1.8V6.3L8 4.5Z",
+      ],
+      hermes: [
+        "M1.5 8.3l12.4-6-3.2 11-2.9-4-6.3-1Z",
+      ],
+    };
+    function agentIcon(agent) {
+      const paths = AGENT_ICON_PATHS[agent] ?? AGENT_ICON_PATHS.team;
+      const svg = doc.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.setAttribute("viewBox", "0 0 16 16");
+      svg.setAttribute("aria-hidden", "true");
+      svg.setAttribute("focusable", "false");
+      svg.classList.add("tb-agent-icon");
+      for (const d of paths) {
+        const path = doc.createElementNS("http://www.w3.org/2000/svg", "path");
+        path.setAttribute("d", d);
+        svg.appendChild(path);
+      }
+      return svg;
+    }
+
+    /**
+     * 执行者清单按 `projectId` 缓存 60s（`forbiddenExecutors` / `executionTeam` 都是项目设置）。
+     * @returns {Promise<{ list: Array, defaultId: string|null }>}
+     *   `defaultId` 由服务端给（=「不换执行者时本来会走谁」），前端不自己猜项目配置。
+     */
+    const executorsCache = new Map();
+    async function loadExecutors(projectId) {
+      const key = String(projectId ?? "");
+      const hit = executorsCache.get(key);
+      if (hit && Date.now() - hit.at < 60000) return { list: hit.list, defaultId: hit.defaultId };
+      const payload = await api("GET", `/api/executors?projectId=${encodeURIComponent(key)}`);
+      const list = Array.isArray(payload?.executors) ? payload.executors : [];
+      const defaultId = typeof payload?.defaultId === "string" ? payload.defaultId : null;
+      executorsCache.set(key, { at: Date.now(), list, defaultId });
+      return { list, defaultId };
+    }
+
+    /**
+     * 按 `kind` 分流到**三条既有入口** —— 这里只做分发，**不新开任何旁路**：
+     * 归因门 / 授权门 / 人工校验门 / 评审门全在服务端原处照旧。
+     */
+    async function runWithExecutor(task, executor, onDone) {
+      const ref = encodeURIComponent(task.identifier);
+      if (executor.kind === "team") {
+        await dispatchTeam(task.identifier, onDone);
+        return `已派发团队执行（${task.identifier}）`;
+      }
+      if (executor.kind === "host-session") {
+        const r = await api("POST", `/api/tasks/${ref}/execute`, {});
+        const launch = r?.launch ?? null;
+        onDone?.();
+        return `已下发宿主会话：mode=${launch?.mode ?? "?"}${launch?.sessionId ? ` · 会话 ${String(launch.sessionId).slice(0, 12)}` : ""}`;
+      }
+      const r = await api("POST", `/api/tasks/${ref}/exec-cli`, { executor: executor.id, async: true });
+      onDone?.();
+      return `已提交 ${executor.label} 后台执行（${r?.executor ?? executor.id}）`;
+    }
+
+    /**
+     * 执行者图标行。
+     * @returns {{ node: HTMLElement, selected: () => string|null, list: () => Array }}
+     *   `selected()` 给同区块的「预览 / 执行」按钮取当前选择（否则选了 codex 却预览 claude = 预览在骗人）。
+     *
+     * 挂点（稳定，供验证台定位，不靠中文文案）：`data-exec-picker` / `data-executor` / `data-executor-kind`。
+     */
+    function mountExecutorPicker(task, { onDone, note: idleNote = null, kinds = null } = {}) {
+      const wrap = mk("div", "tb-exec-picker");
+      wrap.setAttribute("data-exec-picker", "1");
+      wrap.appendChild(mk("span", "tb-exec-picker-label", "执行者"));
+      const choices = mk("div", "tb-exec-picker-choices");
+      const launch = mk("button", "tb-exec-launch", "用所选执行者启动");
+      launch.type = "button";
+      launch.disabled = true;
+      const note = mk("p", "hint tb-exec-note", "加载执行者…");
+      wrap.append(choices, launch, note);
+
+      // 每条通道**此刻**能不能走：服务端注册表只回答「装了没 / 被禁没」，
+      // 「这张卡现在准不准从这条路走」是**卡的状态**决定的（归因门 / 授权门 / 人工校验门），
+      // 与既有「启动执行 / 交给 CLI 执行器执行」用同一把尺子（`executionEntry` / `cliEntry`），不另判一套。
+      const channelBlocker = (executor) => {
+        if (executor.kind === "cli") {
+          const entry = cliEntry(task);
+          if (entry === "start") return null;
+          return entry === "human-review"
+            ? "人工校验任务（FR-85b 升级门）：结论只能人给，不得交给执行器"
+            : "本卡未归属需求条目：先归因再执行（EXECUTION_NOT_ATTRIBUTED）";
+        }
+        const entry = executionEntry(task);
+        if (entry === "start") return null;
+        if (entry === "attribute") return "本卡未归属需求条目：先归因再执行";
+        if (entry === "authorize") return "本卡还在「待办池」：先授权开工（授权只是放行，仍需人点执行）";
+        return `当前状态「${STATUS_LABELS[task.status] ?? task.status}」不可从这里启动（仅「可开工」卡可启动）`;
+      };
+      let all = [];
+      let list = [];
+      let selectedId = null;
+      const buttons = [];
+      const pick = (id) => {
+        selectedId = id;
+        for (const button of buttons) button.setAttribute("aria-pressed", String(button.dataset.executor === id));
+        const chosen = buttons.find((button) => button.dataset.executor === id) ?? null;
+        launch.disabled = !chosen || chosen.disabled;
+      };
+
+      void (async () => {
+        let defaultId = null;
+        try { ({ list: all, defaultId } = await loadExecutors(task.projectId)); }
+        catch (error) {
+          note.textContent = `执行者清单加载失败：${error.message}（其余按钮不受影响）`;
+          return;
+        }
+        // `kinds` 过滤：CLI 区块里放「团队 / 宿主会话」只会让人点出一个必然 400 的按钮。
+        list = kinds ? all.filter((executor) => kinds.includes(executor.kind)) : all;
+        if (!list.length) { note.textContent = "没有可用执行者：/api/executors 返回空清单（旧版服务端？）"; return; }
+        for (const executor of list) {
+          const button = mk("button", "tb-exec-choice");
+          button.type = "button";
+          button.dataset.executor = executor.id;
+          button.dataset.executorKind = executor.kind;
+          button.setAttribute("aria-pressed", "false");
+          button.appendChild(agentIcon(executor.agent));
+          button.appendChild(mk("span", null, executor.label));
+          const blockedWhy = executor.usable ? channelBlocker(executor) : null;
+          button.title = !executor.usable
+            ? `${executor.label} 不可用：${executor.reason ?? "原因未知"}`
+            : blockedWhy ? `${executor.label}：${blockedWhy}` : `${executor.label} · ${executor.hint}`;
+          button.disabled = !executor.usable || Boolean(blockedWhy);
+          // 供验证台断言「为什么灰」：状态码化，不靠中文文案。
+          button.dataset.execBlocked = !executor.usable ? "unusable" : blockedWhy ? "gate" : "ok";
+          button.addEventListener("click", () => pick(executor.id));
+          buttons.push(button);
+          choices.appendChild(button);
+        }
+        const unavailable = buttons.filter((button) => button.disabled);
+        // 默认选中：**服务端给的 `defaultId`**（= 不换执行者时本来会走谁），不可用才退第一个可用的。
+        const preferred = list.find((executor) => executor.id === defaultId && executor.usable)
+          ?? list.find((executor) => executor.usable)
+          ?? null;
+        if (preferred) pick(preferred.id);
+        note.textContent = idleNote ?? (unavailable.length
+          ? `选中后点「用所选执行者启动」；${unavailable.length} 个执行者当前不可用（悬停看原因）。原有「启动执行」固定走宿主会话。`
+          : "选中后点「用所选执行者启动」；原有「启动执行」固定走宿主会话。三条通道的既有门（归因 / 人工校验 / 评审）一个不绕。");
+      })();
+
+      launch.addEventListener("click", async () => {
+        const chosen = list.find((executor) => executor.id === selectedId) ?? null;
+        if (!chosen) return;
+        const confirmText = chosen.kind === "team"
+          ? `把 ${task.identifier} 派发给「${chosen.label}」执行？\n\n· 派发后由项目执行团队接手（roles 由项目设置决定）\n· 完成回写「待验收」，收口仍由人确认`
+          : chosen.kind === "host-session"
+            ? `把 ${task.identifier} 交给「${chosen.label}」执行？\n\n· 会尝试新建/切换会话（可能切换主视图）\n· 执行前先认领：卡片置「进行中」`
+            : `把 ${task.identifier} 交给「${chosen.label}」**真实执行**？\n\n· 非交互调用本地 CLI（通常带文件写权限），耗时数十秒到数分钟\n· 执行前先认领：卡片置「进行中」\n· 完成后回流「待验收」或「受阻」，并附证据评论\n· 期间请勿重复点击`;
+        if (typeof window !== "undefined" && typeof window.confirm === "function" && !window.confirm(confirmText)) return;
+        launch.disabled = true;
+        try {
+          const message = await runWithExecutor(task, chosen, onDone);
+          showBanner(message, "info");
+          await loadTasks();
+        } catch (error) {
+          // 归因门等执行类拒绝走统一处置（与既有「启动执行 / 派发团队」同一套措辞与补救入口）
+          if (error.code === "EXECUTION_NOT_ATTRIBUTED") { await handleExecutionFailure(error, task.identifier, task, "派发"); return; }
+          showBanner(`派发失败（${task.identifier} · ${chosen.label}）：${error.message}${error.code ? `（${error.code}）` : ""}`, "error");
+        } finally { launch.disabled = false; }
+      });
+
+      return { node: wrap, selected: () => selectedId, list: () => list, reload: () => { executorsCache.delete(String(task.projectId ?? "")); } };
+    }
+
     /**
      * FR-108（卡 `-198`）：交付阶段徽标的**唯一**渲染点。
      * 文案只描述"交付物到哪一步"，不替代"下一步点哪里"（那是 `next` 的活）。
@@ -5184,6 +5589,14 @@
         const cliSec = mk("div", "drawer-section");
         cliSec.appendChild(mk("h3", null, "CLI 执行器（真实执行）"));
         cliSec.appendChild(mk("p", "hint", "把该任务交给项目配置的 CLI 执行器（teamTemplate.roles[].executor = cli:*，且不在 forbiddenExecutors 中）真实执行：非交互调用 → 采集退出码 / 耗时 / 本次改动差集 → 写回评论 + 尝试记录；成功转「待验收」，失败走统一受阻入口。执行前会先认领并把卡片置为「进行中」——即使它原先在待办池等其它列，执行期也会如实显示在「进行中」，跑完再回到「待验收」。"));
+        // 卡 `-238`（R174）：CLI 区也放一个**只含 CLI 形态**的选择器（放团队/宿主会话只会点出必然的 400）。
+        // 「预览 / 执行」都按这里选的那个走 —— 否则选了 codex 却预览 claude，预览就在骗人。
+        const cliPicker = cliEntry(t) === "start" ? mountExecutorPicker(t, {
+          onDone: () => void openTaskDetail(t),
+          kinds: ["cli"],
+          note: "选中后「预览执行计划」与下方按钮都按所选执行者走；「交给 CLI 执行器执行」固定用项目配置的那个。",
+        }) : null;
+        if (cliPicker) cliSec.appendChild(cliPicker.node);
         const cliOut = mk("pre", "cli-plan");
         cliOut.textContent = "（未预览）先点「预览执行计划」看清要跑什么，再决定是否真实执行。";
         cliSec.appendChild(cliOut);
@@ -5191,7 +5604,7 @@
         const cliClosed = t.status === "done" || t.status === "cancelled";
         cliBar.appendChild(btn("预览执行计划", async () => {
           try {
-            const r = await api("POST", `/api/tasks/${ref}/exec-cli`, { dryRun: true });
+            const r = await api("POST", `/api/tasks/${ref}/exec-cli`, { dryRun: true, executor: cliPicker?.selected() ?? undefined });
             const p = r.plan ?? {};
             cliOut.textContent = [
               `执行器：${p.executor ?? "—"}（CLI：${p.cli ?? "—"}）`,
@@ -5212,7 +5625,7 @@
         if (cliEntryKind === "start") cliBar.appendChild(btn("交给 CLI 执行器执行", async () => {
           if (!window.confirm(`确认把 ${t.identifier} 交给 CLI 执行器**真实执行**？\n\n· 非交互调用本地 CLI（通常带文件写权限），耗时数十秒到数分钟\n· 执行前先认领：卡片将被置为「进行中」（原为 todo 则走授权门）\n· 完成后看板自动刷新为「待验收」或「受阻」，并附退出码/耗时/改动清单\n· 期间请勿重复点击`)) return;
           try {
-            const r = await api("POST", `/api/tasks/${ref}/exec-cli`, { async: true });
+            const r = await api("POST", `/api/tasks/${ref}/exec-cli`, { async: true, executor: cliPicker?.selected() ?? undefined });
             cliOut.textContent = [
               `已提交后台执行：${r.executor ?? "—"}（CLI：${r.plan?.cli ?? "—"}）`,
               `工作目录：${r.plan?.cwd ?? "—"}`,
@@ -5641,6 +6054,11 @@
           } else {
             sec.appendChild(mk("div", "next-step-title", step.title));
             if (step.hint) sec.appendChild(mk("p", "hint", step.hint));
+            // 卡 `-238`（R174）：执行者图标行 —— 只在**这张卡真的能执行**时出现（能走 CLI 或能走宿主/团队）。
+            // 单独一行、不抢主按钮层级：原有「启动执行」仍是主色，本行是「换谁跑」的选择器。
+            if (cliEntry(t) === "start" || executionEntry(t) === "start") {
+              sec.appendChild(mountExecutorPicker(t, { onDone: () => void reopen() }).node);
+            }
             // 操作顺序：异常/待办卡不许只丢几个并列按钮让人自己猜先点哪个（FR-89 第二条约束）。
             if (Array.isArray(step.steps) && step.steps.length) {
               const ol = mk("ol", "next-steps");

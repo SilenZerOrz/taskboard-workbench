@@ -96,6 +96,11 @@ export function cliArgsFor({ executorId, cwd, settings }) {
  */
 export const EDIT_PERMISSION_HINTS = Object.freeze([
   "acceptEdits", "bypassPermissions", "--dangerously-skip-permissions",
+  // 卡 `-238`：判据从「只认 claude 的写法」扩到「**任一 CLI 的显式写权限**」——
+  // codex 的 `-s workspace-write` / `--dangerously-bypass-approvals-and-sandbox`、
+  // hermes 的 `--yolo` 都是「允许落盘」的明示开关。这几个 token 语义单一，
+  // 扩进来只会**减少**误判成「盲跑」，不会把只读参数误认成可写。
+  "workspace-write", "danger-full-access", "--yolo",
 ]);
 
 export function argsAllowEdits(args) {
@@ -423,16 +428,25 @@ export async function runCliExecutor({
   timeoutMs = DEFAULT_TIMEOUT_MS, spawnImpl = spawn, env = process.env, now = () => Date.now(),
   verifyCommand = null, requirementId = null,
   store = null, heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS,
+  // 卡 `-238`（R174）：按卡选执行者时，参数与「指令怎么给」由**注册表**决定，不再写死 claude 那套。
+  // 两者缺省即老行为（`cliArgsFor` + stdin），**零回归**。
+  argsOverride = null, promptVia = "stdin",
 } = {}) {
   if (!executor?.cli) return { started: false, reason: "no-cli-executor" };
   const workdir = cwd ?? project?.workspacePath ?? null;
   if (!workdir) return { started: false, reason: "no-workspace", executorId: executor.id };
   // 测试/离线替身：`TB_CLI_EXECUTOR_BIN` 指定可执行文件时优先使用（不改 executor id 语义）。
-  const cli = String(env?.TB_CLI_EXECUTOR_BIN ?? "") || executor.cli;
+  // `binPath` 优先于裸命令名：宿主由 launchd 拉起时 PATH 常缺 `~/.npm-global/bin`，
+  // 只写命令名会在 `exec-cli` 真跑时报 ENOENT（探测到绝对路径就用它）。
+  // `TB_CLI_EXECUTOR_BIN` 仍是最高优先（测试/离线替身语义不变）。
+  const cli = String(env?.TB_CLI_EXECUTOR_BIN ?? "") || executor.binPath || executor.cli;
   const prompt = buildTaskPrompt(task, { project, requirementId, verifyCommand });
-  const args = cliArgsFor({ executorId: executor.id, cwd: workdir, settings });
+  const explicitArgs = Array.isArray(argsOverride) && argsOverride.length ? argsOverride.map(String) : null;
+  const args = explicitArgs ?? cliArgsFor({ executorId: executor.id, cwd: workdir, settings });
   // 参数来源与「能不能写文件」都要如实记进结果（证据与状态都取它，见 isBlindRun）。
-  const argsSource = (Array.isArray(settings?.teamTemplate?.engineer?.args) && settings.teamTemplate.engineer.args.length) ? "override" : "default";
+  // `executor` 档＝按卡选执行者时注册表给的参数（非 claude 的 CLI 只有这一种来源）。
+  const argsSource = explicitArgs ? "executor"
+    : (Array.isArray(settings?.teamTemplate?.engineer?.args) && settings.teamTemplate.engineer.args.length) ? "override" : "default";
   const startedAt = now();
   // 基线快照（脏仓库下用于算"本次真实产出"）。
   // 拿不到基线**不得静默继续**：在结果上打 `baseline: "unavailable"`，证据评论里显式告警，
@@ -444,7 +458,7 @@ export async function runCliExecutor({
   let beforeSnap = null;
   if (!before) { try { beforeSnap = await snapshotWorkspace(workdir); } catch { beforeSnap = null; } }
   const baseline = before ? "git" : beforeSnap ? "fs" : "unavailable";
-  const result = { started: true, executorId: executor.id, cli, cwd: workdir, args, argsSource, argsAllowsEdits: argsAllowEdits(args), baseline, exitCode: null, signal: null, timedOut: false, durationMs: 0, stdout: "", stderr: "", diff: null, ok: false };
+  const result = { started: true, executorId: executor.id, cli, cwd: workdir, args, argsSource, argsAllowsEdits: argsAllowEdits(args), promptVia, baseline, exitCode: null, signal: null, timedOut: false, durationMs: 0, stdout: "", stderr: "", diff: null, ok: false };
   // ---- 执行期心跳（2026-10-22 真机 `-122`）----
   // 子进程活着期间必须持续续命认领锁：否则心跳停在开跑那刻，10 分钟后 `claim.stale=true`、
   // 看护按 `session-offline` 判 `stalled/high`，主按钮变「退回待办（重新派发）」——
@@ -479,8 +493,10 @@ export async function runCliExecutor({
       child.stdout?.on("data", (b) => { result.stdout += String(b); });
       child.stderr?.on("data", (b) => { result.stderr += String(b); });
       child.on?.("close", (code, signal) => { clearTimeout(timer); result.exitCode = code; result.signal = signal ?? null; finish(); });
-      // 指令走 stdin（避免超长命令行）+ 立即结束 stdin
-      try { child.stdin?.write(prompt); child.stdin?.end(); } catch { /* ignore */ }
+      // 指令投递：默认走 stdin（避免超长命令行）；`promptVia=argv` 的 CLI（hermes `-z <prompt>`）
+      // 指令已经在参数里，**不再往 stdin 写**（写了它也不读，白占缓冲），但仍要 end() 收口，
+      // 否则子进程等 stdin EOF 会挂到超时。
+      try { if (promptVia !== "argv") child.stdin?.write(prompt); child.stdin?.end(); } catch { /* ignore */ }
     });
   } finally {
     stopHeartbeat();
@@ -600,13 +616,17 @@ export function evidenceComment(task, result, { actor = "cli-executor" } = {}) {
 export async function executeTaskWithCli({
   store, task, project, settings = null, role = "engineer", timeoutMs = DEFAULT_TIMEOUT_MS,
   spawnImpl = spawn, env = process.env, now = () => Date.now(), heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS,
+  // 卡 `-238`：显式选定的执行者（及其参数）优先于「项目配置解析出来的那个」。
+  // 不传时**逐字节**走老路径 —— 项目级配置仍是默认口径。
+  resolvedExecutor = null, argsOverride = null, promptVia = "stdin",
 } = {}) {
-  const executor = resolveCliExecutor(settings ?? store.getProjectSettings(task.projectId), { role });
+  const executor = resolvedExecutor ?? resolveCliExecutor(settings ?? store.getProjectSettings(task.projectId), { role });
   if (!executor) return { ran: false, reason: "no-cli-executor" };
   const verifyCommand = settings?.teamTemplate?.engineer?.verifyCommand ?? null;
   const result = await runCliExecutor({
     task, project, executor, settings, timeoutMs, spawnImpl, env, now,
     verifyCommand, requirementId: task.requirementId ?? null, store, heartbeatIntervalMs,
+    argsOverride, promptVia,
   });
   const body = evidenceComment(task, result);
   let review = null; let blocked = null;

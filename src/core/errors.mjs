@@ -98,6 +98,15 @@ export const ERROR_CATEGORY = Object.freeze({
   REQ_IDENTIFIER_CONFLICT: EXIT.CONFLICT,
   DEPENDENCY_EXISTS: EXIT.CONFLICT,
   DOC_EXISTS: EXIT.CONFLICT,
+  // 卡 `-238`（R174）：执行者按卡选择 —— 三种「选不了」必须**分开报**，否则人分不清该去装 CLI、
+  // 还是去改项目设置（forbiddenExecutors 优先级最高）。
+  EXECUTOR_UNKNOWN: EXIT.USAGE,
+  EXECUTOR_NOT_INSTALLED: EXIT.USAGE,
+  EXECUTOR_FORBIDDEN: EXIT.USAGE,
+  // 选了一个「不是 CLI 形态」的执行者（team / host-session）却打到 exec-cli 上 ⇒ 用法错误，并指路正确入口
+  EXECUTOR_NOT_CLI: EXIT.USAGE,
+  // 卡 `-237`（R173）：同一个库同一时刻只允许一个写者；follower 的所有写操作一律 409。
+  FOLLOWER_READ_ONLY: EXIT.CONFLICT,
 });
 
 /** 领域错误：带 code / 退出码 / 可选细节。 */

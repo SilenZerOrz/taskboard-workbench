@@ -1258,3 +1258,32 @@ button.danger { border-color: var(--danger); color: var(--danger); background: v
    ⇒ 不收敛就画出一条超出视口的「长条面板」。面板按可读行宽收窄；常驻条与 banner 同宽居中。 */
 .tb-boot-panel { max-width: min(760px, calc(100vw - 24px)); }
 .tb-boot-strip { width: 100%; max-width: var(--board-max-width); align-self: center; }
+
+/* ── 卡 `-238`（需求 `R174`）：执行者图标行 ────────────────────────────────────
+   一处定义、两个区块（「下一步」与「CLI 执行器」）共用；图标是内联 SVG（`fill: currentColor`），
+   不引图标字体、不引外部资源 —— 换主题只跟着文字色走，不会出现「深色底上一坨黑图标」。
+   选择器为什么这么长：抽屉里有一条 `.tb-drawer button:not(.link):not(.icon)` 统管按钮尺寸
+   （特异性 0,3,1）。这里用 4 个类压住它，而不是靠书写顺序博一次平局。 */
+.tb-exec-picker {
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2);
+  padding: var(--space-2) 0 0 0;
+}
+.tb-exec-picker-label { font-size: 11px; color: var(--text-tertiary); flex: 0 0 auto; }
+.tb-exec-picker-choices { display: flex; flex-wrap: wrap; gap: var(--space-1); }
+.tb-drawer .tb-exec-picker button.tb-exec-choice:not(.link) {
+  display: inline-flex; align-items: center; gap: 5px;
+  height: 28px; min-height: 28px; padding: 0 10px;
+  background: var(--surface); color: var(--text-secondary);
+  border: 1px solid var(--border); border-radius: var(--radius-full);
+  font-size: 12px; line-height: 1; cursor: pointer;
+}
+.tb-drawer .tb-exec-picker button.tb-exec-choice:not(.link):hover:not(:disabled) {
+  border-color: var(--accent); color: var(--text-primary);
+}
+.tb-drawer .tb-exec-picker button.tb-exec-choice[aria-pressed="true"] {
+  border-color: var(--accent); color: var(--text-primary);
+  background: var(--accent-soft); font-weight: 600;
+}
+.tb-drawer .tb-exec-picker button.tb-exec-choice:disabled { opacity: 0.42; cursor: not-allowed; }
+.tb-agent-icon { width: 13px; height: 13px; fill: currentColor; flex: 0 0 auto; }
+.tb-exec-note { margin: 0; flex: 1 1 100%; }

@@ -113,7 +113,7 @@ test("C. 宿主插件注册的 handler 可直接服务 API（命名空间前缀�
   const base = `http://127.0.0.1:${port}${PREFIX}`;
 
   const health = await (await fetch(`${base}/api/health`)).json();
-  assert.equal(health.schemaVersion, 14); // 14：+ project_settings.flow_inject_policy（P5 档 C · -210）；13：+ 交付物证据 task_evidence / 授权快照 task_mandates（0-B · -197）；12：+ 契约快照（project_contract / flow_injections · P1） // FR-79/FR-82/FR-83/FR-81/FR-85b/FR-11：… + tasks.board_position（列内手工顺序）+ FR-50：team_members.executor → schema 版本 10
+  assert.equal(health.schemaVersion, 15); // 14：+ project_settings.flow_inject_policy（P5 档 C · -210）；13：+ 交付物证据 task_evidence / 授权快照 task_mandates（0-B · -197）；12：+ 契约快照（project_contract / flow_injections · P1） // FR-79/FR-82/FR-83/FR-81/FR-85b/FR-11：… + tasks.board_position（列内手工顺序）+ FR-50：team_members.executor → schema 版本 10
   assert.equal(health.status, "ok");
   const projects = await (await fetch(`${base}/api/projects`)).json();
   assert.equal(projects.count, 1);
@@ -817,7 +817,13 @@ test("O. FR-89 抽屉按状态分层：默认只展开「该做的那一处」�
   // 从「默认折叠」那句起切（它就写在向导块之前，顺序本身也是断言的一部分）。
   const stepAt = source.indexOf('const isClosed = t.status === "done"');
   assert.ok(stepAt > 0, "必须能定位向导块前的默认折叠段");
-  const stepBlock = source.slice(stepAt, stepAt + 3200);
+  // 窗口用**结构锚点**收边，不用固定字节数（卡 `-238` 在向导块里加了一行执行者选择器，
+  // 3200 字节窗当场把后面的「展开入口」挤出窗口 ⇒ 明明没坏却报红）。
+  // 收边判据＝`-224` 的主按钮归一注释（它恒定紧跟向导块之后），与 AGENTS 里
+  // 「固定字节窗 ⇒ 改为按下一个处理器收边」同一条教训。
+  const stepEnd = source.indexOf("// 卡 `-224`：所有区块", stepAt);
+  assert.ok(stepEnd > stepAt, "必须能用结构锚点给向导块收边（`-224` 归一注释）");
+  const stepBlock = source.slice(stepAt, stepEnd);
   assert.match(stepBlock, /mk\("ol", "next-steps"\)/, "异常/待办卡必须给 1-2-3 步骤清单");
   assert.match(stepBlock, /applyFocusPolicy\(step\.focus\)/, "必须先按 focus 收起处置区再渲染向导块");
   assert.ok(stepBlock.indexOf("applyFocusPolicy(step.focus)") < stepBlock.indexOf('mk("div", "drawer-section next-step")'), "折叠策略必须在向导块渲染之前执行");
@@ -858,9 +864,19 @@ test("P. 插件装载不得触碰未声明的 ctx.config（无 dataDir 配置也
     },
   };
   let runtime = null;
-  assert.doesNotThrow(() => {
-    runtime = apply(ctx); // 无第二参数 ⇒ config 为 undefined，必须走安全路径
-  }, "无 dataDir 配置时装载不得抛错");
+  // 本用例只钉「插件配置没给 dataDir 时不得读 ctx.config」，与**默认目录落在哪**无关
+  // （默认目录在 2026-11-10 迁到 `~/.dsh/data/taskboard-workbench`，由 data-dir-default.test.mjs 单独钉）。
+  // 这里给一个临时数据目录，让用例保持 hermetic：不依赖跑测试的机器上 `~/.dsh` 是否可写。
+  const prevDataDir = process.env.TB_DATA_DIR;
+  process.env.TB_DATA_DIR = dir;
+  try {
+    assert.doesNotThrow(() => {
+      runtime = apply(ctx); // 无第二参数 ⇒ config 为 undefined，必须走安全路径
+    }, "无 dataDir 配置时装载不得抛错");
+  } finally {
+    if (prevDataDir === undefined) delete process.env.TB_DATA_DIR;
+    else process.env.TB_DATA_DIR = prevDataDir;
+  }
   t.after(() => {
     runtime?.close?.();
     rmSync(dir, { recursive: true, force: true });

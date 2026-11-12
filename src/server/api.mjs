@@ -17,6 +17,7 @@ import { runExecutionLoop, activeEngine } from "../core/loop.mjs";
 import { assertTeamTemplate, assertQualityGates, planTeamMembers } from "../core/team.mjs";
 import { assessTaskRef, projectWatchdog } from "../core/watchdog.mjs";
 import { ticketStage } from "../core/ticket-stage.mjs";
+import { artifactRefKindProblems, EVIDENCE_REF_KINDS } from "../core/evidence.mjs";
 import { isHumanReviewTask, planHumanReview } from "../core/human-review.mjs";
 import { deriveNextStep } from "../core/next-step.mjs";
 /**
@@ -35,7 +36,7 @@ const HOST_UNAVAILABLE_NEXT = "该实例没有宿主会话通道（独立进程�
 
 import { buildDebugDispatchPrompt } from "../core/debug-dispatch.mjs";
 import { buildSplitAskPrompt } from "../core/split-ask.mjs";
-import { buildReviewEvidence, formatVerifyComment, normalizeVerifyCommand, summarizeVerifyOutput, VERIFY_DEFAULT_COMMAND } from "../core/verify.mjs";
+import { buildReviewEvidence, detectUnrunnableVerify, formatVerifyComment, normalizeVerifyCommand, summarizeVerifyOutput, VERIFY_DEFAULT_COMMAND } from "../core/verify.mjs";
 import { buildGapPrompt, buildKickoffTodos, collectGaps, evaluateKickoff } from "../core/kickoff.mjs";
 import { deriveEmptyState } from "../core/empty-state.mjs";
 // 2026-10-28 拍板 E1–E3 / D-M1–D-M5：项目推进清单（纯投影 + 幂等回写）与项目记忆（L2 条目 + L3 召回）。
@@ -47,6 +48,9 @@ import { runVerifyCommand, probeVerifyApplicability } from "./verify.mjs";
 import { DIAGNOSTIC_KINDS, evaluateTaskDiagnostics, projectDiagnostics, summarizeDiagnostics, resolveSessionRef, humanReviewProbe, humanReviewAnsweredBy } from "../core/diagnostics.mjs";
 import { summarizeNotifyDelivery } from "../core/notify.mjs";
 import { resolveCliExecutor, executeTaskWithCli, buildTaskPrompt, cliArgsFor, claimForCliExecution, DEFAULT_TIMEOUT_MS } from "../core/executor.mjs";
+// 卡 `-238`（R174）：执行者注册表 —— 按卡选「团队 / dsh / claude / codex / hermes」的唯一真源。
+// 本文件只用它**解析与校验**，参数与「指令怎么给」都由注册表给，路由不另写第二份。
+import { EXECUTOR_SPECS, EXECUTOR_KINDS, buildExecutorArgs, detectBinary, findExecutorSpec, isExecutorForbidden, listExecutors } from "../core/executors.mjs";
 import { DEFAULT_FAILURE_LIMIT } from "../core/store.mjs";
 // 卡 `-177`（2026-10-29 · 口径 X）：acceptance 缺省口径与 MCP **共用同一份**，不在本文件另写判断。
 import { markAcceptance, acceptanceFlag } from "../core/acceptance.mjs";
@@ -62,7 +66,12 @@ export function httpStatusFor(error) {
   return 400;
 }
 
-export function createApiRouter({ store, aiElaborator, events } = {}) {
+/**
+ * @param executorProbe 执行者探测（默认 `detectBinary`）。**可注入**是为了让「未安装」这条分支
+ *   能被测试真实走一遍 —— 否则本机四个 CLI 全装着，`EXECUTOR_NOT_INSTALLED` 永远测不到。
+ *   与 `TB_CLI_EXECUTOR_BIN` 同属「测试/宿主替身」这一层，不改变生产默认行为。
+ */
+export function createApiRouter({ store, aiElaborator, events, executorProbe = detectBinary } = {}) {
   const emit = (type, payload) => { try { events?.publish?.(type, payload); } catch { /* ignore */ } };
   /**
    * 已有执行会话仍在执行（未返回结论）→ 不得再次下发。
@@ -195,6 +204,19 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
     ].join("\n");
   }
   async function route({ method, pathname, searchParams, body = {} }) {
+    // 卡 `-237`（需求 `R173`）：同一个库同一时刻只允许一个写者。
+    // follower 一律只读 —— **所有非 GET 直接 409**，不做「部分放行」：
+    // 放行一半比全拒更难解释，也更容易踩到对端正跑着的执行。
+    // **现读**（fresh）而不是吃本地缓存：缓存最多滞后一个心跳周期，那 15s 就是真实双写窗口。
+    if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS"
+      && (typeof store.instanceRoleFresh === "function" ? store.instanceRoleFresh() : "writer") === "follower") {
+      const leaseOwner = typeof store.instanceLeaseOwnerFresh === "function" ? store.instanceLeaseOwnerFresh() : null;
+      throw new TbError(
+        "FOLLOWER_READ_ONLY",
+        `本实例是只读跟随者：另一个工作台实例正在写同一个库（${leaseOwner ? `${leaseOwner.host} · pid ${leaseOwner.pid}` : "对端实例"}）。请到那个窗口操作，或等它退出后本窗口会自动接管。`,
+        { role: "follower", leaseOwner, dataDir: store.dataDir },
+      );
+    }
     if (pathname === "/api/health" && method === "GET") {
       // 宿主能力可见性（诊断）：投递指令 / 建会话 / 打开会话 各依赖的宿主服务是否已就绪。
       const has = (fn) => { try { return typeof fn === "function"; } catch { return false; } };
@@ -227,6 +249,49 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
       return {
         status: 200,
         payload: { statuses: STATUSES, priorities: PRIORITIES, dataDir: store.dataDir, dbPath: store.dbPath },
+      };
+    }
+    if (pathname === "/api/executors" && method === "GET") {
+      // 卡 `-238`（R174）：把「这张卡能交给谁跑」变成**可读数据**，前端照它渲染图标、按它的 id 派发。
+      // 只读：不 spawn 干活（仅 `--version` 探测，失败即 null）、不写库、不碰宿主会话。
+      // 项目维度的两处判据必须带 `projectId`：`forbiddenExecutors` 与 `executionTeam` 都是**项目设置**。
+      const projectId = searchParams.get("projectId") ?? searchParams.get("project") ?? null;
+      const settings = projectId ? store.getProjectSettings(projectId) : null;
+      const port = store.hostSessionPort;
+      // 与 `/api/health` 同口径（`createSession: Boolean(port?.available)`）：宿主会话通道成不成立看它。
+      const hostSessionAvailable = Boolean(port && port.available);
+      // `executionTeam` 为空 ⇒ 团队派发没有落点。没带 projectId 时**判不准** ⇒ 传 null（按可用处理，不冒充不可用）。
+      const teamAvailable = projectId ? Boolean(settings?.teamTemplate?.executionTeam) : null;
+      const executors = await listExecutors({
+        settings,
+        hostSessionAvailable,
+        teamAvailable,
+        detect: executorProbe,
+        // 版本探测**默认关**：真机实测 `hermes --version` 不退出（>10s 才被杀），为它牺牲首屏
+        // 不划算（这个字段只用于展示）。要就显式 `?version=1`，那是诊断/人查的动作，不是页面必经之路。
+        withVersion: searchParams.get("version") === "1",
+      });
+      // `defaultId`＝「**不换执行者**时这张卡本来会走谁」：优先项目 `roles[].executor`（走既有
+      // `resolveCliExecutor` 同一套解析，含 forbidden 过滤），解析不到就退宿主会话。
+      // 为什么由服务端给：前端不该知道 `teamTemplate.roles[].executor` 这种配置细节，
+      // 否则「默认选中项」会与真实派发口径各说一套。
+      const configured = (() => {
+        try { return resolveCliExecutor(settings, { role: "engineer" }); } catch { return null; }
+      })();
+      const configuredId = configured?.id ?? null;
+      const defaultId = (configuredId && executors.some((item) => item.id === configuredId && item.usable))
+        ? configuredId
+        : (executors.some((item) => item.id === "host:dsh" && item.usable) ? "host:dsh" : executors.find((item) => item.usable)?.id ?? null);
+      return {
+        status: 200,
+        payload: {
+          schemaVersion: 2,
+          projectId,
+          executors,
+          defaultId,
+          hostSessionAvailable,
+          hostCapabilities: (() => { try { return port?.capabilities?.() ?? null; } catch { return null; } })(),
+        },
       };
     }
     if (pathname === "/api/context" && method === "GET") {
@@ -898,6 +963,38 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
     }
 
 
+    // ---- FR-106（0-B-b · 卡 -239）· 交付证据写入口（HTTP 侧）----
+    // 与 MCP `card_evidence_submit` **同源**：同一个 store 方法、同一道四字段硬门、同一套错误码。
+    // 本层只多做一件规则层不做的事：**入口层 kind 白名单**（非 {commit,file} 显式拒，而不是静默丢）。
+    const taskEvidenceRoute = /^\/api\/tasks\/([^/]+)\/evidence$/.exec(pathname);
+    if (taskEvidenceRoute) {
+      if (method !== "POST") throw new TbError("USAGE_ERROR", "交付证据入口仅支持 POST");
+      const ref = decodeURIComponent(taskEvidenceRoute[1]);
+      const submittedRefs = body.artifact_refs ?? body.artifactRefs;
+      const badKinds = artifactRefKindProblems(submittedRefs);
+      if (badKinds.length) {
+        throw new TbError(
+          "INVALID_ARTIFACT_REF",
+          `artifact_refs 只接受 ${EVIDENCE_REF_KINDS.join(" / ")}（非法项：第 ${badKinds.map((b) => b.index + 1).join("、")} 项）`,
+          { problems: badKinds },
+        );
+      }
+      const evidence = store.addTaskEvidence(ref, {
+        verdict: body.verdict,
+        deviation: body.deviation,
+        boundary: body.boundary,
+        artifacts: body.artifacts,
+        artifactRefs: submittedRefs,
+        actor: body.actor ?? "agent",
+      });
+      const task = store.requireTaskRef(ref);
+      const stage = ticketStage(task, { evidence, comments: store.listComments(task.id) });
+      try {
+        store.recordAudit({ actor: String(body.actor ?? "agent"), action: "evidence-submit", target: task.identifier, allowed: true, reason: evidence.deduped ? "deduped" : "created", detail: `http · kind=${evidence.refsState} · hash=${evidence.evidenceHash ?? "null"}` });
+      } catch { /* 审计失败不影响业务写入 */ }
+      return { status: 201, payload: { evidence, ticketStage: stage } };
+    }
+
     // ---- 需求文档（FR-34） ----
     if (pathname === "/api/requirements/docs") {
       if (method === "GET") {
@@ -1393,13 +1490,44 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
       const project = store.getProject(task.projectId);
       const settings = store.getProjectSettings(task.projectId);
       const role = String(body.role ?? "engineer");
-      const executor = resolveCliExecutor(settings, { role });
+      // 卡 `-238`（R174）：**按卡选执行者**（可选）。不传 = 逐字节走原口径（项目 `roles[].executor` 决定），
+      // 传了 = 只对这一张卡生效，且**不绕过任何既有门**（人工校验 / 归因 / 授权 / 评审一个不落，见下）。
+      const requestedExecutor = body.executor ?? searchParams.get("executor") ?? null;
+      let chosenSpec = null;
+      let executor = null;
+      let binPath = null;
+      if (requestedExecutor !== null && String(requestedExecutor).trim() !== "") {
+        chosenSpec = findExecutorSpec(requestedExecutor);
+        const known = EXECUTOR_SPECS.map((spec) => spec.id).join(" / ");
+        if (!chosenSpec) {
+          throw new TbError("EXECUTOR_UNKNOWN", `未知执行者「${String(requestedExecutor)}」：可用 ${known}`, { requested: String(requestedExecutor), known: EXECUTOR_SPECS.map((spec) => spec.id) });
+        }
+        // 三条「选不了」**分开报**：人要据此决定去装 CLI、去改项目设置、还是换入口。
+        if (chosenSpec.kind !== EXECUTOR_KINDS.CLI) {
+          throw new TbError("EXECUTOR_NOT_CLI", `执行者 ${chosenSpec.id}（kind=${chosenSpec.kind}）不是 CLI 通道：${chosenSpec.kind === EXECUTOR_KINDS.TEAM ? "团队派发请用 POST /api/teams" : "宿主会话请用 POST /api/tasks/:ref/execute"}`, { executor: chosenSpec.id, kind: chosenSpec.kind });
+        }
+        if (isExecutorForbidden(chosenSpec, settings)) {
+          throw new TbError("EXECUTOR_FORBIDDEN", `执行者 ${chosenSpec.id} 在项目 forbiddenExecutors 中：项目禁用的执行者不得按卡选择（改项目设置后才可选）`, { executor: chosenSpec.id });
+        }
+        const probe = executorProbe(chosenSpec.command);
+        if (!probe.installed) {
+          throw new TbError("EXECUTOR_NOT_INSTALLED", `执行者 ${chosenSpec.id} 未安装：已查 PATH · ~/.npm-global/bin · ~/.local/bin · /opt/homebrew/bin，未找到 ${chosenSpec.command}`, { executor: chosenSpec.id, command: chosenSpec.command, searched: probe.searched });
+        }
+        binPath = probe.binPath;
+        executor = { id: chosenSpec.id, cli: chosenSpec.command, binPath, role };
+      } else {
+        executor = resolveCliExecutor(settings, { role });
+      }
       if (!executor) throw new TbError("NO_CLI_EXECUTOR", `项目 ${task.projectId} 没有可用的 CLI 执行器（teamTemplate.roles[].executor 需为 cli:*，且不在 forbiddenExecutors 中）`);
       const cwd = project?.workspacePath ?? null;
+      const prompt = buildTaskPrompt(task, { project, requirementId: task.requirementId ?? null, verifyCommand: settings?.teamTemplate?.engineer?.verifyCommand ?? null });
+      // 参数：显式选了执行者 ⇒ 由注册表给（claude 仍复用 `cliArgsFor`，含 engineer.args 覆盖语义）；
+      // 否则原样 `cliArgsFor`（老路径的 plan 一字不差）。
       const plan = {
-        executor: executor.id, cli: executor.cli, role: executor.role, cwd,
-        args: cliArgsFor({ executorId: executor.id, cwd, settings }),
-        prompt: buildTaskPrompt(task, { project, requirementId: task.requirementId ?? null, verifyCommand: settings?.teamTemplate?.engineer?.verifyCommand ?? null }),
+        executor: executor.id, cli: binPath ?? executor.cli, role: executor.role ?? role, cwd,
+        args: chosenSpec ? (buildExecutorArgs(chosenSpec, { cwd, settings, prompt }) ?? cliArgsFor({ executorId: executor.id, cwd, settings })) : cliArgsFor({ executorId: executor.id, cwd, settings }),
+        promptVia: chosenSpec?.promptVia ?? "stdin",
+        prompt,
       };
       if (body.dryRun === true || searchParams.get("dryRun") === "1") return { status: 200, payload: { ran: false, dryRun: true, plan } };
       const timeoutMs = Number(body.timeoutMs ?? 0) > 0 ? Number(body.timeoutMs) : DEFAULT_TIMEOUT_MS;
@@ -1418,7 +1546,12 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
       // 进入「进行中」**，否则整个执行期看板显示错误的列（2026-10-18 实测 -73 停在「待办池」14 分钟）。
       const claim = claimForCliExecution(store, task.identifier, { actor: "cli-executor" });
       emit("task.updated", { taskId: task.id, identifier: task.identifier, status: store.requireTaskRef(task.identifier).status });
-      const fire = () => executeTaskWithCli({ store, task, project, settings, role, timeoutMs }).catch((error) => ({ ran: false, reason: String(error?.message ?? error) }));
+      const fire = () => executeTaskWithCli({
+        store, task, project, settings, role, timeoutMs,
+        resolvedExecutor: executor,
+        argsOverride: chosenSpec ? plan.args : null,
+        promptVia: plan.promptVia,
+      }).catch((error) => ({ ran: false, reason: String(error?.message ?? error) }));
       if (body.async === true || searchParams.get("async") === "1") {
         fire();
         emit("task.updated", { taskId: task.id, identifier: task.identifier, status: task.status });
@@ -1842,10 +1975,21 @@ export function createApiRouter({ store, aiElaborator, events } = {}) {
       // 而该工作区是 Java 工程 ⇒ `ENOENT package.json` ⇒ 退出码 254 ⇒ 结论「失败」。
       // 这是「命令不适用」，不是「测试失败」：不跑这条注定报错的命令，落一个**第三态**（不适用）+
       // 一条明路（去填本卡复核动作）。人配过的命令（`configured` 非空）一律照跑，不替他判断。
+      // 卡 `-249`（R179）：**先判「这条命令能不能跑」再跑**。占位符没有替换时（`... <diff文件>`），
+      // shell 会把它解析成重定向 ⇒ 语法错误 ⇒ 退出码 2，结论被写成「失败（退出码 2）」——
+      // 把「配置写成了模板」谎报成「复核没过」。与 FR-94 同构：判「不适用」，不跑。
+      const unrunnable = detectUnrunnableVerify(command);
       const probe = configured ? { applicable: true, reason: null } : await probeVerifyApplicability({ command, cwd });
-      const skipReason = probe.applicable ? null : probe.reason;
+      const skipReason = unrunnable ? unrunnable.reason : (probe.applicable ? null : probe.reason);
       const result = skipReason
-        ? { exitCode: null, timedOut: false, durationMs: 0, tail: `未执行：${skipReason}。\n请在任务「编辑 → 复核动作」（或项目设置 envConfig.verifyCommand）里填本项目的复核命令后重跑，例如 Java 工程填 \`mvn -q test\`。` }
+        ? {
+            exitCode: null, timedOut: false, durationMs: 0,
+            tail: `未执行：${skipReason}。\n${
+              unrunnable
+                ? `请把占位符换成**真实文件路径**后重跑。注意：自动复核的工作目录 = 本项目的 workspacePath（${cwd}），相对路径要相对它写。`
+                : "请在任务「编辑 → 复核动作」（或项目设置 envConfig.verifyCommand）里填本项目的复核命令后重跑，例如 Java 工程填 `mvn -q test`。"
+            }`,
+          }
         : await runVerifyCommand({ command, cwd });
       // FR-90 强化（真机反馈 2026-10-22：「执行结果只返回一个结果，应该在自动复核证据内自动填入
       // 复核总结证据及结论」）：除机器头外，再把**总结 / 失败点**一并落成证据，并回传前端供自动填入。

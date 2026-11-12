@@ -5,8 +5,8 @@
  * 挂到独立命名空间 /integrations/taskboard-workbench 下，并同时托管 web/ 静态资源
  * （客户端面板通过同源脚本加载复用 web/app.js 的看板渲染）。
  *
- * 数据目录：插件配置 dataDir > 宿主 `ctx.get("config").dataDir` > TB_DATA_DIR > 系统临时目录
- * （默认不写代码仓库）。**不得直接读 `ctx.config`**：本插件 `inject` 只声明了 `webServer`，
+ * 数据目录：插件配置 dataDir > 宿主 `ctx.get("config").dataDir` > TB_DATA_DIR > `~/.dsh/data/taskboard-workbench`
+ * （默认不写代码仓库；2026-11-10 起不再落系统临时目录 —— 见 `src/core/config.mjs`）。**不得直接读 `ctx.config`**：本插件 `inject` 只声明了 `webServer`，
  * cordis 会对未声明属性抛「cannot get property "config" without inject」⇒ 装载期整条 entry
  * 不激活（2026-10-26 用隔离真宿主 `--from-default-profile` 复现；真实 profile 因为用户层
  * patch 显式给了 `config.dataDir`，把 `??` 右边短路掉，才一直没暴露）。
@@ -15,9 +15,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
+import os from "node:os";
 
 import { resolveDataDir } from "./src/core/config.mjs";
+import { detectLegacyDataHint } from "./src/core/data-dir-hint.mjs";
 import { openStore } from "./src/core/store.mjs";
+import { LEASE_HEARTBEAT_MS } from "./src/core/instance-lease.mjs";
 import { createRequestHandler, ensureDefaultProject, WEB_DIR } from "./src/server/server.mjs";
 import { createEventHub } from "./src/server/events.mjs";
 import { runExecutionLoop, listLoopProjects } from "./src/core/loop.mjs";
@@ -383,7 +386,12 @@ export function createHostSessionPort({ getService, getCtx, getStore } = {}) {
       const q = getService?.("sessionQuery");
       if (!q) return { sessionId, cwd: null, source: "unavailable" };
       try {
-        const index = await sessionIndex();
+        // 卡 `-235`（需求 `R172`）· lint `no-undef` 抓到的真缺陷：原写 `await sessionIndex()`，
+        // 而那是**同一对象的方法**、不在当前作用域 ⇒ ReferenceError ⇒ 被下面的 `catch` 静默吞掉 ⇒
+        // 「先查持久化索引（带 TTL 缓存）」这条路径**从未生效**，每次都退到 readSession。
+        // 改为直接调上面那个闭包（`sessionIndex()` 方法体也是它），同源、同缓存，语义不变。
+        const built = await buildSessionIndex();
+        const index = built?.map ?? null;
         if (index?.has(sessionId)) {
           return { sessionId, cwd: index.get(sessionId)?.cwd ?? null, source: "sessionQuery.listSessions" };
         }
@@ -599,17 +607,51 @@ export function apply(ctx, config) {
       disposed = false;
       registerRoutes(getWebServer());
       registerTools(ctx?.get?.("tools") ?? ctx?.tools);
-      // FR-82 收口（启动口径）：上一进程留下的「进行中」尝试不会有人闭合 —— 启动时一次结清（**不看时长**）。
+      // 卡 `-237`（需求 `R173`）：**多实例单写者租约**。dsh web 与 dsh desktop 可以同时打开同一个库，
+      // 谁先抢到谁写；后起者降级为 follower（只读 + 不起执行循环 + 不做 boot 收口）。
+      let leaseRole = "writer";
+      let leaseOwner = null;
       try {
-        const rec = runtime.store.reconcileOrphanRuns({ boot: true });
-        if (rec.ended.length || rec.ghostClaims.length) {
-          console.log(`[taskboard-workbench] boot reconcile: 收口孤儿尝试 ${rec.ended.length} 条（${rec.ended.map((r) => `${r.identifier}#${r.attempt}→${r.outcome}`).join(", ")}）；清幽灵认领 ${rec.ghostClaims.length} 条`);
+        const lease = runtime.store.acquireInstanceLease({ host: os.hostname(), pid: process.pid });
+        leaseRole = lease.role;
+        leaseOwner = lease.owner;
+        if (leaseRole !== "writer") {
+          console.log(`[taskboard-workbench] 只读跟随：另一实例正在写同一个库（${lease.owner?.host} · pid ${lease.owner?.pid} · ${runtime.store.dbPath}）`);
+        } else if (lease.tookOver) {
+          console.log(`[taskboard-workbench] 写者租约接管：上一实例 ${lease.previous?.host} · pid ${lease.previous?.pid} 已过期`);
         }
       } catch (error) {
-        console.error(`[taskboard-workbench] boot reconcile failed: ${error?.message ?? error}`);
+        console.error(`[taskboard-workbench] 写者租约获取失败（按 writer 继续）：${error?.message ?? error}`);
+      }
+      // FR-82 收口（启动口径）：上一进程留下的「进行中」尝试不会有人闭合 —— 启动时一次结清（**不看时长**）。
+      // **只有 writer 才做 boot 收口** —— 它分不清「上一进程」与「另一个还活着的进程」，
+      // follower 跑一次就会把对端正跑着的执行当孤儿结清（这正是 R173 的真机风险）。
+      if (leaseRole === "writer") {
+        try {
+          const rec = runtime.store.reconcileOrphanRuns({ boot: true });
+          if (rec.ended.length || rec.ghostClaims.length) {
+            console.log(`[taskboard-workbench] boot reconcile: 收口孤儿尝试 ${rec.ended.length} 条（${rec.ended.map((r) => `${r.identifier}#${r.attempt}→${r.outcome}`).join(", ")}）；清幽灵认领 ${rec.ghostClaims.length} 条`);
+          }
+        } catch (error) {
+          console.error(`[taskboard-workbench] boot reconcile failed: ${error?.message ?? error}`);
+        }
+      }
+      // 卡 `-236`（需求 `R173`）：默认目录从系统临时目录搬到 `~/.dsh/data/taskboard-workbench` 之后，
+      // 老用户的卡还在旧目录 —— 只读对照一次，把「升级后看板全空」变成一条能看懂的提示。
+      // **不搬库、不删旧库**：搬数据属破坏性动作，交用户决定（提示里给两条明路）。
+      try {
+        const hint = detectLegacyDataHint({ dataDir: runtime.dataDir, activeTaskCount: runtime.store.stats().tasks });
+        if (hint) {
+          runtime.store.dataDirHint = hint;
+          console.warn(`[taskboard-workbench] 数据目录迁移提示：${hint.hint}`);
+        }
+      } catch (error) {
+        console.error(`[taskboard-workbench] 迁移提示探测失败（忽略）：${error?.message ?? error}`);
       }
       // 看板执行循环定时器（FR-70）：仅对"已开启循环"的项目按活跃引擎自动派发待执行任务
       const loopTimer = setInterval(() => {
+        // 卡 `-237`：follower 不跑执行循环（否则同一张卡会被两个宿主同时派发）。
+        if (leaseRole !== "writer") return;
         // FR-77：回收失效认领（认领过期 / 心跳陈旧）——执行侧仍存活则延后，避免重复派发。
         try {
           const reclaimed = runtime.store.reclaimStaleClaims();
@@ -636,6 +678,28 @@ export function apply(ctx, config) {
         }
       }, 30000);
       loopTimer.unref?.();
+      // 卡 `-237`：心跳 15s。**follower 也每拍一次 acquire** —— 对端一退出（租约过期 45s）就能接管。
+      const leaseTimer = setInterval(() => {
+        try {
+          const next = runtime.store.acquireInstanceLease({ host: os.hostname(), pid: process.pid });
+          if (next.role === "writer" && leaseRole !== "writer") {
+            leaseRole = "writer";
+            leaseOwner = null;
+            console.log("[taskboard-workbench] 已接管写者租约（对端已过期），本窗口恢复读写");
+            try {
+              const rec = runtime.store.reconcileOrphanRuns({ boot: true });
+              if (rec.ended.length || rec.ghostClaims.length) console.log(`[taskboard-workbench] 接管收口：孤儿 ${rec.ended.length} 条 / 幽灵认领 ${rec.ghostClaims.length} 条`);
+            } catch (error) { console.error(`[taskboard-workbench] 接管收口失败：${error?.message ?? error}`); }
+          } else if (next.role !== "writer" && leaseRole === "writer") {
+            leaseRole = "follower";
+            leaseOwner = next.owner;
+            console.log(`[taskboard-workbench] 失去写者租约 → 只读跟随（${next.owner?.host} · pid ${next.owner?.pid}）`);
+          }
+        } catch (error) {
+          console.error(`[taskboard-workbench] 租约心跳失败：${error?.message ?? error}`);
+        }
+      }, LEASE_HEARTBEAT_MS);
+      leaseTimer.unref?.();
       // 服务在插件 apply 之后才出现/被替换时，重新注册（agent-teams 同款做法）。
       const onService = (name) => {
         if (name === "webServer" || name === "httpServer") registerRoutes(getWebServer());
@@ -645,6 +709,8 @@ export function apply(ctx, config) {
       return () => {
         disposed = true;
         try { clearInterval(loopTimer); } catch (_) {}
+        try { clearInterval(leaseTimer); } catch (_) {}
+        try { runtime.store.releaseInstanceLease(); } catch (_) {}
         try {
           off?.();
         } catch (_) {}

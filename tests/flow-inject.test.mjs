@@ -201,7 +201,7 @@ test("F 迁移：老库的 project_settings 没有该列 ⇒ 打开即幂等补�
     const store = openStore({ dbPath });
     try {
       assert.equal(store.migration.addedFlowInjectPolicyColumn, true, "老库必须被补上 flow_inject_policy 列");
-      assert.equal(store.stats().schemaVersion, 14);
+      assert.equal(store.stats().schemaVersion, 15);
       assert.equal(store.getProjectSettings("old").flowInjectPolicy, "off", "老项目迁移后默认 off（零行为变化）");
       // 二次打开幂等：不再补列、值保持不变
       store.close();

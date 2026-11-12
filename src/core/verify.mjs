@@ -39,6 +39,33 @@ export function normalizeVerifyCommand(raw) {
 }
 
 /**
+ * 「这条命令根本跑不起来」的前置识别（卡 `-249` / 需求 `R179`）。
+ *
+ * 真机 2026-11-12（`scada-vibe-1`）：复核动作被写成
+ * `git -C 00-project-real/scada status --porcelain && git apply --check <diff文件>` ——
+ * `<diff文件>` 是**给人看的占位符**，但 `spawn(cmd, { shell: true })` 会交给 `/bin/sh` 解析：
+ * `<` 被当成重定向、`>` 没有目标 ⇒ **语法错误** ⇒ 退出码 2 ⇒ 结论写成「失败（退出码 2）」。
+ * 读起来像「产品挂了 / 测试没过」，实际是「这条命令不是命令，是模板」。
+ *
+ * 处置与 FR-94 的第三态同构：**不跑**，判「不适用」，并把该替换的位置原样点名。
+ * 只认两种明显的模板痕迹（`<…>` 与 `{{…}}`）：`diff <(a) <(b)` 这类进程替换、`2>&1` 这类
+ * 重定向都不会命中，避免把合法命令误判成模板。
+ */
+export function detectUnrunnableVerify(raw) {
+  const s = String(raw ?? "").trim();
+  if (s === "") return null;
+  const angle = /<([^<>\n]{1,40})>/.exec(s);
+  if (angle) {
+    return { kind: "placeholder", token: angle[0], reason: `复核命令含未替换的占位符 ${angle[0]}（shell 会把 \`<\` 当重定向解析 ⇒ 语法错误，永远跑不起来）` };
+  }
+  const brace = /\{\{([^}\n]{1,40})\}\}/.exec(s);
+  if (brace) {
+    return { kind: "placeholder", token: brace[0], reason: `复核命令含未替换的占位符 ${brace[0]}（模板变量没展开）` };
+  }
+  return null;
+}
+
+/**
  * 人能读的结论（评审人第一眼看的就这一行）。
  *
  * 真机报障（2026-10-28 · hydro-two-ticket 的 T7-B）：默认命令 `npm test` 在一个 **不是 Node 工程**
