@@ -34,3 +34,6 @@ package/
 
 # agent-teams 团队的运行期状态（inbox / team.json 会话留痕），不入库
 .agent-teams/
+
+# docs/ 归档前的本地备份（20MB+，仅作回滚保险，不入库）
+docs.bak-*/

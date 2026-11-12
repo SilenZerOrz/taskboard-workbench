@@ -19,6 +19,7 @@ export default [
       "node_modules/**",
       ".data/**",
       "docs/**",
+      "docs.bak-*/**",
       "coverage/**",
       "**/*.min.js",
       "**/dist/**",
@@ -69,6 +70,25 @@ export default [
       "no-var": "warn",
       "prefer-const": "warn",
       eqeqeq: ["warn", "smart"],
+    },
+  },
+  // 卡 `-235`（需求 `R172`）· 浏览器侧文件：`web/app.js` / `lib/client.js` 以及 `tools/bench-*.mjs`
+  // 里被 `page.evaluate(...)` 带进**页面上下文**执行的代码，`window` / `document` 等是宿主提供的全局量。
+  // 只给这批文件放宽 —— Node 侧文件仍要求「不许引用未声明变量」（`index.js:389` 的真缺陷就是这么抓到的）。
+  {
+    files: ["web/**/*.js", "lib/client.js", "tools/bench-*.mjs"],
+    languageOptions: {
+      globals: {
+        window: "readonly",
+        document: "readonly",
+        navigator: "readonly",
+        localStorage: "readonly",
+        WebSocket: "readonly",
+        EventSource: "readonly",
+        ResizeObserver: "readonly",
+        MutationObserver: "readonly",
+        requestAnimationFrame: "readonly",
+      },
     },
   },
 ];
