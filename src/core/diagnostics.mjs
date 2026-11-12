@@ -23,6 +23,8 @@ export const DIAGNOSTIC_KINDS = Object.freeze([
   "human_review_required",
   // 2026-10-22 补口：把「投递到会话但没交作业」从**静默回收**变成**可见 + 有恢复动作**。
   "delivery_untaken",
+  // 卡 `-246`（需求 `R178` ③）：owner 是自由文本 ⇒「执行卡被写成审查/规划岗」这类越位只能人肉发现。
+  "owner-role-mismatch",
 ]);
 
 /** 严重度取值；high 最重（UI 用它排序与着色）。 */
@@ -185,8 +187,14 @@ function commonActions(ctx, { retryLabel = "退回待办（重新派发）", ret
   ];
 }
 
-/** 人工忽略留痕标记：`已忽略诊断「<kind>」…`（FR-79「忽略即消解且保留原文可回溯」）。 */
-const DISMISS_RE = /已忽略诊断[「"]?([a-zA-Z_]+)/;
+/**
+ * 人工忽略留痕标记：`已忽略诊断「<kind>」…`（FR-79「忽略即消解且保留原文可回溯」）。
+ *
+ * 2026-11-12（卡 `-246`）：字符类补上 `-` —— 新诊断 kind `owner-role-mismatch` **带连字符**，
+ * 原 `([a-zA-Z_]+)` 只会截到 `owner`，于是「忽略此项」写了留痕却压不住这条诊断（静默失效）。
+ * 既有 kind 全是 `[a-z_]+`，补 `-` 不改变它们的行为。
+ */
+const DISMISS_RE = /已忽略诊断[「"]?([a-zA-Z_-]+)/;
 
 /**
  * 已被人工忽略的诊断类型（且忽略发生在最近一次进展之后）。
@@ -226,6 +234,75 @@ function evidenceText(e) {
   const text = e.summary ?? e.text ?? e.title ?? null;
   if (typeof text === "string" && text !== "") return text;
   try { return JSON.stringify(e); } catch { return String(e); }
+}
+
+// ---------------------------------------------------------------------------
+// owner 与角色错配（卡 `-246` · 需求 `R178` ③）
+// ---------------------------------------------------------------------------
+
+/**
+ * owner 的角色词表（沿用团队编制口径：`src/core/team.mjs#TEAM_ROLES` 与 `web/app.js#OWNER_LABELS`）。
+ *
+ * owner 是**自由文本**（早期靠 `owner:<role>` 标签承载，见 `core/owner.mjs`），所以归一必须容忍
+ * 「开发 engineer」这类「中文 + 英文」写法，也不能把 `codex` / `agent-team:claude-cli` 当成角色。
+ */
+export const OWNER_ROLE_TOKENS = Object.freeze([
+  "lead", "planner", "engineer", "tester", "reviewer", "archivist",
+]);
+
+/**
+ * **不执行**的角色（卡 `-246` 任务书点名）：规划 / 审查 / 归档。
+ * 执行岗是 `engineer`（开发）与 `tester`（测试）。
+ */
+export const NON_EXECUTING_OWNER_ROLES = Object.freeze(["planner", "reviewer", "archivist"]);
+
+/** 角色词 → 人读标签（与前端 `OWNER_LABELS` 同口径；core 不能引 web，故各存一份）。 */
+export const OWNER_ROLE_LABELS = Object.freeze({
+  lead: "队长 lead", planner: "规划 planner", engineer: "开发 engineer",
+  tester: "测试 tester", reviewer: "评审 reviewer", archivist: "归档 archivist",
+});
+
+/**
+ * 看板自己的**卡类型标记**（`tasks` 表没有 kind 列，落在 labels 上 —— 见 store.mjs 分拆落库处）：
+ *   · `kind/work`  ＝ 工作项（要派出去执行/落地）
+ *   · `kind/review` ＝ 审查项（审别人的活）
+ */
+export const CARD_KIND_WORK_LABEL = "kind/work";
+export const CARD_KIND_REVIEW_LABEL = "kind/review";
+
+/**
+ * owner → 角色词（纯函数）。取**首个命中**的角色词；命不中返回 `null`（自由文本不判角色）。
+ *
+ * 词边界匹配（而非子串）：`reviewer` 不能被 `review` 命中、`codex` 不能被 `code` 命中。
+ * 「首个命中」按 `OWNER_ROLE_TOKENS` 的顺序（与团队编制表一致），含多个词时**保守取先出现的**。
+ */
+export function ownerRole(owner) {
+  const text = String(owner ?? "").trim().toLowerCase();
+  if (text === "") return null;
+  for (const token of OWNER_ROLE_TOKENS) {
+    if (new RegExp(`(?:^|[^a-z])${token}(?:[^a-z]|$)`).test(text)) return token;
+  }
+  return null;
+}
+
+/**
+ * 这张卡**是不是执行类**（纯函数）。
+ *
+ * 判据：卡带看板自己的卡类型标记 `kind/work`，且没有 `kind/review`（两者同时出现＝数据自相矛盾，不判）。
+ *
+ * **为什么不靠标题/描述猜**：看板没有别的字段能区分「要落地的执行卡」与「规划/文档卡」——
+ * 两者在 owner 上都可能是 planner。2026-11-12 真机库实测（`.data/taskboard.sqlite`，299 张卡）：
+ * 宽判据「在途 + owner∈{planner,reviewer,archivist}」命中 4 张，**4/4 全是误报**
+ * （`scada-vibe-3/4/6/12` 全是 planner 的正经规划卡：需求条款化 / 条款迁移 / 决策单 / 需求补条）。
+ * ⇒ 按卡 `-246`「历史卡大面积误报 ⇒ 停，改判据」的处置，判据收窄到**看板自己有类型标记**的卡。
+ */
+export function isExecutionClassCard(task) {
+  const labels = Array.isArray(task?.labels)
+    ? task.labels.map((l) => String(l ?? "").trim().toLowerCase())
+    : [];
+  if (!labels.includes(CARD_KIND_WORK_LABEL)) return false;
+  if (labels.includes(CARD_KIND_REVIEW_LABEL)) return false;
+  return true;
 }
 
 export const DIAGNOSTIC_RULES = Object.freeze([
@@ -464,6 +541,52 @@ export const DIAGNOSTIC_RULES = Object.freeze([
         actions: [
           action("human_review", "派发人工校验任务（停手等人）", { kind: "primary", path: `/api/tasks/${enc}/human-review`, hint: `类别=${label}；执行侧不得认领、不得置 done` }),
           action("dismiss", "忽略此项", { path: `/api/tasks/${enc}/diagnostics/dismiss`, body: { kind: "human_review_required" }, hint: "忽略后同类情形不再提示，直到出现更新的进展评论" }),
+        ],
+      };
+    },
+  },
+  {
+    /**
+     * 卡 `-246`（需求 `R178` ③）：**owner 与角色错配** —— owner 是自由文本，不校验角色，
+     * 于是「这张执行卡的 owner 是 review/plan 岗」这类越位只能靠人肉发现。
+     *
+     * 判据（三条**全部**满足才报）：
+     *   ① **owner 越位**：owner 归一后命中不执行的角色 {planner, reviewer, archivist}
+     *      （自由文本如 `codex` 不判 —— 判不准就不升级，FR-85 红线）。
+     *   ② **卡是执行类**：卡带看板自己的卡类型标记 `kind/work`（`kind/review` 的审查卡不判）。
+     *   ③ **卡在途**：`done` / `canceled` 不再提示 —— 收口卡的历史错配不影响当下。
+     *
+     * **只诊断、不拦截**（任务书「移出：硬拦截（会误伤历史卡）」）：本规则不写库、不改状态、
+     * 不阻断建卡与派发，只产出一条 medium 提示 + 两个恢复动作（人工改绑 / 人工忽略）。
+     */
+    kind: "owner-role-mismatch",
+    evaluate(ctx) {
+      const { task, dismissed } = ctx;
+      if (dismissed.has("owner-role-mismatch")) return null;
+      const role = ownerRole(task.owner);
+      if (!role || !NON_EXECUTING_OWNER_ROLES.includes(role)) return null;
+      if (!isExecutionClassCard(task)) return null;
+      if (task.status === "done" || task.status === "canceled") return null;
+      const enc = encodeRef(task.identifier);
+      const roleLabel = OWNER_ROLE_LABELS[role] ?? role;
+      return {
+        kind: "owner-role-mismatch", severity: "medium",
+        title: `负责人与卡的类型错配：工作项的负责人是「${roleLabel}」`,
+        detail: `这张卡标着「工作项（${CARD_KIND_WORK_LABEL}）」—— 是要派出去执行/落地的活；`
+          + `但负责人（owner）写的是「${roleLabel}」，那是**不执行**的角色（执行岗是 开发 engineer / 测试 tester）。\n`
+          + `越位的后果：这条活要么没人认领（owner 指向错岗），要么被当成审查/规划/归档处理。\n`
+          + `请人工确认：若确实由执行岗做 → 改绑负责人；若这张卡本来就是审查/规划/归档卡 → 忽略此项（不是缺陷）。`,
+        suggested: "reassign_owner",
+        actions: [
+          action("reassign_owner", "改绑负责人（执行岗 engineer）", {
+            kind: "primary", method: "PATCH", path: `/api/tasks/${enc}`,
+            body: { owner: "engineer", version: task.version },
+            hint: "按项目实际编制改（测试活填 tester）；若这张卡本就是审查/规划/归档卡，请改用「忽略此项」。",
+          }),
+          action("dismiss", "忽略此项（owner 正确 / 卡不是执行卡）", {
+            path: `/api/tasks/${enc}/diagnostics/dismiss`, body: { kind: "owner-role-mismatch" },
+            hint: "写一条忽略留痕，原文可回溯",
+          }),
         ],
       };
     },
