@@ -77,17 +77,18 @@ test("③ askFields 结构门：三条取消出口都归到 finish(null)，提�
   assert.match(app, /if \(entry\.spec\.required && !value\.trim\(\)\)/, "必填字段必须在本地校验");
 });
 
-test("④ 四个功能入口都改走 askFields / askNewProject，且不再各自拼 prompt", () => {
+test("④ 五个功能入口都改走 askFields / askNewProject，且不再各自拼 prompt", () => {
   const app = read("web/app.js");
   // 新建项目：会话绑定门 + 工具栏，共用一份字段表（避免两处文案漂移）
   assert.equal(
     (app.match(/await askNewProject\(\)/g) ?? []).length, 2,
     "两个「新建项目」入口都必须走 askNewProject()",
   );
-  // 另外三处（返工说明 / 人工结论 / 需求条目标题）各一次，加上 askNewProject 内部一次 = 4
+  // 另外四处（返工说明 / 人工结论 / 需求条目标题 / 撤单原因·卡 `-252`）各一次，
+  // 加上 askNewProject 内部一次 = 5。数字门守的是「新入口不许绕开取值器」，所以入口增加时要一起改。
   assert.equal(
-    (app.match(/await askFields\(\{/g) ?? []).length, 4,
-    "返工说明 / 人工结论 / 需求条目标题 + askNewProject 内部，共 4 处必须走 askFields()",
+    (app.match(/await askFields\(\{/g) ?? []).length, 5,
+    "返工说明 / 人工结论 / 需求条目标题 / 撤单原因 + askNewProject 内部，共 5 处必须走 askFields()",
   );
   // 无条件调用（不 await、不判空）会让取消路径变成「用空值发请求」
   assert.match(app, /const input = await askFields\(\{/, "askFields 的返回值必须接住");

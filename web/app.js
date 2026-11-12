@@ -5302,6 +5302,33 @@
           try { const r = await api("POST", `/api/tasks/${ref}/decompose`, {}); showBanner(`已生成子任务：${(r.children || []).map((c) => c.identifier).join("、")}（待办池）`, "info"); closeDrawer(); await loadTasks(); }
           catch (e) { showBanner(`拆解失败：${e.message}`, "error"); }
         }));
+        // 需求 `R180` / 卡 `-252`（2026-11-12 真机批注「这条任务确认不执行，但是人工操作没有关闭按钮」）：
+        // `canceled` 早就是合法终态（服务端 `PATCH /api/tasks/:ref {status:"canceled"}` 放行、库内已有既有 canceled 卡），
+        // 缺的只是**前端入口** —— 「确认不执行」的卡此前只能挂着，或被人拖去别的列。
+        // 口径三条（刻意如此）：① 终态卡（done / canceled）不摆这枚按钮；② 必须写原因，空原因直接拒；
+        // ③ 二次确认走**页内 dialog**（宿主没有 `window.prompt`，见卡 `-242`），撤单后落评论 + 审计，不是静默改库。
+        if (t.status !== "done" && t.status !== "canceled") {
+          ops.appendChild(btn("取消任务（撤单）", async () => {
+            const filled = await askFields({
+              title: `取消任务 ${t.identifier}`,
+              hint: "撤单是终态：卡片进「已取消」。原因会写进评论 —— 后人必须能看懂为什么不执行。本动作不删除任何数据。",
+              fields: [{ name: "reason", label: "撤单原因", multiline: true, rows: 3, required: true, requiredMessage: "撤单必须写原因" }],
+              submit: "确认取消",
+            });
+            if (!filled) return;
+            const reason = String(filled.reason ?? "").trim();
+            if (!reason) { showBanner("撤单必须写原因（否则后人不知道为什么不执行）", "error"); return; }
+            try {
+              // 抽屉里的 `t` 可能是几十秒前的快照 ⇒ 先取最新 version，避免 VERSION_CONFLICT 白跑一次。
+              const fresh = await api("GET", `/api/tasks/${ref}`);
+              await api("PATCH", `/api/tasks/${ref}`, { version: fresh?.task?.version, status: "canceled", actor: "human" });
+              await api("POST", `/api/tasks/${ref}/comments`, { body: `人工撤单（不执行）：${reason}`, actor: "human" });
+              closeDrawer(); await loadTasks(); showBanner(`${t.identifier} 已撤单（已取消）—— 依赖它的下游卡需要按「前置已撤单」重估`, "info");
+            } catch (e) {
+              showBanner(`撤单失败：${e.message}`, "error");
+            }
+          }, "danger"));
+        }
         // （原 `drawerBody.appendChild(ops)` 已移除：动作区改挂标题栏 `drawerActions`。）
 
         const related = (audit.audit ?? []).filter((a) => a.target === t.identifier);
