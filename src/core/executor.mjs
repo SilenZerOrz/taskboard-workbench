@@ -390,14 +390,18 @@ export function pathsOfStatusLines(lines = []) {
  * 终态仍由写回决定（成功 → 待验收；失败 → 统一受阻入口）。
  *
  * 任何一步失败都不阻断执行——执行结果仍会如实写回看板。
+ *
+ * `sessionId`（卡 `-257` / 需求 `R183`）：经项目主会话下发的执行**必须**把会话标识一并落到
+ * `tasks.session_id` 与 `task_runs.session_id` —— 否则「打开执行会话」指不到记录所在的那条会话，
+ * 本轮要修的正是这个可观察性缺口。直跑路径不传（保持 `null`，与既有读数一致）。
  */
-export function claimForCliExecution(store, ref, { actor = "cli-executor" } = {}) {
+export function claimForCliExecution(store, ref, { actor = "cli-executor", sessionId = null } = {}) {
   const outcome = { claimed: false, runStarted: false, fromStatus: null, toStatus: null, note: null };
   try {
     const fresh = store.requireTaskRef(ref);
     outcome.fromStatus = fresh.status;
     if (fresh.status === "todo") {
-      store.startTaskExecution(fresh.identifier, { sessionId: null });
+      store.startTaskExecution(fresh.identifier, { sessionId });
       outcome.claimed = true;
       outcome.note = "authorized";
     } else if (fresh.status !== "in_progress") {
@@ -413,7 +417,7 @@ export function claimForCliExecution(store, ref, { actor = "cli-executor" } = {}
     }
     const cur = store.requireTaskRef(fresh.identifier);
     if (cur.status === "in_progress" && typeof store.getCurrentRun === "function" && !store.getCurrentRun(cur)) {
-      store.startTaskRun(cur.identifier, { actor });
+      store.startTaskRun(cur.identifier, { actor, sessionId });
       outcome.runStarted = true;
     }
     outcome.toStatus = store.requireTaskRef(fresh.identifier).status;

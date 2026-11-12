@@ -4736,8 +4736,23 @@
         onDone?.();
         return `已下发宿主会话：mode=${launch?.mode ?? "?"}${launch?.sessionId ? ` · 会话 ${String(launch.sessionId).slice(0, 12)}` : ""}`;
       }
+      // 卡 `-257`（需求 `R183`）：CLI 执行器**默认经项目主会话下发并跟踪**。
+      // 成功 ⇒ 会话标识已绑到本卡，「打开执行会话」直达记录所在的那条会话；
+      // 投递失败 ⇒ 抛错（不回落直跑 —— 回落会让「记录在哪里」悄悄变掉）；
+      // 无主会话/无宿主 ⇒ 服务端回落直跑，但响应里带 `fallbackReason`，这里必须如实说出来。
       const r = await api("POST", `/api/tasks/${ref}/exec-cli`, { executor: executor.id, async: true });
       onDone?.();
+      if (r?.via === "main-session") {
+        if (r.delivered === false) {
+          const error = new Error(`未下发：${r.reason ?? "原因未知"}（${r.nextAction ?? "先确认主会话可用"}）`);
+          error.code = "MAIN_SESSION_NOT_DELIVERED";
+          throw error;
+        }
+        return `已交项目主会话下发（${executor.label} · 会话 ${String(r.sessionId ?? "").slice(0, 12)}…）—— 执行记录就在该会话里，点「打开执行会话」直达；跑完由主会话回写证据`;
+      }
+      if (r?.fallbackReason) {
+        return `已直跑 ${executor.label}（未走主会话：${r.fallbackReason === "no-main-session" ? "任务与项目都没有可用会话引用" : "本实例无宿主会话通道"}）—— 执行记录**不在任何会话里**；卡片评论已留痕`;
+      }
       return `已提交 ${executor.label} 后台执行（${r?.executor ?? executor.id}）`;
     }
 
@@ -4834,7 +4849,7 @@
           ? `把 ${task.identifier} 派发给「${chosen.label}」执行？\n\n· 派发后由项目执行团队接手（roles 由项目设置决定）\n· 完成回写「待验收」，收口仍由人确认`
           : chosen.kind === "host-session"
             ? `把 ${task.identifier} 交给「${chosen.label}」执行？\n\n· 会尝试新建/切换会话（可能切换主视图）\n· 执行前先认领：卡片置「进行中」`
-            : `把 ${task.identifier} 交给「${chosen.label}」**真实执行**？\n\n· 非交互调用本地 CLI（通常带文件写权限），耗时数十秒到数分钟\n· 执行前先认领：卡片置「进行中」\n· 完成后回流「待验收」或「受阻」，并附证据评论\n· 期间请勿重复点击`;
+            : `把 ${task.identifier} 交给「${chosen.label}」执行？\n\n· 下发：交「项目主会话」下发并跟踪 —— 执行记录留在该会话里，「打开执行会话」直达\n· 执行：非交互调用本地 CLI（通常带文件写权限），耗时数十秒到数分钟\n· 执行前先认领：卡片置「进行中」\n· 跑完由主会话回写证据并提交「待验收」（或写清失败原因）；完成仍由人确认\n· 期间请勿重复点击`;
         if (typeof window !== "undefined" && typeof window.confirm === "function" && !window.confirm(confirmText)) return;
         launch.disabled = true;
         try {
@@ -5412,6 +5427,14 @@
           ["最近进展", fmtTime(lastProgress)],
           ["连续失败", `${exec?.consecutiveFailures ?? 0} / ${exec?.failureLimit ?? 2}`],
         ]));
+        // 卡 `-257`（需求 `R183`）· **「打开执行会话」与 CLI 执行记录同源**：
+        // CLI 执行器（claude / codex / hermes）默认**经项目主会话下发**并跟踪，任务级会话引用会被
+        // 绑成项目主会话 —— 执行记录就在那条会话里。不把这句话写出来，「会话标识」一栏只是换了个 id，
+        // 人不知道点「打开执行会话」到底能看到什么（真机 `-246` 的原话就是「打开执行会话没有看到记录」）。
+        const projMainId = (state.projects ?? []).find((p) => p.id === t.projectId)?.initialSessionId ?? null;
+        if (execSession && projMainId && String(execSession) === String(projMainId)) {
+          execSec.appendChild(mk("p", "hint", "本任务绑定的是**项目主会话**：CLI 执行器（claude / codex / hermes）的派单与执行记录都在这里 —— 点「打开执行会话」直达该会话；跑完由主会话回写四节证据并提交「待验收」。"));
+        }
         // FR-84 补口（2026-10-23）· **实例工作区预检**（说清「为什么重建也可能不对」）：
         // 一个 DSH 实例只有一个工作区，宿主不提供切换（`uiWorkspace` 不可用）⇒ 在看板里切项目
         // **不会**让宿主换工作区，本实例建出的会话只会落在实例自己的工作区上。
@@ -5615,7 +5638,7 @@
         // 在此之前只有 API（POST /api/tasks/:ref/exec-cli），看板上点不到 —— 这一区补的就是那个入口。
         const cliSec = mk("div", "drawer-section");
         cliSec.appendChild(mk("h3", null, "CLI 执行器（真实执行）"));
-        cliSec.appendChild(mk("p", "hint", "把该任务交给项目配置的 CLI 执行器（teamTemplate.roles[].executor = cli:*，且不在 forbiddenExecutors 中）真实执行：非交互调用 → 采集退出码 / 耗时 / 本次改动差集 → 写回评论 + 尝试记录；成功转「待验收」，失败走统一受阻入口。执行前会先认领并把卡片置为「进行中」——即使它原先在待办池等其它列，执行期也会如实显示在「进行中」，跑完再回到「待验收」。"));
+        cliSec.appendChild(mk("p", "hint", "把该任务交给 CLI 执行器（teamTemplate.roles[].executor = cli:*，且不在 forbiddenExecutors 中）执行：**默认交项目主会话下发并跟踪** —— 命令与回写要求投给主会话，执行记录留在那条会话里（「打开执行会话」直达），跑完由主会话写四节证据并把卡提交「待验收」。执行前会先认领并把卡片置为「进行中」（原为 todo 则走授权门）。无主会话通道的实例（独立进程 / 隔离验证台）会回落服务端直跑，并在卡片评论里留痕「执行记录不在任何会话里」。"));
         // 卡 `-238`（R174）：CLI 区也放一个**只含 CLI 形态**的选择器（放团队/宿主会话只会点出必然的 400）。
         // 「预览 / 执行」都按这里选的那个走 —— 否则选了 codex 却预览 claude，预览就在骗人。
         const cliPicker = cliEntry(t) === "start" ? mountExecutorPicker(t, {
@@ -5650,16 +5673,37 @@
         }));
         const cliEntryKind = cliEntry(t);
         if (cliEntryKind === "start") cliBar.appendChild(btn("交给 CLI 执行器执行", async () => {
-          if (!window.confirm(`确认把 ${t.identifier} 交给 CLI 执行器**真实执行**？\n\n· 非交互调用本地 CLI（通常带文件写权限），耗时数十秒到数分钟\n· 执行前先认领：卡片将被置为「进行中」（原为 todo 则走授权门）\n· 完成后看板自动刷新为「待验收」或「受阻」，并附退出码/耗时/改动清单\n· 期间请勿重复点击`)) return;
+          if (!window.confirm(`确认把 ${t.identifier} 交给 CLI 执行器执行？\n\n· 下发：交「项目主会话」下发并跟踪 —— 执行记录留在该会话里，「打开执行会话」直达\n· 执行：非交互调用本地 CLI（通常带文件写权限），耗时数十秒到数分钟\n· 执行前先认领：卡片将被置为「进行中」（原为 todo 则走授权门）\n· 跑完由主会话回写四节证据并提交「待验收」（或写清失败原因）；完成仍由人确认\n· 期间请勿重复点击`)) return;
           try {
             const r = await api("POST", `/api/tasks/${ref}/exec-cli`, { async: true, executor: cliPicker?.selected() ?? undefined });
-            cliOut.textContent = [
-              `已提交后台执行：${r.executor ?? "—"}（CLI：${r.plan?.cli ?? "—"}）`,
-              `工作目录：${r.plan?.cwd ?? "—"}`,
-              "",
-              "执行完成后看板评论会给出退出码 / 耗时 / 改动清单；本页点「刷新」即可看到。",
-            ].join("\n");
-            showBanner(`已提交 CLI 执行器（${r.executor ?? "cli"}）后台执行，完成后看板自动刷新`, "info");
+            if (r?.via === "main-session" && r.delivered === false) {
+              cliOut.textContent = [
+                `未下发：${r.reason ?? "原因未知"}`,
+                `会话：${r.sessionId ?? "—"}（来源 ${r.source ?? "未知"}）`,
+                "",
+                `下一步：${r.nextAction ?? "先确认主会话可用后重试"}`,
+              ].join("\n");
+              showBanner(`未下发：${r.reason ?? "原因未知"}（未回落直跑）`, "error");
+              return;
+            }
+            cliOut.textContent = r?.via === "main-session"
+              ? [
+                `已交项目主会话下发：${r.executor ?? "—"}（CLI：${r.plan?.cli ?? "—"}）`,
+                `会话：${r.sessionId ?? "—"}（来源 ${r.source ?? "未知"}）→ 点「打开执行会话」直达`,
+                `工作目录：${r.plan?.cwd ?? "—"}`,
+                "",
+                "执行记录就在该会话里；跑完由主会话写四节证据并提交「待验收」（或写清失败原因）。",
+              ].join("\n")
+              : [
+                `已提交后台执行：${r?.executor ?? "—"}（CLI：${r?.plan?.cli ?? "—"}）`,
+                `工作目录：${r?.plan?.cwd ?? "—"}`,
+                r?.fallbackReason ? `⚠ 未走主会话（${r.fallbackReason}）：本次执行记录**不在任何会话里**（卡片评论已留痕）` : "",
+                "",
+                "执行完成后看板评论会给出退出码 / 耗时 / 改动清单；本页点「刷新」即可看到。",
+              ].filter(Boolean).join("\n");
+            showBanner(r?.via === "main-session"
+              ? `已交项目主会话下发（${r.executor ?? "cli"}），执行记录在会话 ${String(r.sessionId ?? "").slice(0, 12)}…`
+              : `已提交 CLI 执行器（${r?.executor ?? "cli"}）后台执行，完成后看板自动刷新`, "info");
             await loadTasks();
           } catch (e) {
             showBanner(`提交失败：${e.message}`, "error");

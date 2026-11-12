@@ -35,6 +35,7 @@ const PACKAGED_DOCS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.ur
 const HOST_UNAVAILABLE_NEXT = "该实例没有宿主会话通道（独立进程，/api/health 的 host.capabilities 为 null）：改到 DSH 内的任务工作台操作，或把返回的 prompt 直接粘到会话里手工投递";
 
 import { buildDebugDispatchPrompt } from "../core/debug-dispatch.mjs";
+import { buildMainSessionCliPrompt } from "../core/cli-dispatch.mjs";
 import { buildSplitAskPrompt } from "../core/split-ask.mjs";
 import { buildReviewEvidence, detectUnrunnableVerify, formatVerifyComment, normalizeVerifyCommand, summarizeVerifyOutput, VERIFY_DEFAULT_COMMAND } from "../core/verify.mjs";
 import { buildGapPrompt, buildKickoffTodos, collectGaps, evaluateKickoff } from "../core/kickoff.mjs";
@@ -1529,7 +1530,21 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
         promptVia: chosenSpec?.promptVia ?? "stdin",
         prompt,
       };
-      if (body.dryRun === true || searchParams.get("dryRun") === "1") return { status: 200, payload: { ran: false, dryRun: true, plan } };
+      // 卡 `-257`：预览也要**如实说清这条命令会怎么下发** —— 人看完预览才知道是「交主会话」还是「服务端直跑」。
+      const wantMain = body.direct !== true && searchParams.get("direct") !== "1";
+      if (body.dryRun === true || searchParams.get("dryRun") === "1") {
+        const dryRef = wantMain ? resolveSessionRef(store, task) : { sessionId: null, source: null };
+        const drySid = dryRef.sessionId ?? null;
+        return { status: 200, payload: {
+          ran: false, dryRun: true, plan,
+          via: wantMain ? "main-session" : "direct",
+          mainSession: wantMain ? {
+            sessionId: drySid, source: dryRef.source ?? null,
+            deliverable: Boolean(drySid) && typeof store.hostSessionPort?.sendPrompt === "function",
+          } : null,
+          promptToMainSession: wantMain && drySid ? buildMainSessionCliPrompt({ task, project, executor, plan }) : null,
+        } };
+      }
       const timeoutMs = Number(body.timeoutMs ?? 0) > 0 ? Number(body.timeoutMs) : DEFAULT_TIMEOUT_MS;
       // FR-40 归因门（2026-10-22 · CLI 链路验证台 `tools/bench-cli-chain.mjs` 抓到）：
       // `/exec-cli` 是**第三条真的会干活的执行入口**（另两条＝`/execute` 与 `POST /api/teams` 派发），
@@ -1541,6 +1556,75 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
       // 「进行中」），套 `assertExecutable` 会把这条设计挡掉。
       // `dryRun` 保持宽松：只回执行计划、无副作用，预览不该被归因门挡住。
       store.assertAttributed(task.identifier);
+      // ── 卡 `-257`（需求 `R183`）：CLI 执行器**默认经项目主会话下发并跟踪** ────────────────────
+      // 用户拍板的口径：除「DSH 宿主会话」直接执行外，其他非绑定会话的 agent 执行者一律交
+      // **项目主会话**下发并跟踪，卡片的执行反馈也由主会话回写。
+      //
+      // 为什么（真机 `-246` 的硬证）：服务端直跑 `claude -p` 时，进程与任何会话都无关 ——
+      // 人点「打开执行会话」只看得到项目主会话、里面一条记录都没有，`task_runs` 也只有
+      // `actor=cli-executor` / `session_id=null`，磁盘上更没有输出。执行过程不可观察。
+      //
+      // 保留 `direct:true`（或 `?direct=1`）＝服务端直跑：隔离验证台、无宿主实例、自动化脚本要走这条路，
+      // 但它们**必须显式声明**，不再是被默认落到的静默旁路。
+      //
+      // 门序红线：本分支在 `assertAttributed` **之后** —— 未归因的卡连"投递"都不该发生。
+      let fallbackNote = null; // 回落直跑时的如实标注（null ⇒ 不适用）
+      const viaMain = wantMain; // 同一个判据（dryRun 已在上面早返回，不会走到这里）
+      if (viaMain) {
+        const resolved = resolveSessionRef(store, task);
+        const mainSid = resolved.sessionId ?? null;
+        const mainSource = resolved.source ?? null;
+        const port = store.hostSessionPort;
+        const canDispatch = Boolean(mainSid) && Boolean(port) && typeof port.sendPrompt === "function";
+        if (canDispatch) {
+          const cliPrompt = buildMainSessionCliPrompt({ task, project, executor, plan });
+          let sent = null;
+          let reason = null;
+          try { sent = await port.sendPrompt(mainSid, cliPrompt); }
+          catch (error) { reason = error?.code ?? String(error?.message ?? error); }
+          const delivered = Boolean(sent?.sent ?? sent?.delivered ?? false);
+          if (!delivered) {
+            // **投递失败不回落直跑**：回落会让"记录在哪里"悄悄变掉，正是本轮要消除的不可观察性。
+            // 如实回 200 + delivered:false + 原因，由人决定（重试 / 重建主会话 / 显式直跑）。
+            const why = reason ?? sent?.reason ?? "not-delivered";
+            try { store.recordAudit({ actor: "board", action: "exec-cli-via-main", target: task.identifier, allowed: false, reason: why, detail: `session=${mainSid} source=${mainSource ?? "null"} executor=${executor.id}` }); } catch { /* ignore */ }
+            return { status: 200, payload: {
+              ran: false, via: "main-session", delivered: false,
+              sessionId: mainSid, source: mainSource, executor: executor.id, reason: why,
+              nextAction: "先「打开执行会话」确认主会话可用 / 重建并绑定项目主会话后重试；确需服务端直跑请显式传 direct:true",
+              prompt: cliPrompt,
+            } };
+          }
+          // ① 绑定会话：任务级引用 → 项目主会话（「打开执行会话」自此直达记录所在的那条会话）
+          const bound = store.rebindTaskSession(task.identifier, mainSid);
+          // ② 认领 + 进「进行中」+ 开尝试记录（会话标识一并落库，尝试记录也能反查到会话）
+          const claim = claimForCliExecution(store, task.identifier, { actor: "cli-executor", sessionId: mainSid });
+          const after = store.requireTaskRef(task.identifier);
+          store.addComment(task.identifier, { body: [
+            `已交项目主会话下发执行（CLI 执行器 ${executor.id}）`,
+            `- 会话：${mainSid}（来源 ${mainSource ?? "未知"}）—— 执行记录就在这条会话里，点「打开执行会话」直达`,
+            `- 工作目录：${plan.cwd ?? "（未设置）"}`,
+            `- 命令：${plan.cli ?? ""} ${(plan.args ?? []).join(" ")}`.trim(),
+            `- 回写要求：主会话跑完写四节证据 → 提交「待验收」（或写失败原因）；完成仍由人确认`,
+          ].join("\n") });
+          try { store.recordAudit({ actor: "board", action: "exec-cli-via-main", target: task.identifier, allowed: true, reason: sent?.reason ?? "delivered", detail: `session=${mainSid} source=${mainSource ?? "null"} executor=${executor.id} sessionBound=${bound.changed}` }); } catch { /* ignore */ }
+          emit("task.updated", { taskId: after.id, identifier: after.identifier, status: after.status });
+          return { status: 202, payload: {
+            ran: true, async: true, via: "main-session", delivered: true,
+            sessionId: mainSid, source: mainSource, executor: executor.id,
+            plan, prompt: cliPrompt, claim, status: after.status,
+          } };
+        }
+        // 无主会话 / 无宿主通道 ⇒ 回落直跑，但**必须在卡片上留痕**：
+        // 「这次执行不在任何会话里」是可观察性事实，不能只存在于这一次的 HTTP 响应里。
+        const fallbackReason = mainSid ? "host-unavailable" : "no-main-session";
+        fallbackNote = { via: "direct", delivered: false, fallbackReason, mainSession: { sessionId: mainSid, source: mainSource } };
+        store.addComment(task.identifier, { body: `⚠ 未走项目主会话：${fallbackReason === "no-main-session" ? "任务与项目都没有可用会话引用" : "当前实例没有宿主会话通道"} ⇒ 本次由服务端**直跑** CLI。\n- 执行记录**不在任何会话里**（进程独立，退出后只剩本卡评论与尝试记录）\n- 要让它可观察：先「重建并绑定项目主会话」，再重新下发` });
+        try { store.recordAudit({ actor: "board", action: "exec-cli-via-main", target: task.identifier, allowed: true, reason: `fallback-direct:${fallbackReason}`, detail: `session=${mainSid ?? "null"} executor=${executor.id}` }); } catch { /* ignore */ }
+      } else {
+        // 显式 `direct:true` ⇒ 回包里也写明通道，否则「这次到底是哪条路」只能靠调用方记着自己传了什么。
+        fallbackNote = { via: "direct", delivered: false, explicitDirect: true };
+      }
       // 真实落盘：先认领并转「进行中」——否则看板只看到 todo / 原状态，且与执行循环之间没有互斥。
       // 口径见 `claimForCliExecution`：todo 走授权门；其它状态（人工显式点击即授权）也**必须如实
       // 进入「进行中」**，否则整个执行期看板显示错误的列（2026-10-18 实测 -73 停在「待办池」14 分钟）。
@@ -1555,7 +1639,7 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
       if (body.async === true || searchParams.get("async") === "1") {
         fire();
         emit("task.updated", { taskId: task.id, identifier: task.identifier, status: task.status });
-        return { status: 202, payload: { ran: true, async: true, executor: executor.id, plan, claim } };
+        return { status: 202, payload: { ran: true, async: true, executor: executor.id, plan, claim, ...(fallbackNote ?? {}) } };
       }
       const r = await fire();
       emit("task.updated", { taskId: task.id, identifier: task.identifier, status: store.requireTaskRef(task.identifier).status });
@@ -1567,6 +1651,7 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
           durationMs: r.result?.durationMs ?? 0, cwd: r.result?.cwd ?? null, files: r.result?.diff?.files ?? [],
           stdout: r.result?.stdout ?? "", stderr: r.result?.stderr ?? "", comment: r.comment ?? null,
           claim,
+          ...(fallbackNote ?? {}),
           status: store.requireTaskRef(task.identifier).status,
         },
       };
