@@ -107,6 +107,22 @@ export const DEFAULT_HEARTBEAT_GAP_MS = 10 * 60 * 1000;
 // ---- 失败会计与熔断（FR-78） ------------------------------------------------
 /** 连续非成功次数的默认阈值；达到即自动置"受阻"并停止自动重试。 */
 export const DEFAULT_FAILURE_LIMIT = 2;
+
+/**
+ * 卡 `-259`（需求 `R184`）：**尝试记录的摘要是「执行方回了什么」，不是记账文案**。
+ *
+ * 旧口径（`markTaskSucceeded` 里硬编码）把「按成功完成记账（失败计数清零）」写进 `run.summary`，
+ * 于是卡片「尝试记录」永远读不出跑了什么 —— 真机 `-248`：一条 22 分 51 秒的成功尝试，摘要就这一句。
+ * 现在统一走这里：压成单行、限 500 字符（与 `endTaskRun` 的截断口径一致）；**空就如实写「执行方未回写摘要」**，
+ * 绝不用记账文案冒充执行内容。
+ */
+export const RUN_SUMMARY_FALLBACK = "执行方未回写摘要";
+export function normalizeRunSummary(text) {
+  const flat = String(text ?? "").replace(/\s+/g, " ").trim();
+  if (flat === "") return RUN_SUMMARY_FALLBACK;
+  return flat.length > 500 ? `${flat.slice(0, 499)}…` : flat;
+}
+
 /** 近期成功窗口：窗口内成功过的任务不得被再次自动派发（除非人工显式重跑）。 */
 export const DEFAULT_SUCCESS_WINDOW_MS = 60 * 60 * 1000;
 /**
@@ -2667,7 +2683,7 @@ export function openStore(options = {}) {
       return { tripped, failures, effectiveLimit, limitSource, quota, task: store.getTaskById(task.id) };
     },
     /** 成功即清零（FR-78）；成功 = 产出已提交待验收（含团队回报完成）。 */
-    markTaskSucceeded(ref, { now = null } = {}) {
+    markTaskSucceeded(ref, { now = null, summary = null } = {}) {
       const task = store.requireTaskRef(ref);
       const at = new Date(now ?? Date.now()).toISOString();
       // FR-80：复发计数/阻断类型/人工兜底标记**只在成功时清零**
@@ -2677,7 +2693,9 @@ export function openStore(options = {}) {
         db.prepare("update tasks set labels = ? where id = ?").run(JSON.stringify(labels), task.id);
       } catch { /* ignore */ }
       // FR-82：成功 = 本次尝试的终态；事件流追加（"完成"仍需人确认，这一步只记成功会计）
-      store.endTaskRun(task.identifier, { outcome: "success", summary: "按成功完成记账（失败计数清零）", actor: "system", now: now ?? Date.now() });
+      // 卡 `-259`（R184）：摘要承载**执行方结论**（调用方给什么记什么）；没给就如实写「执行方未回写摘要」。
+      // 记账这件事本身仍由下面的 `consecutive_failures = 0` 落库 + `run_ended` 事件承担，信息不丢。
+      store.endTaskRun(task.identifier, { outcome: "success", summary: normalizeRunSummary(summary), actor: "system", now: now ?? Date.now() });
       return store.getTaskById(task.id);
     },
     /**
@@ -2775,9 +2793,10 @@ export function openStore(options = {}) {
       db.prepare("update team_tasks set status = 'failed', updated_at = ? where task_id = ? and status in ('open','running')").run(nowIso(), task.id);
       return r.task;
     },
-    submitTaskForReview(ref, { comment = "" } = {}) {
+    submitTaskForReview(ref, { comment = "", summary = null } = {}) {
       // FR-83：提交待验收 = 请求评审（从这里进评审一等流程）
-      return store.requestReview(ref, { comment, actor: "team" }).task;
+      // 卡 `-259`（R184）：`summary` 一路透传，最终落到 `run.summary`（执行方结论，不是记账文案）
+      return store.requestReview(ref, { comment, summary, actor: "team" }).task;
     },
     // ---------------- 评审流程（FR-83） ----------------
     /**
@@ -2807,7 +2826,7 @@ export function openStore(options = {}) {
      * 请求评审（FR-83 的一等流程）：进「待验收」+ **指派评审者** + 记下**来源列**（返工退回哪一列）。
      * 释放实现认领（FR-77）；执行成功照 FR-78 记账；事件流写 `review_requested`。
      */
-    requestReview(ref, { reviewer = null, dependsOn = null, comment = "", actor = "team", now = null } = {}) {
+    requestReview(ref, { reviewer = null, dependsOn = null, comment = "", summary = null, actor = "team", now = null } = {}) {
       const task = store.requireTaskRef(ref);
       const at = new Date(now ?? Date.now()).toISOString();
       // 卡 `-244`（R178）：显式传了的优先；没传就按项目团队模板补一个评审角色，
@@ -2825,7 +2844,16 @@ export function openStore(options = {}) {
               version = version + 1, updated_at = ? where id = ?`,
       ).run(assigned, at, source, dependsOn, dependsOn, at, task.id);
       if (comment) store.addComment(task.id, { body: comment });
-      store.markTaskSucceeded(task.identifier); // FR-78：产出已提交待验收 = 本次执行成功
+      // 卡 `-259`（R184）：摘要优先级 = 调用方显式给 > 本次评论首行 > 最近一条结构化证据的 verdict 首句。
+      // 三级都没有 ⇒ 交给 `normalizeRunSummary` 写「执行方未回写摘要」（不伪造）。
+      let runSummary = summary;
+      if (!runSummary && String(comment ?? "").trim() !== "") {
+        runSummary = String(comment).split("\n").map((line) => line.trim()).find((line) => line !== "") ?? null;
+      }
+      if (!runSummary) {
+        try { runSummary = store.latestTaskEvidence(task.identifier)?.verdict ?? null; } catch { runSummary = null; }
+      }
+      store.markTaskSucceeded(task.identifier, { summary: runSummary }); // FR-78：产出已提交待验收 = 本次执行成功
       // 卡 `-245`（R178）：已经在「待验收」再点一次，是同态迁移 —— 不写空转事件
       // （真机 8 卡攒了 16 条 `in_review→in_review`，纯日志噪音）。`review_requested` 照写，动作本身要留痕。
       if (task.status !== "in_review") {
@@ -3811,7 +3839,8 @@ export function openStore(options = {}) {
         db.prepare("update team_tasks set status = 'completed', updated_at = ? where id = ?").run(nowIso(), teamTaskId);
         if (row.kind === "review" && reviewPassed !== true) store.blockDownstream(t.id, "review-not-passed");
         store.addComment(t.id, { body: `团队回报：完成 → 提交待验收${ev}` }); // 自动登记反馈
-        store.markTaskSucceeded(t.identifier); // FR-78：成功即清零失败计数
+        // 卡 `-259`（R184）：团队回报的 evidence 就是这次尝试的结论，带进摘要
+        store.markTaskSucceeded(t.identifier, { summary: evidence || "团队回报完成" }); // FR-78：成功即清零失败计数
       } else if (outcome === "failed") {
         // FR-80：团队回报失败也走统一受阻入口（transient）
         db.prepare("update tasks set status = 'blocked', version = version + 1, updated_at = ? where id = ?").run(nowIso(), t.id);

@@ -1871,7 +1871,7 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
       const ref = decodeURIComponent(taskExecActionRoute[1]);
       const action = taskExecActionRoute[2];
       const task = action === "fail" ? store.recordTaskExecutionFailure(ref, { evidence: body.evidence, kind: body.kind })
-        : action === "review" ? store.submitTaskForReview(ref, { comment: body.comment })
+        : action === "review" ? store.submitTaskForReview(ref, { comment: body.comment, summary: body.summary })
         : action === "retry" ? store.retryTaskExecution(ref)
         : store.releaseTaskAssignment(ref);
       refreshDiagnosticsAfterFix(store, task.identifier); // 卡 `-248`：修复动作后重算 ⇒ 该消的诊断当场消解
@@ -1897,7 +1897,7 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
       }
       if (method !== "POST") throw new TbError("USAGE_ERROR", "review 仅支持 GET / POST");
       const action = String(body.action ?? "request");
-      const result = action === "request" ? store.requestReview(ref, { reviewer: body.reviewer ?? null, dependsOn: body.dependsOn ?? null, comment: body.comment ?? "", actor: body.actor ?? "human" })
+      const result = action === "request" ? store.requestReview(ref, { reviewer: body.reviewer ?? null, dependsOn: body.dependsOn ?? null, comment: body.comment ?? "", summary: body.summary ?? null, actor: body.actor ?? "human" })
         : action === "changes" ? store.requestChanges(ref, { comment: body.comment ?? "", actor: body.actor ?? "reviewer" })
         : action === "approve" ? store.approveReview(ref, { comment: body.comment ?? "", actor: body.actor ?? "reviewer" })
         : null;
