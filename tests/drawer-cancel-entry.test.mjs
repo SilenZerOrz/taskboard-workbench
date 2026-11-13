@@ -88,10 +88,13 @@ test("行为：backlog → canceled 能落库、评论带原因；且如实记�
     assert.match(comment.body, /人工撤单/, "评论要留下原因原文");
     assert.ok(store.listComments(upstream.id).some((c) => /不再需要/.test(c.body ?? "")), "评论必须可回读");
 
-    // 现状如实钉住（不粉饰）：`isTaskReady` 只把 done 当作前置完成，**canceled 仍算未完成** ⇒
-    // 撤单后下游依旧 `ready=false`。这不是本卡的验收项（本卡只补入口），缺口已登记为卡 `-253`。
+    // 口径已由卡 `-253` 定下并落地：撤单 = 「前置终结」⇒ 下游不再阻塞（此前只认 done）。
+    // 注意「终结」不等于「完成」：撤单的卡仍是 canceled，不会被算成已交付。
     const after = store.isTaskReady(downstream.identifier);
-    assert.equal(after.ready, false, "现状：canceled 不解除依赖阻塞（卡 -253 跟踪）");
-    assert.deepEqual(after.blockers.map((b) => b.status), ["canceled"], "阻塞来源应只剩那张已撤单的卡");
+    assert.equal(after.ready, true, "撤单后下游不再被依赖阻塞（卡 -253）");
+    assert.equal(after.basis, "settled-with-canceled", "就绪依据必须区分「前置撤单」与「前置完成」");
+    assert.deepEqual(after.settledByCancel.map((b) => b.status), ["canceled"], "阻塞来源应只剩那张已撤单的卡");
+    assert.deepEqual(after.pending, [], "撤单的前置不再计入 pending");
+    assert.equal(store.requireTaskRef(upstream.identifier).status, "canceled", "撤单不是 done：不得把前置改写成已完成");
   });
 });

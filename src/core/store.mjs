@@ -1027,6 +1027,64 @@ function normalizeUnattributedReason(value) {
   return text;
 }
 
+/**
+ * 卡 `-253`（需求 `R181`）：**撤单后的下游放行**。
+ *
+ * 撤单 = 前置「终结」（口径见 `isTaskReady`）：下游不再需要等它，因此把**因依赖而受阻**的直接下游
+ * 放回「可开工」（`blocked → todo`）。三条边界（都是刻意收窄的）：
+ *   ① 只动 `status = "blocked"` 的卡：`todo` / `backlog` 本来就没被挡（`isTaskReady` 自会变真），
+ *      `in_progress` / `in_review` / `done` / `canceled` 不是在等前置 ⇒ 一律不碰；
+ *   ② 只放行**因依赖而停**的卡（`block_kind` 为 `dependency` 或未分类）：`capability` / `needs_input` /
+ *      `transient` 是「这张卡自己现在做不了」，撤掉前置并不会让它做得了 ⇒ 保持受阻，别把真阻塞洗成可开工；
+ *   ③ 只放**一跳**：放行后的卡不会被继续当成「已终结」去放它的下游（`isTaskReady` 不认 `todo`），
+ *      所以链式 `A→B→C` 里 A 撤单只放 B，C 仍等 B。
+ *
+ * 每次放行**必留痕**：事件 `dependency_released`（`from=blocked` / `to=todo`）+ 一条评论（写明「前置已撤单」）
+ * + 审计行 —— 否则「它怎么突然能开工了」事后无从追起。
+ *
+ * 刻意**不**接在 `done` 上：`done → 下游放行` 属「自动推进」，口径由 `-158`/`-162` 裁定为不自动做
+ * （评审门要人点），本卡禁止项也写明「不改 done 的评审门」。
+ *
+ * @returns {string[]} 被放行的下游任务编号
+ */
+function releaseDownstreamOnCancel(db, store, blocker, { actor = "human", at = nowIso() } = {}) {
+  if (!blocker?.id) return [];
+  // 非依赖类受阻不放行（见上 ②）。`null` 视为未分类，按依赖阻塞处理（人手动拖进「受阻」的常见形态）。
+  const NON_DEPENDENCY_BLOCKS = new Set(["capability", "needs_input", "transient"]);
+  const rows = db.prepare("select d.blocked_id as id from task_dependencies d where d.blocker_id = ? order by d.created_at").all(blocker.id);
+  const released = [];
+  for (const row of rows) {
+    const downstream = store.getTaskById(row.id);
+    if (!downstream || downstream.status !== "blocked") continue;
+    if (NON_DEPENDENCY_BLOCKS.has(downstream.blockKind)) continue;
+    // 其余前置仍未终结 ⇒ 继续受阻（判定只走 `isTaskReady`，不另立一套）
+    if (!store.isTaskReady(downstream.id).ready) continue;
+    db.prepare(
+      `update tasks set status = 'todo', blocked_at = null, board_position = null,
+            claim_lock = null, claim_expires = null, claim_owner = null, last_heartbeat_at = null,
+            version = version + 1, updated_at = ?
+        where id = ?`,
+    ).run(at, downstream.id);
+    store.recordTaskEvent(downstream.id, {
+      type: "dependency_released",
+      from: "blocked",
+      to: "todo",
+      actor,
+      detail: `前置 ${blocker.identifier} 已撤单 → 解除依赖阻塞，放回「可开工」（撤单=前置终结，不等于已交付）`,
+    });
+    try {
+      store.addComment(downstream.id, {
+        body: `前置 **${blocker.identifier}**${blocker.title ? `（${blocker.title}）` : ""} 已撤单，不再要求其交付 → 本任务解除依赖阻塞，放回「可开工」。\n口径：撤单是「前置终结」，**不等于前置已完成**（它没有交付物）；本任务自身仍未开工。`,
+      });
+    } catch { /* 评论失败不影响放行 */ }
+    try {
+      store.recordAudit({ actor, action: "dependency-released", target: downstream.identifier, allowed: true, reason: "blocker-canceled", detail: `blocker=${blocker.identifier}` });
+    } catch { /* ignore */ }
+    released.push(downstream.identifier);
+  }
+  return released;
+}
+
 export function openStore(options = {}) {
   const dataDir = resolveDataDir({ dataDir: options.dataDir, env: options.env });
   const dbPath = options.dbPath ?? resolveDbPath(dataDir);
@@ -1754,6 +1812,12 @@ export function openStore(options = {}) {
         if (nextStatus === "in_review" && !current.reviewRequestedAt) store.markReviewRequested(current.id, timestamp);
         // FR-107（`-197`）：看板 PATCH 进入「进行中」= 本项目口径下的一次认领 ⇒ 冻结授权快照
         if (nextStatus === "in_progress") freezeMandate(current.id, { scope: "board", claimOwner: nextOwner ?? actor, claimSource: current.status });
+        // 卡 `-253`（需求 `R181`）：**撤单即前置终结** ⇒ 因依赖受阻的下游当场放回「可开工」
+        // （事件 + 评论留痕；口径与边界见 `releaseDownstreamOnCancel`）。
+        // 放行失败不反噬撤单本身 —— 撤单已经落库，这里若抛错会把一次成功的撤单变成 500。
+        if (nextStatus === "canceled") {
+          try { releaseDownstreamOnCancel(db, store, { id: current.id, identifier: current.identifier, title: nextTitle }, { actor, at: timestamp }); } catch { /* 下游放行失败不反噬 */ }
+        }
       }
       // FR-83 补口（卡 `-162`）：逃生口放行后必须**可回看** —— 这是"人显式决定跳过评审"的取证点，
       // 否则事后只看到一张 done 卡，分不清"评审通过后收口"与"跳过评审收口"。
@@ -2192,13 +2256,49 @@ export function openStore(options = {}) {
       ).all(task.id);
       return { taskId: task.id, identifier: task.identifier, blockers, blocks };
     },
+    /**
+     * 卡 `-253`（需求 `R181`）：**前置就绪判定 —— 唯一口径**。
+     *
+     * 现象（2026-11-12 真机）：撤单（`canceled`）不解除依赖阻塞 —— 下游 `ready` 恒为 `false`，
+     * 人只能手动把下游拖出「受阻」，否则它一辈子卡在原地（`-252` 只补了撤单入口，缺口登记在本卡）。
+     *
+     * 口径（本处为**唯一真源**，与 `concludeHumanReview` 的放行循环、`loop.mjs` 的派发守卫、
+     * `requirementCompletion` 的「已收口」、MCP `TERMINAL` 一致）：
+     *   · `done`     = 前置**已交付** ⇒ 不再阻塞；
+     *   · `canceled` = 前置**已终结**（人工撤单 / 人工校验门已消耗）⇒ 不要求它交付，因此也不阻塞；
+     *   · 其余（`backlog` / `todo` / `in_progress` / `in_review` / `blocked`）= 仍可能变 `done` ⇒ 阻塞。
+     *
+     * **canceled ≠ done（刻意不合并）**：撤单的语义是「没做、不做了」，不是「做完了」。因此
+     * `ready: true` 只回答「还要不要继续等它」，**不回答「它交付了吗」** —— 两件事靠返回的
+     * `settledByCancel` / `basis` 分开呈现，调用方（人读的界面、完成度统计）不得把
+     * canceled 计进「已完成」。`blockers` 里保留 status 原文，不折叠、不改写。
+     *
+     * 返回：
+     *   · `ready`           —— 还有没有未终结的前置（`true` 才可开工）；
+     *   · `blockers`        —— 全部前置（含 status 原文，UI 直接展示）；
+     *   · `pending`         —— 仍会阻塞的前置（`ready=false` 时就是它们在等）；
+     *   · `settledByCancel` —— 靠「撤单」终结的前置（`ready=true` 时点名「是谁没交付」）；
+     *   · `basis`           —— `waiting` / `all-done` / `settled-with-canceled`（判据来源一句话）。
+     */
     isTaskReady(ref) {
       const task = store.requireTaskRef(ref);
       const rows = db.prepare(
         "select d.blocker_id as id, t.identifier as identifier, t.status as status from task_dependencies d join tasks t on t.id = d.blocker_id where d.blocked_id = ?",
       ).all(task.id);
-      const unfinished = rows.filter((r) => r.status !== "done");
-      return { taskId: task.id, identifier: task.identifier, ready: unfinished.length === 0, blockers: rows };
+      // 口径只这一处：`done`（已交付）与 `canceled`（已终结）都不再阻塞，其余一律等。
+      // 卡 `-253` 之前写的是 `status !== "done"` ⇒ canceled 前置让下游**永久**受阻。
+      const pending = rows.filter((r) => r.status !== "done" && r.status !== "canceled");
+      const settledByCancel = rows.filter((r) => r.status === "canceled");
+      const ready = pending.length === 0;
+      return {
+        taskId: task.id,
+        identifier: task.identifier,
+        ready,
+        blockers: rows,
+        pending,
+        settledByCancel,
+        basis: !ready ? "waiting" : (settledByCancel.length > 0 ? "settled-with-canceled" : "all-done"),
+      };
     },
 
     // ---------------------------------------------------------------- 分拆（FR-38）
@@ -3620,9 +3720,9 @@ export function openStore(options = {}) {
         for (const row of downstream) {
           const t = store.getTaskById(row.id);
           if (!t || (t.status !== "blocked" && t.status !== "todo")) continue;
-          // 就绪判定：其余前置必须都已「完成」或「已取消」（**不能用 isTaskReady** —— 它把 canceled 也算未完成）
-          const blockers = db.prepare("select t.status as status from task_dependencies d join tasks t on t.id = d.blocker_id where d.blocked_id = ?").all(t.id);
-          if (!blockers.every((b) => b.status === "done" || b.status === "canceled")) continue;
+          // 就绪判定只走 `isTaskReady`（唯一口径：done / canceled 都不阻塞）。卡 `-253` 之前这里
+          // 另写了一套 `done || canceled`，与 `isTaskReady` 重复且容易漂移。
+          if (!store.isTaskReady(t.id).ready) continue;
           db.prepare(
             `update tasks set status = 'todo', blocked_at = null, claim_lock = null, claim_expires = null,
                   claim_owner = null, last_heartbeat_at = null, version = version + 1, updated_at = ?
@@ -3671,6 +3771,10 @@ export function openStore(options = {}) {
       // 而诊断 / 看护 / 通知 / M1 度量**全部**建在事件流上 —— 漏 26% 等于度量基础不可信。
       // 只在实际变化时发（同状态重复写不产生假事件）。
       if (t.status !== status) store.recordTaskEvent(t.id, { type: "status_changed", from: t.status, to: status, actor });
+      // 卡 `-253`（需求 `R181`）：团队通道撤单同样是「前置终结」⇒ 放行因依赖受阻的下游。
+      if (status === "canceled" && t.status !== status) {
+        try { releaseDownstreamOnCancel(db, store, t, { actor, at: nowIso() }); } catch { /* 下游放行失败不反噬撤单本身 */ }
+      }
       // FR-111（`-195`）：执行侧 / 团队通道置待验收同样补评审发起时间
       if (status === "in_review" && t.status !== status && !t.reviewRequestedAt) store.markReviewRequested(t.id);
       // FR-107（`-197`）：执行侧 / 团队通道进入「进行中」同样是一次认领 ⇒ 冻结授权快照
