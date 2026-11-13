@@ -4584,12 +4584,45 @@
       } else card.appendChild(mk("div", "empty-note", "暂无团队任务"));
       return card;
     }
+    /**
+     * 卡 `-247`（需求 `R178` ④）：**团队侧反查块** —— 看板卡 ↔ 承载环境 agent-team 插件的 `t-id`。
+     *
+     * 口径（与 `src/core/team-bridge.mjs` 同源，前端不另算）：
+     *   · 映射是**只读推导**（插件侧的 team.json 没有卡号字段，靠卡号全词命中 + 证据片段）；
+     *   · 命中不到 ⇒ **明文声明**「看板只展示、不参与团队状态」，不写"没有团队在跑"（那是猜）。
+     */
+    function teamBridgeBlock(bridge) {
+      const box = mk("div", "team-card");
+      box.appendChild(mk("h3", null, "团队侧任务（只读同步）"));
+      if (!bridge) {
+        box.appendChild(mk("p", "hint", "读不到团队侧映射（服务端较旧或本项目无工作区）。"));
+        return box;
+      }
+      if (!bridge.mapped) {
+        box.appendChild(mk("p", "hint", `本卡号未在承载环境 agent-team 插件的团队任务里登记 ⇒ ${bridge.policyTitle}：看板侧状态与团队侧状态互不影响；看板的「完成」仍只能由人确认。`));
+        box.appendChild(mk("p", "hint", `本工作区插件团队 ${bridge.pluginTeamCount ?? 0} 个；映射由「卡号在团队任务文本里全词命中」推导（插件侧没有卡号字段），命中不到即视为未登记。`));
+        return box;
+      }
+      for (const row of bridge.rows || []) {
+        const line = mk("div", "team-task-row");
+        line.append(pill(row.teamTaskStatus ?? "?", row.teamTaskStatus === "completed" ? "ok" : row.teamTaskStatus === "failed" ? "danger" : "warn"));
+        line.append(mk("span", null, `${row.teamTaskId} · ${row.teamName}`), mk("div", "spacer"), mk("span", "hint", row.assignee ? `负责 ${row.assignee}` : "未指派"));
+        box.appendChild(line);
+        if (row.teamTaskSubject) box.appendChild(mk("p", "hint", `团队任务标题：${row.teamTaskSubject}`));
+        const fields = (row.evidence || []).map((e) => e.field).join("、");
+        if (fields) box.appendChild(mk("p", "hint", `命中字段：${fields}（只读推导，插件侧无卡号字段）`));
+      }
+      return box;
+    }
     async function fillTaskTeam(identifier, host) {
       const head = mk("h3", null, "归属团队");
       try {
         const data = await api("GET", `/api/tasks/${encodeURIComponent(identifier)}/team`);
         host.replaceChildren(head);
         if (data.lock) host.appendChild(mk("p", "hint", `任务级执行锁：${data.lock.status}（team ${String(data.lock.teamId).slice(0, 8)}）`));
+        // 卡 `-247`（需求 `R178` ④）：团队侧反查 —— 这张卡在承载环境 agent-team 插件那边是哪个 t-id。
+        // **只读推导**（插件侧没有卡号字段）；命中不到就明说「看板只展示、不参与团队状态」，不臆断。
+        host.appendChild(teamBridgeBlock(data.bridge));
         // 2026-10-22（第十报）：归因门在授权门**之前**（store.assertExecutable 的门序列）⇒ 未归因的卡
         // 无论在哪一列，「派发团队」都注定被拒（api.mjs 的 assertAttributed）。先给归因入口，
         // 不把注定被拒的按钮摆出来（此前只挡了「启动执行」，这条漏了 —— 真机 `-80` 的抽屉里就有）。
@@ -6245,10 +6278,12 @@
       teamRoot.replaceChildren(mk("p", "hint", "加载团队…"));
       try {
         const q = encodeURIComponent(state.projectId);
-        const [data, settings, avail] = await Promise.all([
+        const [data, settings, avail, bridge] = await Promise.all([
           api("GET", "/api/teams"),
           api("GET", `/api/projects/${q}/settings`).catch(() => ({ teamTemplate: {} })),
           api("GET", `/api/projects/${q}/agent-teams`).catch(() => ({ teams: [] })),
+          // 卡 `-247`（需求 `R178` ④）：团队任务 ↔ 看板卡映射（只读同步器）。
+          api("GET", `/api/projects/${q}/team-bridge`).catch(() => null),
         ]);
         const box = mk("div", "config-view");
         const cur = mk("section", "config-card");
@@ -6306,8 +6341,31 @@
         for (const t of (avail.teams || [])) { const li = mk("li", "req-item"); li.append(mk("span", "req-title", t.name), pill(`${t.source}${t.phase ? ` · ${t.phase}` : ""}${t.memberCount != null ? ` · ${t.memberCount} 成员` : ""}`)); avl.appendChild(li); }
         av.appendChild(avl);
         box.appendChild(av);
+        // 卡 `-247`（需求 `R178` ④）：**团队任务 ↔ 看板卡映射**（只读同步器）。
+        // 这一段是「两套系统」的**桥**：把插件侧 t-id 与看板卡号摆到同一张表上；
+        // 未登记的卡明说「看板只展示、不参与团队状态」——不写"没有团队在跑"（那是猜）。
+        const bx = mk("section", "config-card");
+        bx.appendChild(mk("h3", null, "团队任务 ↔ 看板卡映射（只读同步）"));
+        if (!bridge) {
+          bx.appendChild(mk("p", "hint", "读不到映射（服务端较旧）——本项目暂无团队任务 ↔ 看板卡的对照。"));
+        } else {
+          const st = bridge.stats ?? {};
+          bx.appendChild(mk("p", "hint", `本项目卡 ${st.cards ?? 0} 张 · 已反查到团队任务 ${st.mappedCards ?? 0} 张 · 未登记 ${st.unmappedCards ?? 0} 张 · 插件团队 ${st.pluginTeams ?? 0} 个 / 团队任务 ${st.pluginTasks ?? 0} 条。`));
+          bx.appendChild(mk("p", "hint", "口径：映射由「项目自有卡号在团队任务文本里全词命中」推导（插件侧 team.json 没有卡号字段），属只读同步；看板与团队各记各的账，互不驱动。"));
+          const bl = mk("div", "team-task-list");
+          for (const r of bridge.mappings || []) {
+            const row = mk("div", "team-task-row");
+            row.append(mk("span", null, r.cardIdentifier));
+            row.append(pill(r.teamTaskStatus ?? "?", r.teamTaskStatus === "completed" ? "ok" : r.teamTaskStatus === "failed" ? "danger" : "warn"));
+            row.append(mk("span", null, `${r.teamTaskId} · ${r.teamName}`), mk("div", "spacer"), mk("span", "hint", r.assignee ? `负责 ${r.assignee}` : "未指派"));
+            bl.appendChild(row);
+          }
+          if (!(bridge.mappings || []).length) bl.appendChild(mk("div", "empty-note", "本项目暂无卡反查到团队任务（插件团队未在本工作区登记本项目卡号）"));
+          bx.appendChild(bl);
+        }
+        box.appendChild(bx);
         box.appendChild(mk("h2", null, `工作台本地派发记录（${data.count}）`));
-        box.appendChild(mk("p", "hint", "数据来源：工作台本地记录（team_runs/team_members/team_tasks）——与承载环境 agent-team 插件的「编队」是两套；插件侧真实团队成员不在此显示（见 G-2）。"));
+        box.appendChild(mk("p", "hint", "数据来源：工作台本地记录（team_runs/team_members/team_tasks）——与承载环境 agent-team 插件的「编队」是两套账本；两边的对照见上一节「团队任务 ↔ 看板卡映射（只读同步）」；插件侧真实团队成员不在此显示（见 G-2）。"));
         if (!data.count) box.appendChild(mk("p", "hint", "暂无团队派发记录。派发入口：任务详情/看板 → 启动执行，或调用 /api/teams。"));
         for (const entry of data.teams) box.appendChild(teamDetailCard(entry));
         teamRoot.replaceChildren(box);

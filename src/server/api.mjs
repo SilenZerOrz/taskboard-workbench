@@ -12,6 +12,7 @@ import { EXIT, TbError, invalidField } from "../core/errors.mjs";
 import { resolveContext } from "../core/binding.mjs";
 import { scanProjectMaterials, buildMaterialIndex, collectExternalFiles } from "../core/intake.mjs";
 import { scanAgentTeams, OFFICIAL_TEAM } from "../core/agent-teams.mjs";
+import { BRIDGE_MODE, BRIDGE_POLICY, BRIDGE_POLICY_TITLE, buildCardTaskMap, mapCardToTeamTasks, readPluginTeams, slimPluginTeam } from "../core/team-bridge.mjs";
 import { buildTeamDirective } from "../host/team-engine.mjs";
 import { runExecutionLoop, activeEngine } from "../core/loop.mjs";
 import { assertTeamTemplate, assertQualityGates, planTeamMembers } from "../core/team.mjs";
@@ -625,6 +626,38 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
       // 只列"本项目主会话自身"的团队：官方（队长=主会话）+ 第三方（captainSessionId == 主会话）
       const thirdParty = await scanAgentTeams(project.workspacePath, { mainSessionId: project.initialSessionId ?? null });
       return { status: 200, payload: { mainSessionId: project.initialSessionId ?? null, teams: [OFFICIAL_TEAM, ...thirdParty], count: 1 + thirdParty.length } };
+    }
+    // 团队任务 ↔ 看板卡映射（卡 `-247` · 需求 `R178` ④）：**只读同步器**。
+    // 插件侧 `.agent-teams/<team>/team.json` 的任务只有自己的 t-id、没有卡号字段 ⇒ 映射由
+    // 「项目自有卡号在团队任务文本里全词命中」推导，附命中字段与片段。
+    // **不写 team_tasks、不改 .agent-teams/**（写进去会踩 `team_tasks_active_lock` 把看板卡锁死）。
+    const projectTeamBridgeRoute = /^\/api\/projects\/([^/]+)\/team-bridge$/.exec(pathname);
+    if (projectTeamBridgeRoute) {
+      if (method !== "GET") throw new TbError("USAGE_ERROR", "team-bridge 仅支持 GET（只读同步器）");
+      const project = store.requireProject(decodeURIComponent(projectTeamBridgeRoute[1]));
+      const teams = await readPluginTeams(project.workspacePath ?? null);
+      const cards = store.listTasks({ projectId: project.id }).map((task) => ({
+        id: task.id,
+        identifier: task.identifier,
+        title: task.title,
+        status: task.status,
+      }));
+      const { rows, unmapped, stats } = buildCardTaskMap({ cards, teams });
+      return {
+        status: 200,
+        payload: {
+          mode: BRIDGE_MODE,
+          policy: BRIDGE_POLICY,
+          policyTitle: BRIDGE_POLICY_TITLE,
+          projectId: project.id,
+          workspacePath: project.workspacePath ?? null,
+          mainSessionId: project.initialSessionId ?? null,
+          teams: teams.map(slimPluginTeam),
+          mappings: rows,
+          unmapped,
+          stats,
+        },
+      };
     }
     const projectSessionsRoute = /^\/api\/projects\/([^/]+)\/sessions$/.exec(pathname);
     if (projectSessionsRoute) {
@@ -1786,11 +1819,31 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
         const directive = buildTeamDirective({ teamId: run.id, targetTask: task.identifier, targetRequirement: task.requirementId, members: members.map((m) => m.role), tasks: [{ task: task.identifier, subject: task.title }], qualityGates }, engine);
         return { run, members, tasks, directive };
       }).filter((e) => e.members.length > 0 || e.tasks.length > 0); // 跳过空 run，避免详情显示"空团队"掩盖真实反馈
+      // 卡 `-247`（需求 `R178` ④）：**团队侧反查** —— 这张卡在承载环境 agent-team 插件那边是哪个 t-id。
+      // 只读同步：读工作区 `.agent-teams/<team>/team.json`，不写 team_tasks、不改插件产物。
+      // 命中不到 ⇒ 如实给「看板只展示、不参与团队状态」的明文声明（不臆断"没有团队在跑"）。
+      let bridge = null;
+      try {
+        const project = store.requireProject(task.projectId);
+        const pluginTeams = await readPluginTeams(project.workspacePath ?? null);
+        const bridgeRows = mapCardToTeamTasks(task.identifier, pluginTeams);
+        bridge = {
+          mode: BRIDGE_MODE,
+          policy: BRIDGE_POLICY,
+          policyTitle: BRIDGE_POLICY_TITLE,
+          workspacePath: project.workspacePath ?? null,
+          pluginTeamCount: pluginTeams.length,
+          mapped: bridgeRows.length > 0,
+          rows: bridgeRows,
+        };
+      } catch {
+        bridge = { mode: BRIDGE_MODE, policy: BRIDGE_POLICY, policyTitle: BRIDGE_POLICY_TITLE, workspacePath: null, pluginTeamCount: 0, mapped: false, rows: [] };
+      }
       return {
         status: 200,
         payload: {
           task: { id: task.id, identifier: task.identifier, title: task.title, status: task.status, sessionId: task.sessionId ?? null },
-          engine, teams, count: teams.length, lock: store.getTaskLock(ref),
+          engine, teams, count: teams.length, lock: store.getTaskLock(ref), bridge,
         },
       };
     }
