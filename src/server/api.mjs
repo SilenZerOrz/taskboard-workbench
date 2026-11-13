@@ -975,8 +975,22 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
             };
           });
         } catch { diagnostics = []; }
+        // 卡 `-258`（需求 `R184`）· 抽屉「执行记录」聚合段的**唯一数据源**。
+        // 真机（2026-11-12 · 卡 `-248`）：结构化四节证据 `task_evidence` 早已写进库（verdict/deviation/
+        // boundary/artifacts 齐全），但它在服务端**只被 `evaluateTaskDiagnostics` 读去判「有没有产物」**，
+        // 从来没有回传给前端 —— 于是人打开一张「待验收」的卡，看不到任何执行记录，只能去翻评论。
+        // 这里把「最近一次结构化证据 + 最近一次尝试」只读回传；**零写副作用**（本端点的不变量）。
+        // 读不到就如实给 null / 0，不臆造（前端据此渲染显式空态）。
+        let executionRun = currentRun;
+        let runsCount = 0;
+        try {
+          const allRuns = typeof store.listTaskRuns === "function" ? store.listTaskRuns(task.identifier) : [];
+          runsCount = Array.isArray(allRuns) ? allRuns.length : 0;
+          if (!executionRun && runsCount > 0) executionRun = allRuns[runsCount - 1];
+        } catch { /* 读失败按「无尝试」处理，不伪造 */ }
+        const executionRecord = { evidence, run: executionRun, runsCount };
         const stage = ticketStage(task, { evidence, decision: null, comments, sessionState, currentRun, diagnostics });
-        return { status: 200, payload: { task, comments, reviewEvidence: buildReviewEvidence({ comments }), ticketStage: stage } };
+        return { status: 200, payload: { task, comments, reviewEvidence: buildReviewEvidence({ comments }), ticketStage: stage, executionRecord } };
       }
       if (method === "PATCH") {
         const task = store.updateTask(ref, {

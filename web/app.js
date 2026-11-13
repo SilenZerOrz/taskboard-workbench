@@ -5000,6 +5000,56 @@
         if (t.description) overview.appendChild(richText(t.description));
         drawerBody.appendChild(overview);
 
+        // 卡 `-258`（需求 `R184`）· **执行记录聚合段，紧跟概览**。
+        // 真机（2026-11-12 · 卡 `-248`）：一张「待验收」的卡，结构化四节证据在 `task_evidence` 里齐全、
+        // `task_runs` 也有 1 条 22 分 51 秒的成功尝试，但抽屉里**首屏什么都看不到** —— 尝试记录埋在第 10 段、
+        // 完整证据在第 14 段的评论里，而最像「执行记录」的那条 summary 还只是记账文案。
+        // 数据源＝`GET /api/tasks/:ref` 的 `executionRecord`（只读回传：最近一次结构化证据 + 最近一次尝试）。
+        // **没有就如实空态**：不臆造、不拿评论里的文本冒充结构化证据。
+        {
+          const rec = detail?.executionRecord ?? null;
+          const evd = rec?.evidence ?? null;
+          const run = rec?.run ?? null;
+          const rsec = mk("div", "drawer-section exec-record");
+          rsec.appendChild(mk("h3", null, "执行记录（结构化证据 + 最近一次尝试）"));
+          if (!evd && !run) {
+            rsec.appendChild(mk("p", "hint", "本卡尚无执行记录：`task_evidence` 无行、`task_runs` 无行。结构化证据由 MCP `card_evidence_submit` 或 `POST /api/tasks/:ref/evidence` 写入；尝试记录在任务被认领执行时才会开出第一条。"));
+          } else {
+            if (run) {
+              const RUN_OUT = { success: "成功", blocked: "受阻", failed: "失败", crash: "崩溃", timeout: "超时", reclaimed: "认领被回收", cancelled: "人工作废", released: "释放归属" };
+              const dur = run.status === "running"
+                ? `已跑 ${Math.max(0, Math.round((Date.now() - new Date(run.startedAt).getTime()) / 60000))} 分钟`
+                : (run.durationMs != null ? `耗时 ${Math.max(1, Math.round(run.durationMs / 1000))} 秒` : "耗时 -");
+              rsec.appendChild(mk("p", "hint", `最近一次尝试：第 ${run.attempt} 次 · ${run.status === "running" ? "进行中" : (RUN_OUT[run.outcome] ?? run.outcome ?? "-")} · ${fmtTime(run.startedAt)} → ${run.endedAt ? fmtTime(run.endedAt) : "进行中"} · ${dur} · 执行者 ${run.actor ?? "-"}${rec?.runsCount > 1 ? `（共 ${rec.runsCount} 次尝试）` : ""}`));
+            }
+            if (!evd) {
+              rsec.appendChild(mk("p", "hint", "本卡尚无结构化交付证据（`task_evidence` 无行）—— 证据只存在于执行方自述的评论里，那不是结构化证据。"));
+            } else {
+              for (const [label, value] of [["判定（verdict）", evd.verdict], ["偏离说明（deviation）", evd.deviation], ["边界自查（boundary）", evd.boundary]]) {
+                rsec.appendChild(mk("h4", null, label));
+                rsec.appendChild(String(value ?? "").trim() !== "" ? richText(String(value)) : mk("p", "hint", "（未填写）"));
+              }
+              const arts = Array.isArray(evd.artifacts) ? evd.artifacts : [];
+              rsec.appendChild(mk("h4", null, `产物（${arts.length}）`));
+              if (!arts.length) rsec.appendChild(mk("p", "hint", "（未登记产物）"));
+              else {
+                const ul = mk("ul", "exec-record-artifacts");
+                for (const a of arts) ul.appendChild(mk("li", null, String(a)));
+                rsec.appendChild(ul);
+              }
+              const refs = Array.isArray(evd.artifactRefs) ? evd.artifactRefs : [];
+              if (refs.length) {
+                rsec.appendChild(mk("h4", null, `可核验引用（${refs.length}）`));
+                const ul = mk("ul", "exec-record-refs");
+                for (const rf of refs) ul.appendChild(mk("li", null, `${rf?.kind ?? "?"} · ${rf?.ref ?? rf?.value ?? rf?.path ?? JSON.stringify(rf)}`));
+                rsec.appendChild(ul);
+              }
+              rsec.appendChild(mk("p", "hint", `证据由 ${evd.actor ?? "未标注"} 于 ${fmtTime(evd.createdAt)} 写入 · 对应任务版本 v${evd.taskVersion ?? "-"}${evd.refsState ? ` · 引用状态 ${evd.refsState}` : ""}`));
+            }
+          }
+          drawerBody.appendChild(rsec);
+        }
+
         // FR-40 补口（2026-10-19 真机）：归因门只会拒绝，全前端却**没有归因入口** —— 用户点「启动执行」
         // 只看到「请先关联需求条目（归因门）」，任务编辑对话框没有需求条目字段、也没有对应端点，无处可点。
         // 这里把「引导归因」落成可执行动作：列本项目需求条目 → 选一条 → 关联（跨项目由 store 层拒绝）。
