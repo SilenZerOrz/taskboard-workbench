@@ -14,7 +14,7 @@ import { BLOCK_RECURRENCE_LIMIT, DEFAULT_FAILURE_LIMIT, QUOTA_AUTH_ERROR_RE } fr
 import { STALL_THRESHOLD_MS, assessTask, latestProgressComment, runInFlight } from "./watchdog.mjs";
 import { REVIEW_IDLE_MS, detectReviewDeadlock } from "./review.mjs";
 import { categoryLabel, classifyHumanReview, isHumanReviewTask } from "./human-review.mjs";
-import { detectUntakenDelivery } from "./delivery.mjs";
+import { detectUntakenDelivery, isConclusionComment } from "./delivery.mjs";
 
 /** 诊断类型（FR-79 验收里逐个点名的八类规则）。 */
 export const DIAGNOSTIC_KINDS = Object.freeze([
@@ -305,6 +305,98 @@ export function isExecutionClassCard(task) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// 交付产物事实（卡 `-248` · 需求 `R178` ⑤ ·「heartbeat 空先查产物」）
+// ---------------------------------------------------------------------------
+
+/**
+ * 「卡上已有交付产物」的**评论侧标记**（看板自己的交付约定）。
+ *
+ * 为什么必须有评论这一路：真机（`scada-vibe-1…7`）的活是**宿主 agent team** 干的 ——
+ * 它只往卡上贴评论，**不写 `task_evidence`**（FR-106 的结构化证据行是 MCP/HTTP 入口才写的），
+ * **也不建 `task_runs` 尝试记录**（那条路不建尝试）。只认结构化证据 + 成功尝试 ⇒ 真机那批卡照样
+ * 被判「停滞 / 无人认领」—— 这正是需求条目 `R178` ⑤ 说的「判据只看 heartbeat / reviewer 空，
+ * 不看产物是否存在（真机：5 卡 `stalled`+`unclaimed` 高危 10 条，产物齐全）」。
+ *
+ * 标记只取「**交付动作**」与「**交付声明**」两类，刻意避开两类会误伤的说法：
+ *   · 不取 `进度` / `反馈` 等**过程**词 —— 过程汇报不代表产物齐全；
+ *   · 不取裸词 `产出` —— 看板自己的系统留痕「…将产出「评审死锁」诊断。」含这两个字。
+ */
+export const ARTIFACT_COMMENT_MARKERS = Object.freeze([
+  "请求评审",      // 「**请求评审（执行侧）**。产出：`…`」—— 交付动作本身
+  "人工验收",      // 「请求人工验收」/「请人工验收」
+  "复审通过",      // 「**复审通过，请求人工验收**」
+  "产出：",        // 「产出：`路径`」—— 显式声明产物（带全角冒号，避开系统留痕里的「产出「」）
+  "证据（四节）",  // 本仓四节交付格式
+  "证据回流",
+  "【证据",
+  "## 证据",
+]);
+
+/**
+ * 交付产物事实查询（**只读**、纯判定、零写库）。
+ *
+ * 回答一个问题：**这张卡的活到底干了没有？** 三个来源，任一成立即视为「产物已交」：
+ *   ① 结构化交付证据（FR-106 `task_evidence`：判定/偏离/边界/产物 四字段齐 + artifact_refs）——最硬；
+ *   ② 成功尝试记录（`task_runs.outcome === "success"`）—— 执行器交了作业；
+ *   ③ 交付证据评论（看板自己的交付约定，见 `ARTIFACT_COMMENT_MARKERS`）。
+ *
+ * **返工作废**：产物之后又出现「返工」事件（`changes_requested`）⇒ 那一版产物已被判不合格，
+ *   不再算数 —— 否则「返工之后没人接着干」这种**真停滞**会被吞掉（宁可假阳性不可漏报）。
+ *
+ * @returns {{delivered: boolean, at: string|null, source: string|null, summary: string, revoked: boolean}}
+ */
+export function deliveredArtifacts(store, task, { comments = [], runs = [] } = {}) {
+  const empty = { delivered: false, at: null, source: null, summary: "", revoked: false };
+  if (!task) return empty;
+  const candidates = [];
+
+  // ① 结构化交付证据（FR-106）
+  try {
+    const ev = typeof store?.latestTaskEvidence === "function" ? store.latestTaskEvidence(task.identifier) : null;
+    if (ev && Array.isArray(ev.artifacts) && ev.artifacts.length > 0) {
+      candidates.push({ source: "evidence", at: ev.createdAt ?? null, summary: `结构化交付证据（${ev.artifacts.length} 项产物）` });
+    }
+  } catch { /* 取不到就当没有 */ }
+
+  // ② 成功尝试记录（执行器交了作业）
+  for (const run of Array.isArray(runs) ? runs : []) {
+    if (String(run?.outcome ?? "") !== "success") continue;
+    candidates.push({ source: "run-success", at: run.endedAt ?? run.startedAt ?? null, summary: `第 ${run.attempt ?? "?"} 次尝试执行成功` });
+  }
+
+  // ③ 交付证据评论（agent team / 人工贴证据走评论路径）
+  for (const c of Array.isArray(comments) ? comments : []) {
+    const body = String(c?.body ?? "");
+    if (!body) continue;
+    if (!isConclusionComment(body)) continue; // 系统留痕不是产物
+    if (!ARTIFACT_COMMENT_MARKERS.some((m) => body.includes(m))) continue;
+    candidates.push({ source: "delivery-comment", at: c?.createdAt ?? null, summary: "交付证据评论" });
+  }
+
+  if (!candidates.length) return empty;
+  const atOf = (c) => { const t = Date.parse(String(c.at ?? "")); return Number.isFinite(t) ? t : -Infinity; };
+  // 取**最近**的一份产物（返工判据要跟最新那份对齐）
+  const latest = candidates.reduce((a, b) => (atOf(b) > atOf(a) ? b : a));
+
+  // 返工作废：产物之后出现返工 ⇒ 那一版产物已被判不合格，不再算数
+  let reworkAt = -Infinity;
+  try {
+    const events = typeof store?.listTaskEvents === "function" ? store.listTaskEvents(task, { order: "desc", limit: 200 }) : [];
+    for (const e of Array.isArray(events) ? events : []) {
+      if (String(e?.type ?? "") !== "changes_requested") continue;
+      const t = Date.parse(String(e?.at ?? ""));
+      if (Number.isFinite(t) && t > reworkAt) reworkAt = t;
+    }
+  } catch { /* 取不到就当没返工 */ }
+
+  // 返工作废：产物之后出现返工 ⇒ 那一版产物已被判不合格，不再算数。
+  // 用 `>=` 而不是 `>`：返工与交付**可能落在同一毫秒**（评审 → 打回 → 立刻重投都是进程内连写），
+  // 用 `>` 会把「同一毫秒的返工」漏判成「产物仍有效」⇒ 真停滞被吞掉（宁可假阳性不可漏报）。
+  const revoked = Number.isFinite(reworkAt) && reworkAt >= atOf(latest);
+  return { delivered: !revoked, at: latest.at ?? null, source: latest.source, summary: latest.summary, revoked };
+}
+
 export const DIAGNOSTIC_RULES = Object.freeze([
   {
     kind: "block_loop",
@@ -333,6 +425,12 @@ export const DIAGNOSTIC_RULES = Object.freeze([
       const { task, watchdog, dismissed } = ctx;
       if (dismissed.has("stalled")) return null;
       if (watchdog?.state !== "stalled") return null;
+      // 卡 `-248`（需求 `R178` ⑤ ·「heartbeat 空先查产物」）：
+      // 「疑似停滞 N 分钟**无进展回报**」的前提是**没交过活**。若卡上已有交付产物（结构化证据 /
+      // 成功尝试 / 交付证据评论），那个前提不成立 ⇒ 不报。
+      // 不报还有一层安全理由：本诊断的首选动作是「退回待办（重新派发）」，对一张**已经交过活**的卡
+      // 再派一遍 = 让执行侧把做完的活重做一遍，正是 FR-86 说的同文件双写风险。
+      if (ctx.artifacts?.delivered) return null;
       const enc = encodeRef(task.identifier);
       const offline = watchdog.reason === "session-offline";
       return {
@@ -362,6 +460,10 @@ export const DIAGNOSTIC_RULES = Object.freeze([
       if (sessionState?.running) return null;
       if (!sessionState?.sessionId && runInFlight(currentRun, { now: ctx.now, thresholdMs: ctx.thresholds?.stallMs })) return null;
       if (claim?.locked && !claim?.expired) return null;
+      // 卡 `-248`（需求 `R178` ⑤ ·「heartbeat 空先查产物」）：
+      // 本诊断的原文是「…**这条任务事实上没人干**」—— 若卡上已有交付产物，这句话**本身就是假的**
+      // （有人干了，只是没续认领 / 没改状态）⇒ 不报。真没产物时照报（宁可假阳性不可漏报）。
+      if (ctx.artifacts?.delivered) return null;
       const why = claim?.locked && claim?.expired ? "认领已过期" : claim?.locked ? "认领心跳陈旧" : "未被执行者认领";
       return {
         kind: "unclaimed", severity: "high",
@@ -726,6 +828,9 @@ export function collectContext(store, task, { now = Date.now(), thresholds = DEF
       limitSource: limitOverride != null ? "task" : "default",
     },
     runs: attempts,
+    // 卡 `-248`：「heartbeat 空先查产物」的**前置事实**（只读、零写库）。
+    // `stalled` / `unclaimed` 两条规则先看它，再决定要不要报。
+    artifacts: deliveredArtifacts(store, task, { comments, runs: attempts }),
     // FR-83：评审死锁由**真实判定**给出（调用方可显式覆盖，便于单测/回放）
     review: review === null
       ? detectReviewDeadlock(store, task, { now, idleMs: thresholds.reviewIdleMs ?? REVIEW_IDLE_MS })
@@ -754,14 +859,42 @@ export function evaluateTaskDiagnostics(store, ref, { now = Date.now(), threshol
 }
 
 /**
+ * 复检：终态卡（`done` / `canceled`）的遗留诊断**只收口、不新增**（卡 `-248` · 需求 `R178` ⑤）。
+ *
+ * 为什么单独一个函数、而不是直接 `evaluateTaskDiagnostics`：
+ *   · 终态卡**不该**再产出任何诊断（`owner-role-mismatch` 等规则本就排除 done/canceled）；
+ *   · 但库里可能留着上一轮 open 的行 —— 诊断是「只增不减」的，那些行会永远挂着。
+ *     真机读数（2026-11-12，只读）：`scada-vibe-11`（`canceled`）的 `review_deadlock` 仍 open、
+ *     `count=19`；本仓 6 张 `done` 卡共 11 行 `stalled`/`unclaimed`/`review_deadlock` 仍 open。
+ *   · 收口走 `saveTaskDiagnostics(ref, [])` —— 与规则产出的诊断**同一张表、同一套字段**，
+ *     `resolved_at` 留痕、历史可回溯（不删数据）。
+ */
+function closeTerminalDiagnostics(store, task, { now } = {}) {
+  let open = [];
+  try { open = typeof store.listTaskDiagnostics === "function" ? store.listTaskDiagnostics(task) : []; } catch { open = []; }
+  if (!open.length) return [];
+  try {
+    const saved = store.saveTaskDiagnostics(task.identifier, [], { now });
+    return saved?.resolved ?? [];
+  } catch { return []; }
+}
+
+/**
  * 项目级诊断：对"可能需要人介入"的任务逐个评估（进行中 / 受阻 / 待验收），
  * 返回 { rows, summary }。只读路径也可以调用（会同步落库，保证 count 有意义）。
+ *
+ * 卡 `-248`：**复检** —— 扫描集之外的终态卡（done/canceled）也走一遍，
+ * 把它们身上遗留的诊断**收口**（见 `closeTerminalDiagnostics`）；这是「诊断只增不减」的正面修法。
  */
 export function projectDiagnostics(store, projectId, { now = Date.now(), thresholds = DEFAULT_THRESHOLDS, persist = true } = {}) {
   const statuses = new Set(["in_progress", "blocked", "in_review"]);
-  const tasks = store.listTasks({ projectId }).filter((t) => statuses.has(t.status) || t.triageAt);
+  const tasks = store.listTasks({ projectId });
   const rows = [];
   for (const task of tasks) {
+    if (!(statuses.has(task.status) || task.triageAt)) {
+      if (persist) closeTerminalDiagnostics(store, task, { now });
+      continue;
+    }
     const r = evaluateTaskDiagnostics(store, task, { now, thresholds, persist });
     for (const d of r.diagnostics) rows.push({ ...d, identifier: task.identifier, title: task.title, status: task.status });
   }

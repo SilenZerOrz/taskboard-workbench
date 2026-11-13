@@ -61,6 +61,21 @@ import { FLOW_INJECT_MANUAL, FLOW_INJECT_ROLES, injectFlow, normalizeFlowInjectP
 
 export const API_SCHEMA_VERSION = 2;
 
+/**
+ * 修复动作后**重算诊断**（卡 `-248` · 需求 `R178` ⑤ ·「修复后自动 resolve」）。
+ *
+ * 诊断是「只增不减」的：规则只在**被评估**时才会重算，而评估只发生在读路径上
+ * （`GET /execution` / `GET /diagnostics`）。于是修复动作（重派 / 回收认领 / 请求评审 /
+ * 重置失败计数 / 改绑负责人）已经把成因消掉了，却没人重算 ⇒ 那条诊断一直挂着（`count` 还在涨），
+ * 人看到的是「我明明修好了，它还在喊」。
+ *
+ * 这里在**动作落库后立刻重算一次** ⇒ 成因已消的诊断当场消解（FR-79 的「问题消失即自动消解」）。
+ * 只重算**这一张卡**，不扫项目；写入走的是 `evaluateTaskDiagnostics`（诊断的唯一写入口）。
+ */
+function refreshDiagnosticsAfterFix(store, ref) {
+  try { return evaluateTaskDiagnostics(store, ref); } catch { return null; }
+}
+
 export function httpStatusFor(error) {
   if (error.code === "STORE_UNAVAILABLE") return 503;
   if (error.code === "NOT_FOUND" || error.code.endsWith("_NOT_FOUND")) return 404;
@@ -985,6 +1000,7 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
           // 漏带/带字符串一律按"没批准"处理（store 侧严格 `=== true`）⇒ 拖拽/脚本的静默收口必然被拒。
           skipReview: body.skipReview,
         });
+        refreshDiagnosticsAfterFix(store, task.identifier); // 卡 `-248`：改绑负责人 / 改状态后重算
         return { status: 200, payload: { task } };
       }
       if (method === "DELETE") {
@@ -1466,6 +1482,7 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
     if (taskResetFailuresRoute) {
       if (method !== "POST") throw new TbError("USAGE_ERROR", "reset-failures 仅支持 POST");
       const task = store.resetTaskFailures(decodeURIComponent(taskResetFailuresRoute[1]));
+      refreshDiagnosticsAfterFix(store, task.identifier); // 卡 `-248`：重置失败计数后重算（`repeated_failure` 消解）
       emit("task.updated", { taskId: task.id, identifier: task.identifier, status: task.status });
       return { status: 200, payload: { task, guard: store.dispatchGuard(task) } };
     }
@@ -1484,6 +1501,7 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
       const ref = decodeURIComponent(taskReclaimRoute[1]);
       const r = store.reclaimStaleClaim(ref);
       if (r.reclaimed) {
+        refreshDiagnosticsAfterFix(store, ref); // 卡 `-248`：回收认领后重算（`unclaimed` 消解）
         const t = store.getTaskById(store.requireTaskRef(ref).id);
         emit("task.updated", { taskId: t.id, identifier: t.identifier, status: t.status });
       }
@@ -1856,6 +1874,7 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
         : action === "review" ? store.submitTaskForReview(ref, { comment: body.comment })
         : action === "retry" ? store.retryTaskExecution(ref)
         : store.releaseTaskAssignment(ref);
+      refreshDiagnosticsAfterFix(store, task.identifier); // 卡 `-248`：修复动作后重算 ⇒ 该消的诊断当场消解
       emit("task.updated", { taskId: task.id, identifier: task.identifier, status: task.status });
       return { status: 200, payload: { task } };
     }
@@ -1883,6 +1902,7 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
         : action === "approve" ? store.approveReview(ref, { comment: body.comment ?? "", actor: body.actor ?? "reviewer" })
         : null;
       if (!result) throw invalidField("action", "action 只支持 request / changes / approve");
+      refreshDiagnosticsAfterFix(store, result.task.identifier); // 卡 `-248`：指派评审者后重算（`review_deadlock` 消解）
       emit("task.updated", { taskId: result.task.id, identifier: result.task.identifier, status: result.task.status });
       return { status: 200, payload: result };
     }
