@@ -669,6 +669,16 @@ export function apply(ctx, config) {
         } catch (error) {
           console.error(`[taskboard-workbench] run reconcile error: ${error?.message ?? error}`);
         }
+        // 卡 `-260`（R185）：**经主会话下发的执行也打心跳**。
+        // `-257` 之后 CLI 执行器默认交项目主会话下发，服务端没有本地进程可挂心跳 —— 真机 `-248`
+        // 一条 22 分 51 秒的成功尝试 `heartbeats` 恒为 1。这里每拍（30s）只给「绑定的会话确实在跑
+        // （running / 有待消费消息）」的尝试打一拍，会话空闲则一拍都不打（不臆造）。
+        try {
+          const beat = runtime.store.heartbeatDispatchedRuns();
+          if (beat.length) console.log(`[taskboard-workbench] heartbeat ${beat.length} 张在途卡（主会话执行中）`);
+        } catch (error) {
+          console.error(`[taskboard-workbench] dispatched heartbeat error: ${error?.message ?? error}`);
+        }
         for (const project of listLoopProjects(runtime.store)) {
           runExecutionLoop({ store: runtime.store, events: runtime.events, projectId: project.id })
             .then((r) => {

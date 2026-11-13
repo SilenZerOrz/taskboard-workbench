@@ -1826,6 +1826,19 @@ export function openStore(options = {}) {
         store.recordTaskEvent(current.id, { type: "status_changed", from: current.status, to: nextStatus, actor: changes.actor ?? "human" });
         // FR-111（`-195`）：进待验收就补评审发起时间（幂等；已有值不覆盖）
         if (nextStatus === "in_review" && !current.reviewRequestedAt) store.markReviewRequested(current.id, timestamp);
+        // 卡 `-260`（R185）：进「待验收」= 本次执行结束 —— 在途尝试必须**当场**闭合。
+        // 真机（2026-11-12 · `-248`）：08:37:13 卡片已 `in_review`，`run_ended` 却晚到 08:41:08，
+        // 这 3 分 55 秒里抽屉同时显示「待验收」与「进行中」，人分不清到底跑完没有。
+        // 摘要沿用 `-259` 的口径（最近一条结构化证据的 verdict；没有就「执行方未回写摘要」）。
+        if (nextStatus === "in_review") {
+          try {
+            let runSummary = null;
+            try { runSummary = store.latestTaskEvidence(current.identifier)?.verdict ?? null; } catch { runSummary = null; }
+            store.endTaskRun(current.identifier, {
+              outcome: "success", summary: normalizeRunSummary(runSummary), actor, now: new Date(timestamp).getTime(),
+            });
+          } catch { /* 无在途尝试 ⇒ 正常（endTaskRun 返回 ended:false，不抛） */ }
+        }
         // FR-107（`-197`）：看板 PATCH 进入「进行中」= 本项目口径下的一次认领 ⇒ 冻结授权快照
         if (nextStatus === "in_progress") freezeMandate(current.id, { scope: "board", claimOwner: nextOwner ?? actor, claimSource: current.status });
         // 卡 `-253`（需求 `R181`）：**撤单即前置终结** ⇒ 因依赖受阻的下游当场放回「可开工」
@@ -2535,7 +2548,7 @@ export function openStore(options = {}) {
      * 任务不在认领态 / 认领已过期 → 返回 false（对齐 hermes `heartbeat_worker`）。
      * **缺心跳本身不计为失败**，因此这里不碰 consecutive_failures。
      */
-    heartbeatTask(ref, { lock = null, note = null, now = null } = {}) {
+    heartbeatTask(ref, { lock = null, note = null, now = null, silent = false } = {}) {
       const task = store.requireTaskRef(ref);
       const at = new Date(now ?? Date.now()).toISOString();
       const args = [at, at, task.id, at];
@@ -2544,9 +2557,44 @@ export function openStore(options = {}) {
       const res = db.prepare(sql).run(...args);
       if (res.changes !== 1) return { ok: false, reason: "not-claimed-or-expired" };
       // FR-82：心跳同时计入当前尝试（heartbeats / last_heartbeat_at）
-      store.heartbeatTaskRun(task.identifier, { now: now ?? Date.now() });
+      store.heartbeatTaskRun(task.identifier, { now: now ?? Date.now(), silent });
       if (note) { try { store.addComment(task.id, { body: `心跳：${note}` }); } catch { /* ignore */ } }
       return { ok: true, at };
+    },
+    /**
+     * 卡 `-260`（需求 `R185`）：**经主会话下发的执行也要有心跳**。
+     *
+     * 真机（2026-11-12 · `-248`）：`-257` 之后 CLI 执行器默认交项目主会话下发，服务端只投一条 prompt
+     * 就返回 —— **没有任何本地进程**，于是 `run_heartbeat` 从来不打，一条 22 分 51 秒的成功尝试
+     * `heartbeats` 恒为 1（只有认领那一拍）。看门狗因此判不了活，人也在抽屉里看不到任何进度。
+     *
+     * 口径（**只报可观测事实，不臆造**）：只有当该次尝试绑定的会话在宿主 `agents` 注册表里
+     * **running 或有待消费消息**时才打 —— 会话空闲就一拍都不打，绝不为了「看起来在跑」而刷心跳。
+     *
+     * 每拍只更新计数/时间戳，**不写 `heartbeat` 事件**（`silent:true`），否则事件流会被 40 条噪音淹掉。
+     */
+    heartbeatDispatchedRuns({ now = null } = {}) {
+      const rows = db.prepare(
+        `select t.id as task_id, t.identifier, t.status, r.session_id
+           from task_runs r join tasks t on t.id = r.task_id
+          where r.status = 'running'`,
+      ).all();
+      const beat = [];
+      for (const row of rows) {
+        if (String(row.status) !== "in_progress") continue; // 已进待验收/已完成的不该再「在跑」
+        const sid = row.session_id;
+        if (!sid) continue; // 没有会话可观测 ⇒ 不臆造
+        let state = null;
+        try { state = store.taskSessionState({ id: row.task_id, sessionId: sid }); } catch { state = null; }
+        const alive = state?.running === true || Number(state?.pending ?? 0) > 0;
+        if (!alive) continue;
+        try {
+          const ok = store.heartbeatTask(row.identifier, { now, silent: true });
+          if (!ok?.ok) store.heartbeatTaskRun(row.identifier, { now, silent: true });
+          beat.push(row.identifier);
+        } catch { /* 单卡心跳失败不影响其它卡 */ }
+      }
+      return beat;
     },
     /** 认领状态只读查询（FR-77）：是否被认领 / 是否过期 / 心跳年龄（秒）。 */
     taskClaimState(ref, { now = null, heartbeatGapMs = DEFAULT_HEARTBEAT_GAP_MS } = {}) {
@@ -3235,14 +3283,16 @@ export function openStore(options = {}) {
       return { started: true, run: rowToRun(db.prepare("select * from task_runs where id = ?").get(id)) };
     },
     /** 尝试心跳（FR-82 的 heartbeats 计数；与 FR-77 的认领心跳同源，缺心跳本身不算失败）。 */
-    heartbeatTaskRun(ref, { now = null, maxMs = null } = {}) {
+    heartbeatTaskRun(ref, { now = null, maxMs = null, silent = false } = {}) {
       const task = ref && typeof ref === "object" && ref.id ? ref : store.requireTaskRef(ref);
       const run = store.getCurrentRun(task);
       if (!run) return { ok: false, reason: "no-running-run" };
       const at = new Date(now ?? Date.now()).toISOString();
       db.prepare("update task_runs set heartbeats = heartbeats + 1, last_heartbeat_at = ?, updated_at = ? where id = ? and status = 'running'").run(at, at, run.id);
       if (maxMs != null) db.prepare("update task_runs set max_ms = ? where id = ?").run(Number(maxMs), run.id);
-      store.recordTaskEvent(task.id, { type: "heartbeat", to: "running", detail: `第 ${run.attempt} 次尝试心跳`, now });
+      // 卡 `-260`（R185）：批量心跳（`heartbeatDispatchedRuns`）每 30s 一拍，不能每拍都往事件流里
+      // 塞一条 `heartbeat` —— 20 分钟的执行会攒下 40 条纯噪音。`silent:true` 只更新计数与时间戳。
+      if (!silent) store.recordTaskEvent(task.id, { type: "heartbeat", to: "running", detail: `第 ${run.attempt} 次尝试心跳`, now });
       return { ok: true, runId: run.id, attempt: run.attempt, at };
     },
     /**
