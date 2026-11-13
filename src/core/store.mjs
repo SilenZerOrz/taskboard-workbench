@@ -3839,7 +3839,10 @@ export function openStore(options = {}) {
         store.recordAudit({ actor, action: "set-status", target: t.identifier, allowed: false, reason: "human-review-not-executable", detail: `requested ${status}` });
         throw new TbError("HUMAN_REVIEW_NOT_EXECUTABLE", `任务 ${t.identifier} 是人工校验任务：执行侧不得改其状态`, { identifier: t.identifier });
       }
-      if (!TEAM_WRITABLE_STATUSES.includes(status)) throw invalidField("status", `执行侧不允许写入 ${status}`);
+      if (!TEAM_WRITABLE_STATUSES.includes(status))
+        // 卡 `-262`（需求 `R186`）：旧文案只说「不允许」，不列合法值 —— 传中文时读起来像「这个状态不允许」，
+        // 而不是「你填错语言了」。现在把合法枚举与中文列名一次说清（仍拒绝，不做静默映射）。
+        throw invalidField("status", `执行侧不允许写入 ${status}：status 只接受英文枚举 ${TEAM_WRITABLE_STATUSES.join(" / ")}（中文只是看板列名：in_progress=进行中 / in_review=待验收 / blocked=受阻 / canceled=取消）`);
       // 状态离开"进行中"即释放认领（FR-77）
       const clearClaim = status === "in_progress" ? "" : ", claim_lock = null, claim_expires = null, claim_owner = null, last_heartbeat_at = null";
       db.prepare(`update tasks set status = ?${clearClaim}, version = version + 1, updated_at = ? where id = ?`).run(status, nowIso(), t.id);

@@ -270,7 +270,7 @@ async function deliverDispatched(store, project, dispatched) {
   const lines = [`[任务工作台下发] 本轮派发 ${dispatched.length} 条任务（请作为项目执行团队承接）：`];
   for (const d of dispatched) lines.push(`· ${d.task}（teamId=${d.teamId}）`);
   lines.push("操作指引：按依赖就绪逐个认领 → 执行 → 提交\"待验收\"（失败→受阻）；不得置\"完成\"（人工确认）。");
-  lines.push("状态回写：任务看板 taskboard_update_status（进行中/待验收/受阻），完成由人工确认。");
+  lines.push("状态回写：taskboard_update_status 的 status 取英文枚举 in_progress / in_review（待验收）/ blocked（受阻）/ canceled（取消）；中文只是列名，传中文会被拒。完成不得自行置 done（人工确认）。");
   let r = null;
   try { r = await port.sendPrompt(boundSessionId, lines.join("\n")); } catch { r = null; }
   const sent = Boolean(r?.sent);

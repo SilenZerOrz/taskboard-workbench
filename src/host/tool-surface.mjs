@@ -13,6 +13,7 @@
  */
 import { matchProjectForCwd, resolveContext, resolveProjectForCwd } from "../core/binding.mjs";
 import { TbError } from "../core/errors.mjs";
+import { TEAM_WRITABLE_STATUSES } from "../core/team.mjs";
 
 const text = (v) => [{ type: "text", text: typeof v === "string" ? v : JSON.stringify(v, null, 2) }];
 // 宿主 tools 服务对 JSON-schema 有**子集校验**（dsh-tools/json-schema）：`type` 只能是
@@ -162,8 +163,18 @@ export function registerTaskboardTools({ tools, store, events = null, defineTool
 
   reg({
     name: "taskboard_update_status",
-    description: "更新任务状态（执行侧可用：进行中/待验收/受阻/取消）；**不得写 done**（人工确认）。置「受阻」时可带 kind（dependency/needs_input/capability/transient）以便分类与循环升级；置「待验收」= **请求评审**（FR-83，欢迎带 comment 说明与触发的疑问）。",
-    parameters: { ref: { type: "string", required: true }, status: { type: "string", required: true }, kind: { type: "string" }, reason: { type: "string" }, comment: { type: "string" } },
+    description: "更新任务状态（执行侧可写：in_progress / in_review / blocked / canceled）。**status 必须传英文枚举**——中文只是看板列名对照：in_progress（进行中）/ in_review（待验收）/ blocked（受阻）/ canceled（取消），传中文会被拒。**不得写 done**（人工确认，schema 直接拒）。置 blocked 时可带 kind（dependency/needs_input/capability/transient）以便分类与循环升级；置 in_review = **请求评审**（FR-83，欢迎带 comment 说明与触发的疑问）。",
+    parameters: {
+      ref: { type: "string", required: true, description: "任务编号（如 taskboard-workbench-1）或任务 id。" },
+      // 卡 `-262`（需求 `R186`）：`status` 原先只有 `type: "string"`、描述里写中文 ⇒ 模型照描述填「待验收」，
+      // 实现只认英文枚举，必抛 `INVALID_FIELD: 执行侧不允许写入 待验收`。
+      // 现在把合法值写进 schema：宿主 JSON-schema 子集已核实支持 `type:"string"` 上的 `enum`
+      // （dsh-tools `compileValueSchema` 的 string 分支允许 authorKeys + type/enum/const）。
+      status: { type: "string", required: true, enum: [...TEAM_WRITABLE_STATUSES], description: "英文枚举（必填）：in_progress / in_review / blocked / canceled。中文只是看板列名，不要传中文。" },
+      kind: { type: "string", description: "仅在 status=blocked 时生效：dependency / needs_input / capability / transient（缺省 transient）。" },
+      reason: { type: "string", description: "受阻原因 / 撤单说明（可选）。" },
+      comment: { type: "string", description: "仅在 status=in_review 时作为评审请求说明（可选）。" },
+    },
     async execute(args, exec) {
       const actor = actorOf(exec) ?? "agent";
       // FR-80：置「受阻」走统一分类入口（带类型 + 复发升级）；
