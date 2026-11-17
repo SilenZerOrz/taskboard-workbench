@@ -69,7 +69,7 @@ node cli/tb.mjs project list   # 或用 CLI 直接操作
 | 项 | 值 |
 | --- | --- |
 | Node.js | `>= 22.5.0`（依赖 `node:sqlite`） |
-| DSH | `0.2.0-rc.2` 线真机验证通过（`0.2.1-alpha.1` 历史走通） |
+| DSH | `>=0.2.1-rc.3`（与 `package.json#engines.dsh` 一致）；`0.2.2-rc.3` 真机验证通过 |
 | 运行时依赖 | 无（`dependencies` 为空） |
 
 ## 快速上手（CLI）
