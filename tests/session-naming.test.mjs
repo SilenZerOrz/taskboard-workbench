@@ -320,5 +320,12 @@ test("FR-95-20：前端必须把命名结果**说出来** —— 成功给名字
   assert.ok(uses >= 5, `五处横幅都要接上（实际 ${uses} 处）`);
   // 3) 命名失败时横幅**不得仍报绿**（否则等于换个方式骗人）
   assert.match(web, /r\.titleApplied === false \? "error" : "info"/, "改绑出口：命名失败要红色");
-  assert.match(web, /l\.mode === "session" && l\.titleApplied !== false \? "info" : "error"/, "启动执行出口：要按命名结果定档");
+  // 卡 `-264`（R188）：`launch.mode` 新增 `reuse-bound` / `create-and-authorize` 两档（它们是**正常成功**），
+  // 旧口径「非 session 即 error」会把「复用了空闲会话」误报成红色 ⇒ 定档改为按「降级 / 无会话 / 命名失败」判红。
+  // 本条要守的仍是同一件事：**启动执行出口不许在命名失败时仍报绿**。
+  // 卡 `-272`（R188 ③）再加一档红条件 `bookDeliveryFailed(l)`（会话建了但任务书没送到）——
+  // 断言改成「该行**含**降级 / 无会话 / 命名失败三条」，不锁整行字面（锁字面会逼着每次加红条件都改守卫，
+  // 而守卫要守的是「命名失败必红」这件事本身）。
+  assert.match(web, /l\.mode === "degraded" \|\| !l\.sessionId \|\| l\.titleApplied === false[^\n]*\? "error" : "info"/, "启动执行出口：命名失败 / 降级 / 无会话都要报红");
+  assert.match(web, /l\.mode === "reuse-bound" \? "复用已绑定空闲会话"/, "新增的成功档必须说人话（不能只丢枚举名）");
 });

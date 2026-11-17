@@ -24,6 +24,7 @@ import { fileURLToPath } from "node:url";
 import { openStore } from "../src/core/store.mjs";
 import { TEAM_WRITABLE_STATUSES } from "../src/core/team.mjs";
 import { registerTaskboardTools } from "../src/host/tool-surface.mjs";
+import { buildDispatchBriefLines, directiveFor } from "../src/core/loop.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -96,12 +97,49 @@ test("E 红线：done 不在 enum 内，但直连 execute 传 done 仍抛 GOVERN
   assert.equal(store.requireTaskRef(t.identifier).status, "in_progress", "红线拒绝后状态不得变化");
 });
 
-test("F 下发文案：loop.mjs 那行给的是英文枚举，不是旧中文串", () => {
+test("F 下发文案：团队派发指令（directiveFor 的真实输出）给的是英文枚举，不是旧中文串", () => {
+  // 卡 `-270` 补口：原 F 是「在源码里 find 含『状态回写：』的那一行」——
+  // 锁的是**源码文本**，而源码里可能有好几行、也可能一行都没真正下发。
+  // 现在直接调用产出函数断言**真正派发出去的这份文本**。
+  const text = directiveFor("official", { teamId: "team-1", taskRef: "taskboard-workbench-270", requirementId: null, qualityGates: null });
+  assert.ok(text.includes("状态回写用英文枚举"), `下发文案必须写明英文枚举口径：${text}`);
+  assert.ok(!text.includes("（进行中/待验收/受阻）"), `下发文案仍在给中文取值：${text}`);
+  for (const e of ENUMS) assert.ok(text.includes(e), `下发文案缺少英文枚举 ${e}：${text}`);
+  // 中文只允许以「英文（中文）」对照形态出现（列名解释），不得再当取值教。
+  assert.ok(text.includes("in_review（待验收）"), `中文必须作括号对照：${text}`);
+  assert.ok(!text.includes("提交\"待验收\""), `仍在教中文取值：${text}`);
+  assert.ok(!text.includes("不得置\"完成\""), `红线应写成英文枚举 done（与工具描述同口径）：${text}`);
+});
+
+test("F2 主会话汇总指令（buildDispatchBriefLines 的真实输出）：不得再把中文当取值教给执行会话", () => {
+  // 卡 `-270` 补口：这条**才是真正投进项目主会话的正文**，此前没人锁过它
+  // （原 F2 靠 `find` 源码里含「工作台任务标识：」的那一行 ⇒ 锁到的是相邻说明行，
+  //  于是「提交"待验收"（失败→受阻）」长期绿着）。现在断言真实产出。
+  const text = buildDispatchBriefLines([{ task: "taskboard-workbench-270", teamId: "team-1" }]).join("\n");
+  assert.ok(text.includes("状态回写："), `汇总指令必须写明状态回写口径：${text}`);
+  assert.ok(!text.includes("（进行中/待验收/受阻）"), `下发文案仍在给中文取值：${text}`);
+  assert.ok(!text.includes("提交\"待验收\""), `仍在教中文取值：${text}`);
+  assert.ok(!text.includes("失败→受阻"), `仍在教中文取值：${text}`);
+  for (const e of ENUMS) assert.ok(text.includes(e), `下发文案缺少英文枚举 ${e}：${text}`);
+  // 中文只作括号对照。
+  assert.ok(text.includes("in_review（待验收）"), `中文必须作括号对照：${text}`);
+  assert.ok(text.includes("blocked（受阻）"), `中文必须作括号对照：${text}`);
+});
+
+test("F3 兜底：loop.mjs 里凡出现中文状态词的**非注释行**，必须同时给出对应英文枚举对照", () => {
+  // 为什么还要扫源码：F/F2 断言的是**那两条真实下发文案**，但下次有人再加第三条下发路径
+  // （或往别的行上加中文取值）时它们不会红。扫描兜住「loop.mjs 里还有别的行在教中文取值」。
   const src = readFileSync(path.join(ROOT, "src/core/loop.mjs"), "utf8");
-  const line = src.split("\n").find((l) => l.includes("状态回写："));
-  assert.ok(line, "loop.mjs 里必须还有「状态回写：」这一行");
-  assert.ok(!line.includes("（进行中/待验收/受阻）"), `下发文案仍在给中文取值：${line}`);
-  for (const e of ["in_progress", "in_review", "blocked", "canceled"]) {
-    assert.ok(line.includes(e), `下发文案缺少英文枚举 ${e}：${line}`);
-  }
+  const WORDS = { 进行中: "in_progress", 待验收: "in_review", 受阻: "blocked", 取消: "canceled" };
+  src.split("\n").forEach((raw, i) => {
+    const line = raw.trim();
+    if (line.startsWith("//") || line.startsWith("*") || line.startsWith("/*")) return; // 注释行
+    for (const [word, en] of Object.entries(WORDS)) {
+      if (!line.includes(word)) continue;
+      assert.ok(
+        line.includes(`${en}（${word}）`),
+        `loop.mjs:${i + 1} 出现中文状态词「${word}」却没给对应枚举对照「${en}（${word}）」：${line}`,
+      );
+    }
+  });
 });

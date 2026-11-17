@@ -156,6 +156,10 @@ export function assertSplitTasks(tasks) {
     out.push({
       title,
       description: t.description === undefined || t.description === null ? "" : String(t.description),
+      // 卡 `-273`（需求 `R189`）：acceptance 也必须**穿过**校验层。
+      // 2026-11-17 真机读数：批量生成 16 张卡 desc=0 / acc=0，而条目本身 desc 4509 / acc 213
+      // —— 内容全被这一层丢掉，与 2026-10-28 `kind` 丢失是**同一个缺陷形状**（界面/接口给了，实现静默丢）。
+      acceptance: t.acceptance === undefined || t.acceptance === null ? "" : String(t.acceptance),
       owner: t.owner === undefined || t.owner === null ? null : String(t.owner),
       // 2026-10-28：kind 必须**穿过**校验层（旧实现丢字段 ⇒ 界面填了等于没填）
       kind: normalizeSplitKind(t.kind),
@@ -165,6 +169,99 @@ export function assertSplitTasks(tasks) {
     });
   }
   return out;
+}
+
+/** 条目正文里取「标签：」段（含后续同段行；用于兜底装配卡片正文；取不到返回空串）。 */
+const BLOCK_LABELS = ["目标", "范围", "改动范围", "禁止", "约束", "硬约束", "做法", "报告", "停下", "验收", "关联", "背景"];
+const LABEL_LINE_RE = new RegExp(`^[\\s>*【]*(?:${BLOCK_LABELS.join("|")})\\s*[】]*\\s*[：:]`);
+
+/** 显式截断：**不静默砍**（-232 的教训：静默 slice 比报错更难查）。 */
+function clipText(text, maxChars) {
+  if (text.length <= maxChars) return text;
+  const head = text.slice(0, maxChars);
+  // 尽量在句读处断开，别把一句话砍成半个词。
+  const cut = Math.max(head.lastIndexOf("；"), head.lastIndexOf("。"), head.lastIndexOf("、"));
+  const body = cut > maxChars * 0.4 ? head.slice(0, cut) : head;
+  return `${body}…（截断，全文见需求条目）`;
+}
+
+function pickLabelledBlock(body, labels, maxChars = 9999) {
+  const lines = String(body ?? "").split(/\r?\n/);
+  for (const label of labels) {
+    const head = new RegExp(`^[\\s>*【]*(?:${label})\\s*[】]*\\s*[：:]\\s*(.*)$`);
+    for (let i = 0; i < lines.length; i += 1) {
+      const m = head.exec(lines[i]);
+      if (!m) continue;
+      const parts = [];
+      if (m[1].trim()) parts.push(m[1].trim());
+      for (let j = i + 1; j < lines.length; j += 1) {
+        const line = lines[j];
+        if (line.trim() === "") break;
+        if (LABEL_LINE_RE.test(line)) break;
+        parts.push(line.trim());
+      }
+      const text = parts.join("；").replace(/；{2,}/g, "；").replace(/：；/g, "：").trim();
+      if (text === "") return "";
+      return clipText(text, maxChars);
+    }
+  }
+  return "";
+}
+
+/**
+ * 卡 `-273`（需求 `R189`）：**批量/分拆生成任务时的兜底正文**（规范 `docs/规范/07-条目详情规范.md` §2.1 七块）。
+ *
+ * 为什么要有兜底：入口（界面「批量生成任务」、MCP、CLI）都只传 `{title}` 时，旧实现会建出
+ * **description 为空**的卡 —— 执行者打开只看到一句标题，没有范围、没有禁止、没有验收，
+ * 于是「怎么做都对」「做没做完说不清」。条目上明明写着这些内容，却在建卡时丢了。
+ *
+ * 口径：**只装配、不臆造** —— 条目写了「范围：」「约束：」就摘出来；没写就如实写「未写，开工前须补」，
+ * 绝不替人编一个范围。八个标签顺序固定，便于逐行核对。
+ *
+ * 2026-11-17 二修：首版只摘「范围：」**同一行**，而本仓条目普遍写成「范围：」换行 + ①②③ 清单
+ * ⇒ 摘出来只剩一句「包含（本仓库可改）：」，等于没写。改为**摘整段**并按预算显式截断。
+ */
+export function buildSplitTaskDescription(item, title) {
+  const ref = String(item?.identifier ?? "").trim();
+  const body = String(item?.description ?? "");
+  const itemTitle = String(item?.title ?? "").trim() || String(title ?? "").trim();
+  const scopeFull = pickLabelledBlock(body, ["范围", "改动范围"]);
+  const forbidFull = pickLabelledBlock(body, ["禁止", "约束", "硬约束"]);
+  const acceptance = String(item?.acceptance ?? "").trim();
+  // 验收整段照搬会把正文顶出 800 字预算（-272 实测 593 字）⇒ 超过 200 字改指向验收字段，不重复粘贴。
+  const accLine = acceptance === ""
+    ? "需求条目未写验收 —— 开工前必须补，否则本卡无法判定完成"
+    : acceptance.length <= 200
+      ? acceptance
+      : `见本卡「验收标准」字段（原文 ${acceptance.length} 字，此处不重复粘贴）`;
+
+  const assemble = (scopeChars, forbidChars) => [
+    `${String(title ?? "").trim()}（来自需求 ${ref || "（未命名）"}）`,
+    "",
+    `目标：${itemTitle}`,
+    `范围：${scopeFull ? clipText(scopeFull, scopeChars) : `包含：按需求 ${ref || "（未命名）"} 正文所列落点；移出：需求之外的一切（条目未写「范围」段 —— 开工前须补）`}`,
+    `禁止：AGENTS.md §3 硬禁令（不碰 :3080 运行实例 / 不改 ~/.dsh/** / 不删用户数据 / 对外动作须报批）${forbidFull ? `；本轮特禁：${clipText(forbidFull, forbidChars)}` : "；本轮特禁：未指定（开工前须补）"}`,
+    "做法：1) 读需求条目正文与相关文件，先贴原文；2) 按「范围」改动，一次一处；3) 改完再贴改后原文",
+    "报告：四节证据（判定 / 偏离说明 / 边界自查 / 产物路径 + sha256）",
+    "停下：报错 / 超范围 / 验收不满足 / 需新变量 ⇒ 停，不重试",
+    `验收：${accLine}`,
+    `关联：需求 ${ref || "（未命名）"}；规范 docs/规范/07-条目详情规范.md §2.1`,
+  ].join("\n");
+
+  // 预算 800（规范 07 §4）：从宽到紧逐档收缩，**每一档都是显式截断**（带「截断」字样）。
+  const caps = [[360, 220], [260, 150], [180, 100], [120, 70], [80, 50]];
+  let text = "";
+  for (const [scopeChars, forbidChars] of caps) {
+    text = assemble(scopeChars, forbidChars);
+    if (text.length <= 800) break;
+  }
+  return text;
+}
+
+/** 卡 `-273`（需求 `R189`）：兜底验收 —— 条目有验收就逐字沿用，没有就**显式标注缺口**（不留空）。 */
+export function buildSplitTaskAcceptance(item) {
+  const acceptance = String(item?.acceptance ?? "").trim();
+  return acceptance || "需求条目未写验收 —— 开工前必须补";
 }
 
 // ------------------------------------------------------------------ AI 条目化（FR-36，首选路径；规则解析为 fallback）

@@ -71,15 +71,58 @@ export function resolveCliExecutor(settings, { role = "engineer" } = {}) {
     ?? null;
 }
 
-/** CLI 参数：非交互 + 显式放行工具 + 允许访问项目目录（可被设置里的 `engineer.args` 覆盖）。 */
+/**
+ * 派发工作目录（2026-11-13 · 方案 A）。
+ *
+ * **背景（真机事故）**：本项目 `project.workspacePath` = `00-project-real`，而前端卡片的目标文件在
+ * 兄弟目录 `00-project-realdemo/app-vue/`。派单器把 `workspacePath` 同时用作 ① `--add-dir`、
+ * ② 任务书 Step 0 的 `cd`、③ 硬边界那句「只允许改 X 内的文件」，于是三处一起指错：
+ * CLI 的写权限收敛在 `00-project-real`，目标文件在界外 —— 执行器在 Step 0 就得停（且停得对）。
+ *
+ * 修法：把「派发目录」与「文档/仓库工作区」解耦。`teamTemplate.engineer.cwd` 一旦配置，
+ * 上面三处统一改用它；不配置即**逐字节**维持旧行为（零回归）。
+ */
+export function resolveDispatchDir({ project, settings } = {}) {
+  const raw = settings?.teamTemplate?.engineer?.cwd;
+  const cwd = typeof raw === "string" && raw.trim() ? raw.trim() : null;
+  return cwd ?? project?.workspacePath ?? null;
+}
+
+/**
+ * 硬边界指向的路径（写进任务书那句「只允许改 …… 内的文件」）。
+ *
+ * `teamTemplate.engineer.writable` 是**相对派发目录**的子路径（如 `app-vue`）：
+ * 配了就渲染成 `<派发目录>/app-vue`，没配就是整个派发目录。
+ * 注意：这是**文字边界**，不是 ACL —— 真正的进程级收敛仍是 `--add-dir`（见 `cliArgsFor`）。
+ */
+export function resolveWritableScope({ project, settings } = {}) {
+  const dir = resolveDispatchDir({ project, settings });
+  // 既有字段优先：`teamTemplate.writeScope`（数组，本项目原本就写着 ["scada-docs/", ".doc-backups/"]，
+  // 但此前**没有任何代码读它** —— 边界那行一直只渲染整个 workspacePath）。
+  // 条目语义：相对派发目录；以 `/` 开头的当绝对路径用（这样不换 cwd 也能放行兄弟目录）。
+  const list = settings?.teamTemplate?.writeScope;
+  const fromScope = Array.isArray(list) ? list.map(String).map((x) => x.trim()).filter(Boolean) : [];
+  const single = settings?.teamTemplate?.engineer?.writable;
+  const items = fromScope.length ? fromScope
+    : (typeof single === "string" && single.trim() ? [single.trim()] : []);
+  if (!items.length) return dir;
+  const abs = items.map((x) => (x.startsWith("/") ? x : (dir ? `${dir}/${x.replace(/^\.\//, "")}` : x)));
+  return abs.join("、");
+}
+
+/** CLI 参数：非交互 + 显式放行工具 + 允许访问派发目录（可被设置里的 `engineer.args` 覆盖）。 */
 export function cliArgsFor({ executorId, cwd, settings }) {
   const override = settings?.teamTemplate?.engineer?.args;
   if (Array.isArray(override) && override.length) return override.map(String);
+  const extra = Array.isArray(settings?.teamTemplate?.engineer?.extraDirs)
+    ? settings.teamTemplate.engineer.extraDirs.map(String).filter((d) => d.trim())
+    : [];
   return [
     "-p",
     "--permission-mode", "acceptEdits",
     "--allowedTools", String(settings?.teamTemplate?.engineer?.allowedTools ?? DEFAULT_ALLOWED_TOOLS),
     "--add-dir", cwd,
+    ...extra.flatMap((d) => ["--add-dir", d]),
   ];
 }
 
@@ -119,8 +162,8 @@ export function argsAllowEdits(args) {
  * 本函数产出的就是「要嵌进外层 ``` 围栏」的正文，故正文内**任何代码块一律 4 反引号**。
  * §一 硬规则 #2：**每个 Step 必须同时给判据与停下情形**，缺一即为不合格模板。
  */
-export function buildTaskPrompt(task, { project, requirementId = null, verifyCommand = null } = {}) {
-  const cwd = project?.workspacePath ?? null;
+export function buildTaskPrompt(task, { project, settings = null, requirementId = null, verifyCommand = null } = {}) {
+  const cwd = resolveDispatchDir({ project, settings });
   const steps = [
     `## Step 0 — 预检（只读，不通过就停）`,
     ``,
@@ -151,7 +194,7 @@ export function buildTaskPrompt(task, { project, requirementId = null, verifyCom
     `- ❌ 不删任何既有数据（任务 / 看板项目 / 需求条目）。`,
     `- ❌ 不改本任务范围外的文件；共享文件（core/store、server/api、web/app.js）改动保持最小。`,
     `- ❌ **不自行置「完成(done)」** —— 完成只能由人确认，你只提交「待验收」。`,
-    cwd ? `- ✅ 只允许改 ${cwd} 内的文件。` : "",
+    resolveWritableScope({ project, settings }) ? `- ✅ 只允许改 ${resolveWritableScope({ project, settings })} 内的文件。` : "",
     `- ✅ 隔离验证用临时目录 / 临时端口 / 独立进程，跑完即删。`,
     ``,
     `## 已知前置`,
@@ -437,14 +480,14 @@ export async function runCliExecutor({
   argsOverride = null, promptVia = "stdin",
 } = {}) {
   if (!executor?.cli) return { started: false, reason: "no-cli-executor" };
-  const workdir = cwd ?? project?.workspacePath ?? null;
+  const workdir = cwd ?? resolveDispatchDir({ project, settings }) ?? null;
   if (!workdir) return { started: false, reason: "no-workspace", executorId: executor.id };
   // 测试/离线替身：`TB_CLI_EXECUTOR_BIN` 指定可执行文件时优先使用（不改 executor id 语义）。
   // `binPath` 优先于裸命令名：宿主由 launchd 拉起时 PATH 常缺 `~/.npm-global/bin`，
   // 只写命令名会在 `exec-cli` 真跑时报 ENOENT（探测到绝对路径就用它）。
   // `TB_CLI_EXECUTOR_BIN` 仍是最高优先（测试/离线替身语义不变）。
   const cli = String(env?.TB_CLI_EXECUTOR_BIN ?? "") || executor.binPath || executor.cli;
-  const prompt = buildTaskPrompt(task, { project, requirementId, verifyCommand });
+  const prompt = buildTaskPrompt(task, { project, settings, requirementId, verifyCommand });
   const explicitArgs = Array.isArray(argsOverride) && argsOverride.length ? argsOverride.map(String) : null;
   const args = explicitArgs ?? cliArgsFor({ executorId: executor.id, cwd: workdir, settings });
   // 参数来源与「能不能写文件」都要如实记进结果（证据与状态都取它，见 isBlindRun）。

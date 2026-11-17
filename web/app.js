@@ -52,6 +52,11 @@
     "change-requirement": "变更需求（按新口径重开原任务）",
     close: "关闭（不再推进该任务）",
   };
+  // 卡 `-268`（需求 `R184`）：**执行方没回写摘要时的唯一说法**。
+  // 与服务端 `src/core/store.mjs` 的 `RUN_SUMMARY_FALLBACK` **逐字一致**（两份不许漂 ——
+  // `tests/exec-record-render.test.mjs` 钉住）。绝不拿记账文案（「按成功完成记账（失败计数清零）」）
+  // 冒充执行内容；服务端已在读路径归一（`displayRunSummary`），这里的兜底是给**未重载的旧服务端**留的。
+  const RUN_SUMMARY_FALLBACK = "执行方未回写摘要";
   // FR-88：卡片「折叠（软归档）」—— 不删任何数据，只用一个标签把已失效 / 无用的卡片从
   // 看板默认视图里收起来，保住「项目 → 需求 → 主任务（子任务串）」的层次。
   // 用标签而不是新状态：状态是流程语义（backlog / todo / …），折叠只是呈现开关；
@@ -566,6 +571,23 @@
       node.textContent = label;
       return node;
     };
+    // 卡 `-272`（需求 `R188`）：`launch.reusedFrom` 的**来源档位**中文名。
+    // 服务端只给 `main` / `approved` / `executor` 三个枚举值 —— 这里只做翻译，不新增判据。
+    const REUSED_FROM_LABEL = { main: "项目主会话", approved: "已批准关联会话", executor: "执行会话（派生）" };
+    /**
+     * 卡 `-272`（需求 `R188` 验收③）：**授权已成 ≠ 任务书已送达**。
+     *
+     * 服务端 `launch.bookDelivery` 只有新建路径才有（`null` = 不适用）。`delivered === false` 表示
+     * 会话建出来了、授权也写了，但**任务书一个字都没进那条会话**（宿主 preset 被吞 + 补投也失败）。
+     * 此时界面**不得**照常显示「已新建…无需再申请关联」—— 那句话会让人以为派发已完成。
+     * 返回 `""` 表示没有这条警告（不是复用路径、或确实送达了）。
+     */
+    const bookDeliveryClause = (launch) => {
+      const d = launch?.bookDelivery ?? null;
+      if (!d || d.delivered !== false) return "";
+      return `\n⚠ 任务书未送达（${d.reason ?? "原因未知"}）：会话已建、授权已生效，但该会话不知道要做什么 —— 点「打开执行会话」把任务书手工贴过去，或修好宿主 preset 投递后重派`;
+    };
+    const bookDeliveryFailed = (launch) => (launch?.bookDelivery?.delivered === false);
 
     // ---------------------------------------------------------------- chrome
     const shell = mk("div", "app-shell");
@@ -743,7 +765,22 @@
     // `stale` 单独给警示样式：判定过期时**不许**看起来像"可以确认"。
     const drawerStage = mk("span", "tb-stage-badge", "");
     drawerStage.hidden = true;
-    drawerHeadMain.append(drawerId, drawerStage, drawerTitle);
+    // 卡 `-268`（需求 `R184`）③：**首屏的「执行记录」锚点**。
+    // 真机（2026-11-12 · 卡 `-248`）：执行状态埋在抽屉第 7 段（「执行会话」），证据埋在第 14 段（评论），
+    // 首屏只有概览 —— 人要先知道「有没有跑过、跑到哪了」，才谈得上往下翻。这里在标题栏给一颗**恒在**的
+    // 徽标（有没有记录都给，空态写「尚无」），点它跳到「执行记录」段。
+    // 只读：不新增判据，数字全部来自 `GET /api/tasks/:ref` 的 `executionRecord`（与那一段同源）。
+    const drawerExecBadge = mk("button", "tb-exec-badge", "");
+    drawerExecBadge.type = "button";
+    drawerExecBadge.hidden = true;
+    drawerExecBadge.addEventListener("click", () => {
+      const sec = Array.from(drawerBody.querySelectorAll(".drawer-section"))
+        .find((s) => s.classList.contains("exec-record"));
+      if (!sec) { showBanner("「执行记录」段尚未就绪，请稍候重试", "error"); return; }
+      sec.classList.remove("collapsed"); // FR-87 折叠态下先展开，否则"跳过去"看不到东西
+      sec.scrollIntoView({ block: "start", behavior: "smooth" });
+    });
+    drawerHeadMain.append(drawerId, drawerStage, drawerExecBadge, drawerTitle);
     const drawerClose = mk("button", "ghost icon", "✕");
     drawerClose.type = "button";
     drawerClose.title = "关闭";
@@ -1542,9 +1579,15 @@
             // FR-49：下发结果可见（会话绑定 / 降级原因）
             if (suffix === "/execute" && result?.launch) {
               const l = result.launch;
+              // 卡 `-264`：`mode` 新增 `reuse-bound` / `create-and-authorize` 两档 —— 它们是**正常成功**，
+              // 旧口径「非 session 即 error」会把「复用了空闲会话」误报成红色错误。
+              const modeText = l.mode === "reuse-bound" ? "复用已绑定空闲会话"
+                : l.mode === "create-and-authorize" ? "新建执行会话并首次授权"
+                : l.mode === "session" ? "已下发到指定会话"
+                : "降级";
               showBanner(
-                `已下发 ${task.identifier}：mode=${l.mode}${l.sessionId ? ` · 会话 ${String(l.sessionId).slice(0, 12)}` : ""}${l.reason ? ` · 降级原因 ${l.reason}` : ""}${sessionNameClause(l)}`,
-                l.mode === "session" && l.titleApplied !== false ? "info" : "error",
+                `已下发 ${task.identifier}：${modeText}${l.sessionId ? ` · 会话 ${String(l.sessionId).slice(0, 12)}…` : ""}${l.reason ? ` · 降级原因 ${l.reason}` : ""}${sessionNameClause(l)}${bookDeliveryClause(l)}`,
+                l.mode === "degraded" || !l.sessionId || l.titleApplied === false || bookDeliveryFailed(l) ? "error" : "info",
               );
             }
             await loadTasks();
@@ -1559,7 +1602,9 @@
       };
       // 2026-10-22：入口由 executionEntry 决定 —— 未归因的可开工卡不给「启动执行」（点了必被归因门拒）。
       const entry = executionEntry(task);
-      if (entry === "start") group.appendChild(act("启动执行", "/execute", undefined, "启动执行会尝试新建/切换会话（可能切换主视图）。确认继续？"));
+      // 卡 `-264`：卡片级入口没有每卡预览（看板上不为每张卡探活），但口径要提前讲清 ——
+      // 会优先复用本项目的已绑定空闲会话；没有可用会话才新建并**首次授权**。
+      if (entry === "start") group.appendChild(act("启动执行", "/execute", undefined, "启动执行会先复用本项目已绑定的空闲会话；没有可用会话时新建一条并当场首次授权（可能切换主视图）。确认继续？"));
       else if (entry === "attribute") group.appendChild(attributeAction(task));
       else if (entry === "authorize") group.appendChild(authorizeAction(task));
       if (task.status === "in_progress") {
@@ -2086,7 +2131,8 @@
       if (!sessionId) { state.binding = { projectId, bound: true, mainSessionId: null, association: null }; return; }
       try {
         const c = await api("GET", `/api/context?session=${encodeURIComponent(sessionId)}&project=${encodeURIComponent(projectId)}`);
-        state.binding = { projectId, bound: c.sessionBound !== false, mainSessionId: c.mainSessionId ?? null, association: c.association ?? null, sessionOrigin: c.sessionOrigin ?? null };
+        // 卡 `-263`：`roleDerived` / `executorTasks` 让「执行会话」这条绑定说得出依据（哪张卡派生出来的）。
+        state.binding = { projectId, bound: c.sessionBound !== false, mainSessionId: c.mainSessionId ?? null, association: c.association ?? null, roleDerived: c.roleDerived === true, executorTasks: c.executorTasks ?? [], sessionOrigin: c.sessionOrigin ?? null };
       } catch (error) {
         state.binding = { projectId, bound: true, mainSessionId: null, association: null };
         // 卡 `-222` ①：绑定态也是 bootstrap 的一步 —— 失败要留原因（项目内切换时不算 boot 步骤，不记账）
@@ -3361,11 +3407,25 @@
         cfgAdv.append(envTa, tplTa, saveCfg);
         init.appendChild(cfgAdv);
 
+        // 卡 `-263`：角色中文名 —— 配置页此前直接打印英文枚举（executor / associated），
+        // 「执行会话」是**派生**出来的，必须在文案里说清它从哪来、什么时候消失。
+        const ROLE_LABEL = {
+          main: "主会话",
+          associated: "已关联（主会话批准）",
+          executor: "执行会话（按任务归属派生）",
+          pending: "待批准",
+          none: "未绑定",
+        };
+        const roleLabel = (role, tasks) => {
+          if (!role) return "未绑定";
+          const base = ROLE_LABEL[role] ?? String(role);
+          return Array.isArray(tasks) && tasks.length ? `${base} · 任务 ${tasks.join(" / ")}` : base;
+        };
         // FR-63：会话关联（主会话批准）
-        const links = card("会话关联（主会话批准）", "已绑定本项目的会话；未绑定的会话可申请，由主会话批准后生效");
+        const links = card("会话关联（主会话批准）", "已绑定本项目的会话；未绑定的会话可申请，由主会话批准后生效。执行会话按任务归属自动生效，任务收口后自动收回");
         links.appendChild(kvList([
           ["本会话", sessionId ? String(sessionId) : "（全局入口 · 非会话）"],
-          ["本会话角色", sessionId ? String(state.context?.association ?? "未绑定") : "—"],
+          ["本会话角色", sessionId ? roleLabel(state.context?.association, state.context?.executorTasks) : "—"],
           ["主会话", state.context?.mainSessionId ? String(state.context.mainSessionId) : "（尚无）"],
         ]));
         const sessList = await api("GET", `/api/projects/${encodeURIComponent(state.projectId)}/sessions`).catch(() => ({ sessions: [], main: null, staleMain: false }));
@@ -3445,6 +3505,21 @@
             ));
           }
         } else links.appendChild(mk("p", "hint", "暂无其它会话申请"));
+        // 卡 `-263`（需求 `R187`）· **执行会话（派生）**：认领/启动执行只写 `tasks.session_id`，
+        // 不写批准表 —— 这类会话此前在配置页完全不可见，用户只能看到「本会话角色：executor」这种生词。
+        // 这里如实列出「谁在干哪张卡」，并说明它**随任务收口自动消失**（没有「解除」按钮，因为它不是授权记录）。
+        if ((sessList.executors ?? []).length) {
+          for (const s of sessList.executors) {
+            const label = mk("span", null, `⚙ 执行会话（派生） · ${String(s.sessionId).slice(0, 14)}…`);
+            label.title = String(s.sessionId);
+            links.appendChild(row(
+              label,
+              livenessPill(s.liveness),
+              mk("span", "hint", `任务 ${(s.tasks ?? []).join(" / ")} · 任务进入 done / canceled 后自动收回`),
+              hostBtn("打开会话", () => openSessionJump(s.sessionId)),
+            ));
+          }
+        }
         links.appendChild(mk("p", "hint", "存活判定来源：宿主 `sessionQuery.observeSession`（持久化会话存在性）；判不准时显示「存在性未知」并按有效处理（不阻断打开）。主会话失效时用「重建并绑定主会话」接续。"));
 
         // FR-81：通知订阅（游标 + notify/wake）——工作台关着也能把任务终态闭环回目标会话
@@ -4149,9 +4224,18 @@
           btn("批量生成任务", async () => {
             const ids = [...reqState.selected].filter((id) => { const x = allItems.find((y) => y.identifier === id); return x && x.status !== "draft"; });
             if (!ids.length) { showBanner("请先勾选「已确认」条目", "error"); return; }
-            let n = 0; const failed = [];
-            for (const id of ids) { const x = allItems.find((y) => y.identifier === id); try { await api("POST", `/api/requirements/items/${encodeURIComponent(id)}/split`, { tasks: [{ title: x.title, kind: "work" }] }); n += 1; } catch (e) { failed.push(`${id}:${e.message}`); } }
-            showBanner(failed.length ? `已生成 ${n} 个任务，失败 ${failed.length} 条（首条：${failed[0]}）` : `已批量生成 ${n} 个看板任务（待办池，需授权开工）`, failed.length ? "error" : "info");
+            let n = 0; const failed = []; let noAcceptance = 0;
+            for (const id of ids) {
+              const x = allItems.find((y) => y.identifier === id);
+              // 卡 `-273`（需求 `R189`）：条目没写验收时必须**说出口** —— 旧口径只报「已生成 N 个任务」，
+              // 人以为卡是完整的；实际服务端只能写「需求条目未写验收 —— 开工前必须补」。
+              if (!String(x?.acceptance ?? "").trim()) noAcceptance += 1;
+              try { await api("POST", `/api/requirements/items/${encodeURIComponent(id)}/split`, { tasks: [{ title: x.title, kind: "work" }] }); n += 1; } catch (e) { failed.push(`${id}:${e.message}`); }
+            }
+            const detailNote = noAcceptance ? ` · ${noAcceptance} 条需求未写验收（卡上已标「开工前必须补」）` : "";
+            showBanner(failed.length
+              ? `已生成 ${n} 个任务，失败 ${failed.length} 条（首条：${failed[0]}）${detailNote}`
+              : `已批量生成 ${n} 个看板任务（待办池，需授权开工；正文与验收已按条目装配）${detailNote}`, failed.length ? "error" : "info");
             setView("board");
           }, "primary"),
           btn("批量删除", async () => {
@@ -4767,7 +4851,15 @@
         const r = await api("POST", `/api/tasks/${ref}/execute`, {});
         const launch = r?.launch ?? null;
         onDone?.();
-        return `已下发宿主会话：mode=${launch?.mode ?? "?"}${launch?.sessionId ? ` · 会话 ${String(launch.sessionId).slice(0, 12)}` : ""}`;
+        // 卡 `-264`：`mode` 是派发决策的可读回执 —— 复用/新建授权/降级必须说人话，不能只丢枚举名。
+        // 卡 `-272`（`R188` 验收①）：复用时把**来源档位**也说出来（主会话 / 已批准关联 / 派生执行会话）——
+        // 只说「复用了某条会话」的话，人答不出「它凭什么接这张卡」。
+        const reusedFromText = launch?.reusedFrom ? `（${REUSED_FROM_LABEL[launch.reusedFrom] ?? launch.reusedFrom}）` : "";
+        const modeText = launch?.mode === "reuse-bound" ? `复用已绑定空闲会话${reusedFromText}`
+          : launch?.mode === "create-and-authorize" ? "新建执行会话并首次授权"
+          : launch?.mode === "degraded" ? "降级（未建会话）" : "已下发";
+        // 卡 `-272`：任务书未送达必须随横幅一起说出来（这句话是「执行者选择器」这条入口的回执）。
+        return `已下发宿主会话（${modeText}）${launch?.sessionId ? ` · 会话 ${String(launch.sessionId).slice(0, 12)}…` : ""}${launch?.fallbackReason ? ` · 回退原因：${launch.fallbackReason}` : ""}${bookDeliveryClause(launch)}`;
       }
       // 卡 `-257`（需求 `R183`）：CLI 执行器**默认经项目主会话下发并跟踪**。
       // 成功 ⇒ 会话标识已绑到本卡，「打开执行会话」直达记录所在的那条会话；
@@ -4796,7 +4888,7 @@
      *
      * 挂点（稳定，供验证台定位，不靠中文文案）：`data-exec-picker` / `data-executor` / `data-executor-kind`。
      */
-    function mountExecutorPicker(task, { onDone, note: idleNote = null, kinds = null } = {}) {
+    function mountExecutorPicker(task, { onDone, note: idleNote = null, kinds = null, dispatchHint = null } = {}) {
       const wrap = mk("div", "tb-exec-picker");
       wrap.setAttribute("data-exec-picker", "1");
       wrap.appendChild(mk("span", "tb-exec-picker-label", "执行者"));
@@ -4881,7 +4973,7 @@
         const confirmText = chosen.kind === "team"
           ? `把 ${task.identifier} 派发给「${chosen.label}」执行？\n\n· 派发后由项目执行团队接手（roles 由项目设置决定）\n· 完成回写「待验收」，收口仍由人确认`
           : chosen.kind === "host-session"
-            ? `把 ${task.identifier} 交给「${chosen.label}」执行？\n\n· 会尝试新建/切换会话（可能切换主视图）\n· 执行前先认领：卡片置「进行中」`
+            ? `把 ${task.identifier} 交给「${chosen.label}」执行？\n\n· 会尝试新建/切换会话（可能切换主视图）\n· 执行前先认领：卡片置「进行中」${dispatchHint?.text ? `\n\n派发目标：${dispatchHint.text}` : ""}`
             : `把 ${task.identifier} 交给「${chosen.label}」执行？\n\n· 下发：交「项目主会话」下发并跟踪 —— 执行记录留在该会话里，「打开执行会话」直达\n· 执行：非交互调用本地 CLI（通常带文件写权限），耗时数十秒到数分钟\n· 执行前先认领：卡片置「进行中」\n· 跑完由主会话回写证据并提交「待验收」（或写清失败原因）；完成仍由人确认\n· 期间请勿重复点击`;
         if (typeof window !== "undefined" && typeof window.confirm === "function" && !window.confirm(confirmText)) return;
         launch.disabled = true;
@@ -4920,6 +5012,45 @@
       drawerStage.title = stageInfo?.reason ? `${label}：${stageInfo.reason}` : label;
     }
 
+    /**
+     * 卡 `-268`（需求 `R184`）③：标题栏「执行记录」徽标的**唯一**渲染点。
+     *
+     * 数据源＝`GET /api/tasks/:ref` 的 `executionRecord`（与正文那段**同一份**：最近一次结构化证据 +
+     * 最近一次尝试 + 尝试总数）。**恒在**：没记录时也显示「尚无记录」—— 空态本身也是读数，
+     * 藏起来就退回「不知道到底跑没跑过」。
+     * 文案只说「跑到哪了」，不替代「下一步点哪里」（那是 `next` 的活）。
+     *
+     * @returns {void}
+     */
+    function renderExecBadge(record) {
+      const run = record?.run ?? null;
+      const evd = record?.evidence ?? null;
+      const runsCount = Number(record?.runsCount ?? 0);
+      // 结果档位：在途 / 成功 / 非成功 /（无尝试）。与正文 `RUN_OUT` 同一套服务端口径（outcome 是枚举）。
+      const OUT_LABEL = { success: "成功", blocked: "受阻", failed: "失败", crash: "崩溃", timeout: "超时", reclaimed: "认领被回收", cancelled: "人工作废", released: "释放归属", interrupted: "中断", ended: "结束" };
+      let label = "执行记录：尚无";
+      let tone = "none";
+      let detail = "本卡尚无执行记录（`task_evidence` 无行、`task_runs` 无行）—— 点这里看「执行记录」段的说明";
+      if (run?.status === "running") {
+        label = `执行记录：跑着（第 ${run.attempt} 次）`;
+        tone = "running";
+        detail = `第 ${run.attempt} 次尝试进行中 · 执行者 ${run.actor ?? "-"} · 开始于 ${fmtTime(run.startedAt)}`;
+      } else if (run) {
+        const out = OUT_LABEL[run.outcome] ?? run.outcome ?? "-";
+        label = `执行记录：${out}`;
+        tone = run.outcome === "success" ? "ok" : "warn";
+        detail = `第 ${run.attempt} 次尝试 · ${out}${runsCount > 1 ? `（共 ${runsCount} 次）` : ""}`
+          + `${run.endedAt ? ` · 结束于 ${fmtTime(run.endedAt)}` : ""} · 执行者 ${run.actor ?? "-"}`;
+      }
+      const withEvidence = evd ? ` · 结构化证据 ${Array.isArray(evd.artifacts) ? evd.artifacts.length : 0} 项产物` : " · 无结构化证据";
+      drawerExecBadge.hidden = false;
+      drawerExecBadge.textContent = label;
+      drawerExecBadge.dataset.tone = tone;
+      drawerExecBadge.dataset.runs = String(runsCount);
+      drawerExecBadge.dataset.evidence = evd ? "1" : "0";
+      drawerExecBadge.title = `${detail}${withEvidence}\n点击跳到「执行记录」段`;
+    }
+
     async function openTaskDetail(task) {
       const renderSeq = ++detailRenderSeq; // 本代编号（并发渲染时只有最新一代允许落地）
       detailTask = task;
@@ -4928,6 +5059,13 @@
       drawerStage.hidden = true;
       drawerStage.textContent = "";
       drawerStage.removeAttribute("data-stage");
+      // 卡 `-268`：换卡先复位执行记录徽标（否则上一张卡的读数会挂在新卡标题上 —— 与动作区同一类残留）。
+      drawerExecBadge.hidden = true;
+      drawerExecBadge.textContent = "";
+      drawerExecBadge.dataset.tone = "";
+      drawerExecBadge.dataset.runs = "";
+      drawerExecBadge.dataset.evidence = "";
+      drawerExecBadge.removeAttribute("title");
       drawerActions.replaceChildren(); // 换卡先清空标题栏动作区，避免上一张卡的按钮残留
       drawerBody.replaceChildren(mk("p", "hint", "加载详情…"));
       drawerBackdrop.classList.add("show");
@@ -4946,6 +5084,9 @@
         ]);
         if (renderSeq !== detailRenderSeq) return; // 取数期间已被更新的一代取代 ⇒ 本次渲染作废
         renderStageBadge(detail.ticketStage ?? null);
+        // 卡 `-268`：首屏徽标与正文「执行记录」段**同源同代**（都来自这一次 `GET /api/tasks/:ref`），
+        // 所以在概览渲染之前就画上 —— 人一打开抽屉就看到「跑没跑过、跑到哪了」。
+        renderExecBadge(detail.executionRecord ?? null);
         const t = detail.task ?? task;
         // 需求条目 id → 可读「identifier · title」。真机报障（2026-10-22）：概览只打裸 UUID，
         // 用户「不知道这个关联的是哪个需求」—— 归属成了没人看得懂的字段。
@@ -5021,6 +5162,13 @@
                 ? `已跑 ${Math.max(0, Math.round((Date.now() - new Date(run.startedAt).getTime()) / 60000))} 分钟`
                 : (run.durationMs != null ? `耗时 ${Math.max(1, Math.round(run.durationMs / 1000))} 秒` : "耗时 -");
               rsec.appendChild(mk("p", "hint", `最近一次尝试：第 ${run.attempt} 次 · ${run.status === "running" ? "进行中" : (RUN_OUT[run.outcome] ?? run.outcome ?? "-")} · ${fmtTime(run.startedAt)} → ${run.endedAt ? fmtTime(run.endedAt) : "进行中"} · ${dur} · 执行者 ${run.actor ?? "-"}${rec?.runsCount > 1 ? `（共 ${rec.runsCount} 次尝试）` : ""}`));
+              // 卡 `-268`（需求 `R184`）：**摘要也是执行记录的一部分** —— 只给「起止/耗时/结果」而没有
+              // 「执行方说了什么」，等于只给了账目的骨架。空摘要 ⇒ 如实写「执行方未回写摘要」，
+              // **不拿记账文案冒充执行内容**（服务端已归一；这里的兜底是给未重载的旧服务端留的）。
+              if (run.status !== "running") {
+                const sum = String(run.summary ?? "").trim();
+                rsec.appendChild(mk("p", "hint exec-record-summary", `执行摘要：${sum !== "" ? sum : RUN_SUMMARY_FALLBACK}`));
+              }
             }
             if (!evd) {
               rsec.appendChild(mk("p", "hint", "本卡尚无结构化交付证据（`task_evidence` 无行）—— 证据只存在于执行方自述的评论里，那不是结构化证据。"));
@@ -5371,10 +5519,23 @@
           const ok = await moveTask(t, "todo");
           if (ok) showBanner(`${t.identifier} 已授权开工（待办池 → 可开工）。下一步：点「启动执行」，或让它被团队/执行循环认领。`, "info");
         }, "secondary"));
+        // 卡 `-264`：确认框先回答「交给谁」，回执再回答「实际走了哪条」—— 两处都用服务端同一份判据。
+        const confirmLaunch = () => window.confirm(`启动执行会把主视图切到执行会话。${dispatchSummary ? `\n\n派发目标：${dispatchSummary.text}` : ""}${execRunning ? "\n\n⚠ 该任务已有执行会话正在执行且未返回结论，继续会被拒绝（EXECUTION_ALREADY_RUNNING）。" : ""}\n\n确认继续？`);
+        const launchResultText = (r) => {
+          const launch = r?.launch ?? null;
+          if (launch?.mode === "reuse-bound") return `已复用已绑定空闲会话 ${String(launch.sessionId ?? "").slice(0, 12)}…（${launch?.reusedFrom ? REUSED_FROM_LABEL[launch.reusedFrom] ?? launch.reusedFrom : "已绑定会话"} · ${t.identifier}）`;
+          if (launch?.mode === "create-and-authorize") return `已新建执行会话并首次授权（${String(launch.sessionId ?? "").slice(0, 12)}…）—— 无需再申请关联（${t.identifier}）${bookDeliveryClause(launch)}`;
+          if (launch?.mode === "degraded") return `派发降级：${launch?.reason ?? "无宿主会话通道"}（${t.identifier}）`;
+          return `已下发执行会话 ${String(launch?.sessionId ?? "?").slice(0, 12)}…（${t.identifier}）${launch?.fallbackReason ? ` · 回退原因：${launch.fallbackReason}` : ""}`;
+        };
         if (drawerEntry === "start") ops.appendChild(btn("启动执行", async () => {
-          if (!window.confirm(`启动执行会尝试新建/切换会话（可能切换主视图）。${execRunning ? "\n\n⚠ 该任务已有执行会话正在执行且未返回结论，继续会被拒绝（EXECUTION_ALREADY_RUNNING）。" : ""}确认继续？`)) return;
-          try { await api("POST", `/api/tasks/${ref}/execute`, undefined); closeDrawer(); await loadTasks(); }
-          catch (e) {
+          if (!confirmLaunch()) return;
+          try {
+            const r = await api("POST", `/api/tasks/${ref}/execute`, undefined);
+            // 卡 `-272`：任务书未送达 ⇒ 横幅必须转红（与「派发降级」同档），否则等于把「会话不知道要做什么」报成成功。
+            showBanner(launchResultText(r), r?.launch?.mode === "degraded" || bookDeliveryFailed(r?.launch) ? "error" : "info");
+            closeDrawer(); await loadTasks();
+          } catch (e) {
             // 与卡片入口同一份处置（含「打开并高亮归因入口」），不再各写一套措辞。
             await handleExecutionFailure(e, ref, t);
           }
@@ -5421,7 +5582,15 @@
               const fresh = await api("GET", `/api/tasks/${ref}`);
               await api("PATCH", `/api/tasks/${ref}`, { version: fresh?.task?.version, status: "canceled", actor: "human" });
               await api("POST", `/api/tasks/${ref}/comments`, { body: `人工撤单（不执行）：${reason}`, actor: "human" });
-              closeDrawer(); await loadTasks(); showBanner(`${t.identifier} 已撤单（已取消）—— 依赖它的下游卡需要按「前置已撤单」重估`, "info");
+              // 卡 `-267` / 需求 `R181`（呈现层收口）：这条横幅原先写的是「下游卡需要按『前置已撤单』重估」——
+              // 那是 `-253` 之前的服务端口径（撤单不解阻），而 `-253` 已把「撤单 = 前置**终结**」落到了服务端：
+              // 因依赖而受阻的下游**当场**放回「可开工」（事件 `dependency_released` + 评论 + 审计）。
+              // 界面继续说「要人工重估」＝「界面承诺 ≠ 实现」的同类缺陷（人在界面上读到的仍是旧口径），
+              // 而且把人引到一条已经不存在的路上 —— 改说真话。
+              // 措辞**刻意带限定语「因依赖而受阻的」**：非依赖类受阻（capability / needs_input / transient）
+              // 是「这张卡自己做不了」，撤掉前置并不会让它做得了 ⇒ 服务端**不**放行（口径见 `releaseDownstreamOnCancel`）。
+              // 横幅只陈述**规则**，不报数（报数就得在界面另立一套判定 ⇒ 必然与服务端口径漂移）。
+              closeDrawer(); await loadTasks(); showBanner(`${t.identifier} 已撤单（已取消）—— 前置已终结：依赖它的下游不再等它；因依赖而受阻的下游已自动放回「可开工」，无需人工重估`, "info");
             } catch (e) {
               showBanner(`撤单失败：${e.message}`, "error");
             }
@@ -5463,6 +5632,35 @@
           : refOrigin.cwd ? `${refOrigin.cwd}${refOrigin.projectId ? `（项目 ${refOrigin.projectId}）` : "（不属于任何在册项目）"}` : `判定不可用（${refOrigin.source ?? "未知"}）`;
         const ss = exec?.sessionState ?? null;
         const execRunning = Boolean(ss?.sessionId && (ss.running || ((ss.pending ?? 0) > 0)));
+        // 卡 `-264`（需求 `R188`）· **派发目标预览**：点「启动执行」之前就告诉人「这条会交给谁」。
+        // 数据来自服务端 `GET /api/tasks/:ref/execution` 的 `dispatchTarget`（与 `/execute` 共用同一份
+        // `pickDispatchTarget`，所以「预览说 A、执行做 B」不可能发生）。老服务端没有该字段 ⇒ null ⇒ 不显示（不臆断）。
+        const dispatchTarget = exec?.dispatchTarget ?? null;
+        const DISPATCH_ROLE_LABEL = { main: "项目主会话", associated: "已批准关联会话", executor: "执行会话（派生）" };
+        const DISPATCH_WHY_LABEL = {
+          "other-workspace": "工作在别的工作区",
+          "no-liveness": "探活不可用",
+          "session-gone": "会话已失效",
+          "liveness-unknown": "无法判定是否空闲",
+          "running": "正在执行",
+          "pending-prompts": "还有未消费的指令",
+        };
+        const dispatchSummary = (() => {
+          const d = dispatchTarget;
+          if (!d) return null;
+          const short = (id) => (id ? `${String(id).slice(0, 12)}…` : "（未知会话）");
+          if (d.decision === "reuse" && d.target?.sessionId) {
+            return { tone: "info", text: `将复用${DISPATCH_ROLE_LABEL[d.target.role] ?? "已绑定会话"} ${short(d.target.sessionId)}（已绑定本项目且此刻空闲）` };
+          }
+          if (d.decision === "degraded" || d.hostAvailable === false) {
+            return { tone: "warn", text: "宿主会话通道不可用：派发会降级（不建会话、不投递），需先在宿主里加载本插件。" };
+          }
+          const busy = (d.candidates ?? []).filter((c) => !c.idle);
+          const whyText = busy.length
+            ? `已绑定的 ${busy.length} 条会话都不可用（${[...new Set(busy.map((c) => DISPATCH_WHY_LABEL[c.why] ?? c.why))].join(" / ")}）`
+            : "本项目还没有绑定过会话";
+          return { tone: "warn", text: `${whyText}：点「启动执行」会新建一条执行会话，并**当场首次授权**绑定本项目（不必再去申请关联）。` };
+        })();
         const sessionStateLabel = !ss?.sessionId
           ? "未关联（降级）"
           : execRunning ? `执行中${ss.pending ? `（待消费 ${ss.pending}）` : ""}`
@@ -5903,7 +6101,14 @@
               head.appendChild(mk("span", "run-time", `${started} · ${dur}`));
               head.appendChild(mk("span", "run-heartbeats", `心跳 ${run.heartbeats}${run.maxMs ? ` · 上限 ${Math.round(run.maxMs / 60000)}m` : ""}`));
               row.appendChild(head);
-              if (run.summary) row.appendChild(mk("p", "hint run-summary", run.summary));
+              // 卡 `-268`（需求 `R184`）：空摘要**如实显示「执行方未回写摘要」**，不再静默留白 ——
+              // 「没写」与「写了句空话」在人眼里都是空白，但前者该说清楚。服务端已归一（读路径兜住
+              // 库里 22 行记账文案 + 7 行空摘要），这里的兜底是给未重载的旧服务端留的。
+              {
+                const sum = String(run.summary ?? "").trim();
+                if (sum !== "") row.appendChild(mk("p", "hint run-summary", sum));
+                else if (run.status !== "running") row.appendChild(mk("p", "hint run-summary", RUN_SUMMARY_FALLBACK));
+              }
               if (run.error) row.appendChild(mk("p", "hint run-error", `错误：${run.error}`));
               table.appendChild(row);
             }
@@ -6124,8 +6329,12 @@
               catch (e) { showBanner(`授权失败：${e.message}`, "error"); }
             },
             "start-execution": async () => {
-              if (!window.confirm(`启动执行会尝试新建/切换会话（可能切换主视图）。${execRunning ? "\n\n⚠ 该任务已有执行会话正在执行且未返回结论，继续会被拒绝（EXECUTION_ALREADY_RUNNING）。" : ""}确认继续？`)) return;
-              try { await api("POST", `/api/tasks/${ref}/execute`, undefined); closeDrawer(); await loadTasks(); }
+              if (!confirmLaunch()) return;
+              try {
+                const r = await api("POST", `/api/tasks/${ref}/execute`, undefined);
+                showBanner(launchResultText(r), r?.launch?.mode === "degraded" ? "error" : "info");
+                closeDrawer(); await loadTasks();
+              }
               // 第三条入口（下一步面板）：此前是裸 catch，同一次失败换条路进来就没有归因引导了。
               catch (e) { await handleExecutionFailure(e, ref, t); }
             },
@@ -6208,10 +6417,16 @@
           } else {
             sec.appendChild(mk("div", "next-step-title", step.title));
             if (step.hint) sec.appendChild(mk("p", "hint", step.hint));
+            // 卡 `-264`：派发目标预览（复用谁 / 会新建并首次授权）—— 只在「这张卡还能派」时服务端才给该字段。
+            if (dispatchSummary && (cliEntry(t) === "start" || executionEntry(t) === "start")) {
+              const line = mk("p", "hint", `派发目标：${dispatchSummary.text}`);
+              line.dataset.dispatchDecision = dispatchTarget?.decision ?? "";
+              sec.appendChild(line);
+            }
             // 卡 `-238`（R174）：执行者图标行 —— 只在**这张卡真的能执行**时出现（能走 CLI 或能走宿主/团队）。
             // 单独一行、不抢主按钮层级：原有「启动执行」仍是主色，本行是「换谁跑」的选择器。
             if (cliEntry(t) === "start" || executionEntry(t) === "start") {
-              sec.appendChild(mountExecutorPicker(t, { onDone: () => void reopen() }).node);
+              sec.appendChild(mountExecutorPicker(t, { onDone: () => void reopen(), dispatchHint: dispatchSummary }).node);
             }
             // 操作顺序：异常/待办卡不许只丢几个并列按钮让人自己猜先点哪个（FR-89 第二条约束）。
             if (Array.isArray(step.steps) && step.steps.length) {

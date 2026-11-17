@@ -48,6 +48,39 @@ export const STATUS_MAPPING = Object.freeze({
 export const TEAM_WRITABLE_STATUSES = Object.freeze(["in_progress", "in_review", "blocked", "canceled"]);
 
 /**
+ * 执行侧可写状态 ↔ **看板列名** 对照（卡 `-261`）。
+ *
+ * 用途**只有两处**：① 报错文案把误传的看板列名**直接点名**到枚举（少一次「读报错 → 猜语言 → 重试」的往返）；
+ * ② 守卫测试断言「四种中文各能落到对应英文状态」。
+ *
+ * **不做入参归一**：中文一律**拒绝**（需求 `R186` ③：仍拒绝、不做静默映射）——
+ * 一旦这里开始接受中文，契约里就同时留着两套词汇，`-262` 立的「单一真源英文枚举」口径当场作废。
+ */
+export const TEAM_STATUS_COLUMN_LABELS = Object.freeze({
+  in_progress: "进行中",
+  in_review: "待验收",
+  blocked: "受阻",
+  canceled: "取消",
+});
+
+/**
+ * 列名别名：看板 UI 的列名与工具文案差一个字（UI 写「已取消」、工具写「取消」），
+ * 只认一种写法会让「已取消」变成死胡同 —— 这里按**枚举**归一，别名只是入口。
+ */
+const TEAM_STATUS_COLUMN_ALIASES = Object.freeze({ 已取消: "canceled" });
+
+/**
+ * 反查：看板列名 → 状态枚举。**只用于报错文案**（不改写入参、不做映射）。
+ * 认不得（不是已知列名 / 大小写或空格对不上）⇒ 返回 `null` ⇒ 报错只列全部合法值，**不给猜测**。
+ */
+export function teamStatusEnumForColumn(label) {
+  if (typeof label !== "string") return null;
+  if (Object.hasOwn(TEAM_STATUS_COLUMN_ALIASES, label)) return TEAM_STATUS_COLUMN_ALIASES[label];
+  const hit = Object.entries(TEAM_STATUS_COLUMN_LABELS).find(([, name]) => name === label);
+  return hit ? hit[0] : null;
+}
+
+/**
  * FR-50：团队模板的**角色集合**——权威来源是 `spec/团队agent.md` §一 的角色表（id 列）。
  * 只认这 6 个派发角色；用于创建团队时校验模板里出现的角色名。
  */

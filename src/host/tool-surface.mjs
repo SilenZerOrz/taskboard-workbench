@@ -170,7 +170,9 @@ export function registerTaskboardTools({ tools, store, events = null, defineTool
       // 实现只认英文枚举，必抛 `INVALID_FIELD: 执行侧不允许写入 待验收`。
       // 现在把合法值写进 schema：宿主 JSON-schema 子集已核实支持 `type:"string"` 上的 `enum`
       // （dsh-tools `compileValueSchema` 的 string 分支允许 authorKeys + type/enum/const）。
-      status: { type: "string", required: true, enum: [...TEAM_WRITABLE_STATUSES], description: "英文枚举（必填）：in_progress / in_review / blocked / canceled。中文只是看板列名，不要传中文。" },
+      // 卡 `-261`：参数描述里把「看板列名 = 枚举」对照**直接摆出来** —— 模型填这一格时看到的是对照本身，
+      // 而不是「不要传中文」这种只说禁令的话（对照同样只用于**报错文案**，不做入参归一）。
+      status: { type: "string", required: true, enum: [...TEAM_WRITABLE_STATUSES], description: "英文枚举（必填）：in_progress / in_review / blocked / canceled。对照：进行中=in_progress / 待验收=in_review / 受阻=blocked / 取消=canceled。中文只是看板列名，不要传中文。" },
       kind: { type: "string", description: "仅在 status=blocked 时生效：dependency / needs_input / capability / transient（缺省 transient）。" },
       reason: { type: "string", description: "受阻原因 / 撤单说明（可选）。" },
       comment: { type: "string", description: "仅在 status=in_review 时作为评审请求说明（可选）。" },

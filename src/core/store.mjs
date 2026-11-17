@@ -28,9 +28,9 @@ import {
   elaborateDocument, formatRequirementIdentifier, normalizeTitle, parseRequirementIdentifier,
   titleKey, assertRequirementStatus, normalizeCandidates, summarizeRequirementCompletion,
   clampElaborateLimit, ELABORATE_PREVIEW_SIZE, DEFAULT_ELABORATE_LIMIT, MAX_ELABORATE_LIMIT,
-  deriveDetailState,
+  deriveDetailState, buildSplitTaskDescription, buildSplitTaskAcceptance,
 } from "./requirements.mjs";
-import { TEAM_WRITABLE_STATUSES } from "./team.mjs";
+import { TEAM_STATUS_COLUMN_LABELS, TEAM_WRITABLE_STATUSES, teamStatusEnumForColumn } from "./team.mjs";
 import { evidenceProblems, makeResolver, normalizeArtifactRefs, verifyArtifactRefs } from "./evidence.mjs";
 import { REVIEW_SOURCE_STATUSES, REVIEW_IDLE_MS, detectReviewDeadlock, reviewReturnStatus } from "./review.mjs";
 import { NOTIFY_DELIVERY_MODES, buildNotifyMessage, normalizeDeliveryMode, selectNotifyEvents } from "./notify.mjs";
@@ -39,7 +39,16 @@ import { HUMAN_REVIEW_LABEL, assertConclusion, categoryLabel, conclusionOutcome,
 import { createMemoryApi } from "./memory.mjs";
 import { createLeaseApi } from "./instance-lease.mjs";
 
-export const SCHEMA_VERSION = 15; // 15：agents / agent_sessions + task_evidence.evidence_hash + WAL（0-B-b · 卡 -239）；14：项目设置 flow_inject_policy（P5 档 C · 卡 -210）；13：交付物证据 task_evidence + 授权快照 task_mandates（0-B · 卡 -197）；12：契约快照
+export const SCHEMA_VERSION = 15;
+
+/**
+ * 「执行会话」判据（卡 `-263` · 需求 `R187`）：任务处于这些状态时，持有它的会话算「正在干 / 刚干完待验收」。
+ *
+ * 为什么单列一份：`tasks.session_id` 是执行归属的**唯一事实源**（认领 / 启动执行 / 改指都写它），
+ * 而 `project_sessions` 只承载「人工或主会话批准的项目关联」—— 两者是不同的东西，此前被混为一谈，
+ * 于是「认领了卡片、却打不开工作台」。终态（done / canceled）**不在其中**：任务收口后绑定自动收回。
+ */
+export const EXECUTOR_LIVE_STATUSES = Object.freeze(["todo", "in_progress", "in_review", "blocked"]); // 15：agents / agent_sessions + task_evidence.evidence_hash + WAL（0-B-b · 卡 -239）；14：项目设置 flow_inject_policy（P5 档 C · 卡 -210）；13：交付物证据 task_evidence + 授权快照 task_mandates（0-B · 卡 -197）；12：契约快照
 // 条目化数量口径（卡 `-169` P4②）：定义在 requirements.mjs（纯模块），此处转发以便调用方就近取用。
 export { clampElaborateLimit, DEFAULT_ELABORATE_LIMIT, MAX_ELABORATE_LIMIT, ELABORATE_PREVIEW_SIZE };
 
@@ -120,6 +129,30 @@ export const RUN_SUMMARY_FALLBACK = "执行方未回写摘要";
 export function normalizeRunSummary(text) {
   const flat = String(text ?? "").replace(/\s+/g, " ").trim();
   if (flat === "") return RUN_SUMMARY_FALLBACK;
+  return flat.length > 500 ? `${flat.slice(0, 499)}…` : flat;
+}
+
+/**
+ * 卡 `-268`（需求 `R184`）：**读路径也要兜一次记账文案** —— 写路径（`-259`）只管得住新行。
+ *
+ * 真实库里仍有 **22 行** `run.summary` 是老口径写死的「按成功完成记账（失败计数清零）」、
+ * **7 行**是空摘要（真机读数 · 2026-11-13 · `.data/taskboard.sqlite`）。这两类在**展示层**
+ * 都不能露出去：前者是机器的账务说明、不是执行方结论；后者是「没写」而不是「写了句空话」。
+ * 两者对人的唯一正确说法都是「执行方未回写摘要」——**不得拿记账文案冒充执行内容**。
+ *
+ * 落点说明：**只改展示口径，不改库里的历史原文**（改历史 = 篡改过程证据）⇒
+ * 展示值走 `displayRunSummary`，原文另存 `summaryRaw`。
+ */
+export const BOOKKEEPING_RUN_SUMMARY_RE = /按成功完成记账|失败计数清零/;
+/**
+ * 展示口径的摘要：**执行方真的回写了内容 ⇒ 原样显示；没回写（空）或只写了纯记账文案 ⇒ 回落到
+ * 「执行方未回写摘要」**。与 `normalizeRunSummary` 的差别只在于「记账文案」这一档（写路径不该产生，
+ * 读路径必须兜住历史行）。
+ */
+export function displayRunSummary(text) {
+  const flat = String(text ?? "").replace(/\s+/g, " ").trim();
+  if (flat === "") return RUN_SUMMARY_FALLBACK;
+  if (BOOKKEEPING_RUN_SUMMARY_RE.test(flat)) return RUN_SUMMARY_FALLBACK;
   return flat.length > 500 ? `${flat.slice(0, 499)}…` : flat;
 }
 
@@ -1240,6 +1273,26 @@ export function openStore(options = {}) {
       } catch { return null; }
     }
 
+  /**
+   * 卡 `-269`（需求 `R185`）：**进「待验收」= 本次执行结束 ⇒ 在途尝试当场闭合**。
+   *
+   * `-260` 只把这一跳做在看板 PATCH（`updateTask`）上，但「提交待验收」还有两条正式入口没走到它：
+   *   · `teamSetTaskStatus`（MCP `taskboard_update_status` / `POST /tasks/:ref/team-status` / 团队通道）
+   * 它们**直接写 `tasks.status` 列**、不经过 `updateTask` ⇒ 卡片已「待验收」而 `task_runs` 仍是 `running`，
+   * 真机 `-248` 那 3 分 55 秒「待验收 vs 进行中」并存，在这条路上**依然存在**（本卡实测复现）。
+   *
+   * 摘要口径沿用 `-259`：最近一条结构化证据的 verdict；没有就由 `normalizeRunSummary` 如实写
+   * 「执行方未回写摘要」——不拿记账文案冒充执行内容。**无在途尝试是正常情况**
+   * （`endTaskRun` 返回 `ended:false`，不抛），因此这里也吞掉异常，绝不反噬状态迁移本身。
+   */
+  const closeInflightRunOnReview = (identifier, { actor = "system", at = null } = {}) => {
+    try {
+      let runSummary = null;
+      try { runSummary = store.latestTaskEvidence(identifier)?.verdict ?? null; } catch { runSummary = null; }
+      return store.endTaskRun(identifier, { outcome: "success", summary: normalizeRunSummary(runSummary), actor, now: at });
+    } catch { return { ended: false, reason: "no-running-run" }; }
+  };
+
   const store = {
     schemaVersion: SCHEMA_VERSION,
     dataDir,
@@ -1496,23 +1549,98 @@ export function openStore(options = {}) {
       ).run(project.id, String(sessionId), ts, ts);
       return { projectId: project.id, sessionId: String(sessionId), status: "approved" };
     },
-    /** 该会话是否已绑定该项目：主会话=main；已批准=associated；否则 none/pending。 */
+    /**
+     * 该会话在本项目里「正在干 / 刚干完待验收」的任务（卡 `-263` · 需求 `R187`）—— **只读**。
+     *
+     * `tasks.session_id` 由认领（tool `taskboard_claim` / `startTaskExecution`）与改指写入，是执行归属的
+     * 唯一事实源；`project_sessions` 只承载「人工/主会话批准的项目关联」。二者此前互不相通，导致
+     * 「认得出卡归谁执行，认不出会话属于哪个项目」。这里把它做成**一条判据**，绑定态与配置页共用。
+     */
+    executorTasksOf(projectId, sessionId, { statuses = EXECUTOR_LIVE_STATUSES } = {}) {
+      store.requireProject(projectId);
+      const sid = String(sessionId ?? "");
+      if (!sid) return [];
+      const list = (Array.isArray(statuses) ? statuses : EXECUTOR_LIVE_STATUSES).map((x) => String(x));
+      if (!list.length) return [];
+      const marks = list.map(() => "?").join(",");
+      return db.prepare(
+        `select identifier, status from tasks
+          where project_id = ? and session_id = ? and status in (${marks})
+          order by updated_at desc, rowid desc`,
+      ).all(projectId, sid, ...list).map((r) => ({ identifier: r.identifier, status: r.status }));
+    },
+    /**
+     * 本项目下所有「执行会话」（按 `tasks.session_id` 聚合）—— 供配置页如实列出，**只读**。
+     * 与 `listProjectSessions` 的分工：那张表是**批准记录**，这里是**当前任务归属**。
+     */
+    listExecutorSessions(projectId, { statuses = EXECUTOR_LIVE_STATUSES } = {}) {
+      store.requireProject(projectId);
+      const list = (Array.isArray(statuses) ? statuses : EXECUTOR_LIVE_STATUSES).map((x) => String(x));
+      if (!list.length) return [];
+      const marks = list.map(() => "?").join(",");
+      // 卡 `-264`：额外回 `statuses` / `hasInProgress` —— 派发器要判「这条执行会话是不是正干着别的活」。
+      // 用逐行读 + JS 聚合（不用两个 group_concat）：两列的拼接顺序不保证一一对应，错位就会误判空闲。
+      const rows = db.prepare(
+        `select session_id, identifier, status, updated_at
+           from tasks
+          where project_id = ? and session_id is not null and session_id <> '' and status in (${marks})
+          order by updated_at desc, rowid desc`,
+      ).all(projectId, ...list);
+      const bySession = new Map();
+      for (const r of rows) {
+        const cur = bySession.get(r.session_id) ?? { sessionId: r.session_id, tasks: [], statuses: [], lastActivityAt: null };
+        cur.tasks.push(r.identifier);
+        cur.statuses.push(r.status);
+        if (!cur.lastActivityAt || String(r.updated_at) > String(cur.lastActivityAt)) cur.lastActivityAt = r.updated_at ?? null;
+        bySession.set(r.session_id, cur);
+      }
+      return [...bySession.values()]
+        .map((v) => ({ ...v, hasInProgress: v.statuses.includes("in_progress") }))
+        .sort((a, b) => String(b.lastActivityAt ?? "").localeCompare(String(a.lastActivityAt ?? "")));
+    },
+    /**
+     * 该会话是否已绑定该项目：**主会话=main > 已批准=associated > 执行会话=executor(派生)**；否则 none/pending。
+     *
+     * 卡 `-263`（需求 `R187`）第三档：认领/启动执行只写 `tasks.session_id`，不写 `project_sessions`，
+     * 于是执行会话被 FR-63 绑定门全视图挡住。**不补写持久授权行**：判据从任务归属现场派生 ——
+     * ① tool 认领 / 启动执行 / 回写重派全部路径自动覆盖（不靠维护写点名单）；
+     * ② 任务进入终态（done/canceled）后绑定**自动收回**，不留永久授权；
+     * ③ 显式批准（associated）仍优先于派生，人工口径不被派生覆盖。
+     */
     sessionBinding(projectId, sessionId) {
       const project = store.requireProject(projectId);
-      if (sessionId && project.initialSessionId && project.initialSessionId === String(sessionId)) {
-        return { bound: true, role: "main", sessionId: String(sessionId) };
+      const sid = sessionId ? String(sessionId) : null;
+      if (sid && project.initialSessionId && project.initialSessionId === sid) {
+        return { bound: true, role: "main", sessionId: sid };
       }
-      const row = db.prepare("select status from project_sessions where project_id = ? and session_id = ?").get(project.id, String(sessionId ?? ""));
-      if (row?.status === "approved") return { bound: true, role: "associated", sessionId: String(sessionId) };
-      return { bound: false, role: row?.status ?? "none", sessionId: sessionId ? String(sessionId) : null };
+      const row = db.prepare("select status from project_sessions where project_id = ? and session_id = ?").get(project.id, sid ?? "");
+      if (row?.status === "approved") return { bound: true, role: "associated", sessionId: sid };
+      const tasks = sid ? store.executorTasksOf(project.id, sid) : [];
+      if (tasks.length) {
+        return { bound: true, role: "executor", derived: true, tasks: tasks.map((t) => t.identifier), sessionId: sid };
+      }
+      return { bound: false, role: row?.status ?? "none", sessionId: sid };
     },
-    /** 反查：某会话归属哪个项目（主会话优先，其次已批准/待批准的关联）。用于 `/api/context?session=` 的项目解析。 */
+    /**
+     * 反查：某会话归属哪个项目。用于 `/api/context?session=` 的项目解析。
+     * 顺序（卡 `-263` 定档）：主会话 > 已批准关联 > **执行会话（任务归属派生）** > 待批/其它申请。
+     * 派生排在 pending 之前：pending 只是「提出申请」，而派生是「这个会话正在干这个项目的卡」——
+     * 拿 pending 项目去解析会让用户明明在干活却看到一个空门。
+     */
     findProjectBySession(sessionId) {
       const s = String(sessionId ?? "");
       if (!s) return null;
       const main = db.prepare("select * from projects where initial_session_id = ? order by rowid limit 1").get(s);
       if (main) return { project: rowToProject(main), role: "main" };
-      const row = db.prepare("select project_id, status from project_sessions where session_id = ? order by (status = 'approved') desc, rowid desc limit 1").get(s);
+      const approved = db.prepare("select project_id from project_sessions where session_id = ? and status = 'approved' order by rowid desc limit 1").get(s);
+      if (approved) return { project: store.requireProject(approved.project_id), role: "associated" };
+      const marks = EXECUTOR_LIVE_STATUSES.map(() => "?").join(",");
+      const ex = db.prepare(
+        `select project_id from tasks where session_id = ? and status in (${marks})
+          order by updated_at desc, rowid desc limit 1`,
+      ).get(s, ...EXECUTOR_LIVE_STATUSES);
+      if (ex) return { project: store.requireProject(ex.project_id), role: "executor" };
+      const row = db.prepare("select project_id, status from project_sessions where session_id = ? order by rowid desc limit 1").get(s);
       if (row) return { project: store.requireProject(row.project_id), role: row.status };
       return null;
     },
@@ -1829,16 +1957,8 @@ export function openStore(options = {}) {
         // 卡 `-260`（R185）：进「待验收」= 本次执行结束 —— 在途尝试必须**当场**闭合。
         // 真机（2026-11-12 · `-248`）：08:37:13 卡片已 `in_review`，`run_ended` 却晚到 08:41:08，
         // 这 3 分 55 秒里抽屉同时显示「待验收」与「进行中」，人分不清到底跑完没有。
-        // 摘要沿用 `-259` 的口径（最近一条结构化证据的 verdict；没有就「执行方未回写摘要」）。
-        if (nextStatus === "in_review") {
-          try {
-            let runSummary = null;
-            try { runSummary = store.latestTaskEvidence(current.identifier)?.verdict ?? null; } catch { runSummary = null; }
-            store.endTaskRun(current.identifier, {
-              outcome: "success", summary: normalizeRunSummary(runSummary), actor, now: new Date(timestamp).getTime(),
-            });
-          } catch { /* 无在途尝试 ⇒ 正常（endTaskRun 返回 ended:false，不抛） */ }
-        }
+        // 卡 `-269`（R185）：收口抽成 `closeInflightRunOnReview`，与 `teamSetTaskStatus` 共用同一份口径。
+        if (nextStatus === "in_review") closeInflightRunOnReview(current.identifier, { actor, at: new Date(timestamp).getTime() });
         // FR-107（`-197`）：看板 PATCH 进入「进行中」= 本项目口径下的一次认领 ⇒ 冻结授权快照
         if (nextStatus === "in_progress") freezeMandate(current.id, { scope: "board", claimOwner: nextOwner ?? actor, claimSource: current.status });
         // 卡 `-253`（需求 `R181`）：**撤单即前置终结** ⇒ 因依赖受阻的下游当场放回「可开工」
@@ -2342,8 +2462,14 @@ export function openStore(options = {}) {
         // 用标签而不是拼进描述：卡片与抽屉都能直接看到，且可按标签筛。
         const labels = [...(Array.isArray(t.labels) ? t.labels : [])];
         if (t.kind) labels.push(`kind/${t.kind}`);
+        // 卡 `-273`（需求 `R189`）：**空详情卡**不许再出现。
+        // 入口只传 `{title}` 时（界面「批量生成任务」、MCP、CLI 都一样），旧实现把 description / acceptance
+        // 都建成空串 —— 2026-11-17 真机 16 张卡 desc=0 / acc=0，而条目正文与验收都齐备。
+        // 处置：调用方给了正文就原样用；没给就按规范 07 七块**兜底装配**（只摘条目的原文，不臆造）。
+        const description = String(t.description ?? "").trim() || buildSplitTaskDescription(item, t.title);
+        const acceptance = String(t.acceptance ?? "").trim() || buildSplitTaskAcceptance(item);
         const task = store.createTask({
-          projectId: item.projectId, title: t.title, description: t.description,
+          projectId: item.projectId, title: t.title, description, acceptance,
           owner: t.owner, priority: t.priority, labels, status: "backlog",
         });
         const linked = store.associateRequirementTask(item.id, task.id);
@@ -3839,10 +3965,15 @@ export function openStore(options = {}) {
         store.recordAudit({ actor, action: "set-status", target: t.identifier, allowed: false, reason: "human-review-not-executable", detail: `requested ${status}` });
         throw new TbError("HUMAN_REVIEW_NOT_EXECUTABLE", `任务 ${t.identifier} 是人工校验任务：执行侧不得改其状态`, { identifier: t.identifier });
       }
-      if (!TEAM_WRITABLE_STATUSES.includes(status))
+      if (!TEAM_WRITABLE_STATUSES.includes(status)) {
         // 卡 `-262`（需求 `R186`）：旧文案只说「不允许」，不列合法值 —— 传中文时读起来像「这个状态不允许」，
         // 而不是「你填错语言了」。现在把合法枚举与中文列名一次说清（仍拒绝，不做静默映射）。
-        throw invalidField("status", `执行侧不允许写入 ${status}：status 只接受英文枚举 ${TEAM_WRITABLE_STATUSES.join(" / ")}（中文只是看板列名：in_progress=进行中 / in_review=待验收 / blocked=受阻 / canceled=取消）`);
+        // 卡 `-261`：若这次填的**正是某个看板列名**，再点名它对应的枚举 —— 少一次「读报错 → 猜语言 → 重试」的往返；
+        // 认不得的值**不给猜测**（只列全部合法值），免得把「已取消/已完成」这类别的列名猜成某个枚举。
+        const column = teamStatusEnumForColumn(status);
+        const hint = column ? `。你传的「${status}」是看板列名，对应的 status 枚举是 ${column}。` : "";
+        throw invalidField("status", `执行侧不允许写入 ${status}：status 只接受英文枚举 ${TEAM_WRITABLE_STATUSES.join(" / ")}（中文只是看板列名：${TEAM_WRITABLE_STATUSES.map((s) => `${s}=${TEAM_STATUS_COLUMN_LABELS[s]}`).join(" / ")}）${hint}`);
+      }
       // 状态离开"进行中"即释放认领（FR-77）
       const clearClaim = status === "in_progress" ? "" : ", claim_lock = null, claim_expires = null, claim_owner = null, last_heartbeat_at = null";
       db.prepare(`update tasks set status = ?${clearClaim}, version = version + 1, updated_at = ? where id = ?`).run(status, nowIso(), t.id);
@@ -3858,6 +3989,10 @@ export function openStore(options = {}) {
       }
       // FR-111（`-195`）：执行侧 / 团队通道置待验收同样补评审发起时间
       if (status === "in_review" && t.status !== status && !t.reviewRequestedAt) store.markReviewRequested(t.id);
+      // 卡 `-269`（R185）：**这条入口同样要当场闭尝试**。`-260` 只补了看板 PATCH（`updateTask`），
+      // 而 MCP `taskboard_update_status` / `POST /tasks/:ref/team-status` / 团队通道走的是这里、
+      // 直接写状态列 ⇒ 卡片已「待验收」而在途尝试仍是 `running`（本卡实测复现了同一分叉）。
+      if (status === "in_review" && t.status !== status) closeInflightRunOnReview(t.identifier, { actor, at: Date.now() });
       // FR-107（`-197`）：执行侧 / 团队通道进入「进行中」同样是一次认领 ⇒ 冻结授权快照
       if (status === "in_progress" && t.status !== status) freezeMandate(t.id, { scope: "team", claimOwner: t.claimOwner ?? actor, claimSource: t.status });
       return store.getTaskById(t.id);

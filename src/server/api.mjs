@@ -45,6 +45,8 @@ import { deriveEmptyState } from "../core/empty-state.mjs";
 import { buildAdvance, renderAdvanceBlock, applyDecision } from "../core/advance.mjs";
 import { renderMemoryBlock } from "../core/memory.mjs";
 import { taskSessionTitle, projectMainSessionTitle } from "../core/session-naming.mjs";
+// 卡 `-264`（R188）：派发目标解析 —— 「优先复用已绑定空闲会话，无则新建 + 首次授权」，纯逻辑 + 注入探活。
+import { pickDispatchTarget, buildReuseDirective, buildAuthorizationDirective } from "../core/dispatch-target.mjs";
 import { collectKickoffFacts, hasEngineerExecutor, hasReviewerRole } from "./kickoff.mjs";
 import { runVerifyCommand, probeVerifyApplicability } from "./verify.mjs";
 import { DIAGNOSTIC_KINDS, evaluateTaskDiagnostics, projectDiagnostics, summarizeDiagnostics, resolveSessionRef, humanReviewProbe, humanReviewAnsweredBy } from "../core/diagnostics.mjs";
@@ -53,7 +55,7 @@ import { resolveCliExecutor, executeTaskWithCli, buildTaskPrompt, cliArgsFor, cl
 // 卡 `-238`（R174）：执行者注册表 —— 按卡选「团队 / dsh / claude / codex / hermes」的唯一真源。
 // 本文件只用它**解析与校验**，参数与「指令怎么给」都由注册表给，路由不另写第二份。
 import { EXECUTOR_SPECS, EXECUTOR_KINDS, buildExecutorArgs, detectBinary, findExecutorSpec, isExecutorForbidden, listExecutors } from "../core/executors.mjs";
-import { DEFAULT_FAILURE_LIMIT } from "../core/store.mjs";
+import { DEFAULT_FAILURE_LIMIT, displayRunSummary } from "../core/store.mjs";
 // 卡 `-177`（2026-10-29 · 口径 X）：acceptance 缺省口径与 MCP **共用同一份**，不在本文件另写判断。
 import { markAcceptance, acceptanceFlag } from "../core/acceptance.mjs";
 // P5 档 C（卡 `-210`）：开局注入的唯一实现（内容仍由 `buildFlowBlock()` 生成，本文件不复制正文）。
@@ -74,6 +76,26 @@ export const API_SCHEMA_VERSION = 2;
  */
 function refreshDiagnosticsAfterFix(store, ref) {
   try { return evaluateTaskDiagnostics(store, ref); } catch { return null; }
+}
+
+/**
+ * 卡 `-268`（需求 `R184`）· **尝试记录的展示口径**：`summary` 字段不再露记账文案。
+ *
+ * 写路径（`-259`）只管得住**新行**；库里躺着 **22 行**老口径的「按成功完成记账（失败计数清零）」
+ * 与 **7 行**空摘要（真机读数 2026-11-13）⇒ 只修写路径，老卡打开仍是记账文案 —— 正是验收
+ * 第 2 条要禁的那句。
+ *
+ * 这里在**读路径**统一兜一次（`displayRunSummary` 是唯一判据，与 `normalizeRunSummary` 同源）：
+ *   · `summary`     = **给人看的**（空 / 纯记账文案 ⇒ 「执行方未回写摘要」；执行方真写了 ⇒ 原样）
+ *   · `summaryRaw`  = **库里原文**（一字不改 —— 改历史 = 篡改过程证据）
+ * 在途尝试（`status="running"`）的 `summary` 恒为 null ⇒ **不套回落文案**：把「还在跑」说成
+ * 「没回写」是另一种撒谎。
+ */
+function withDisplaySummary(run) {
+  if (!run) return null;
+  const raw = run.summary ?? null;
+  const summary = run.status === "running" ? raw : displayRunSummary(raw);
+  return { ...run, summary, summaryRaw: raw };
 }
 
 export function httpStatusFor(error) {
@@ -330,12 +352,18 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
       }
       let sessionBound = null;
       let association = null;
+      // 卡 `-263`（需求 `R187`）：绑定的**来源**与派生依据要说得出 —— 否则「执行会话」在配置页只显示一个
+      // 英文 role，用户无法判断它是「批准过的」还是「按任务归属派生的」，更无法知道它什么时候会消失。
+      let roleDerived = false;
+      let executorTasks = [];
       if (ctx.project && session) {
         // 首个进入该项目的会话成为"主会话"（首次绑定不改写）
         if (!ctx.project.initialSessionId) ctx = { ...ctx, project: store.bindInitialSession(ctx.project.id, session) };
         const binding = store.sessionBinding(ctx.project.id, session);
         sessionBound = binding.bound;
         association = binding.role;
+        roleDerived = binding.derived === true;
+        executorTasks = Array.isArray(binding.tasks) ? binding.tasks : [];
       }
       const mainSessionId = ctx.project ? (store.requireProject(ctx.project.id).initialSessionId ?? null) : null;
       // FR-84 补口（2026-10-23）· **实例工作区预检**：一个 DSH 实例只有一个工作区（宿主不给切换服务，
@@ -343,7 +371,7 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
       // 这里把「本会话落哪个工作区」如实交出来（只读探测），前端据此提前告知，不再让用户走
       // 「重建 → 还是说工作区不对」的弯路。
       const sessionOrigin = session ? await sessionOriginOf(session, ctx.project ?? null) : null;
-      return { status: 200, payload: { cwd: cwd ?? null, session: session ?? null, project: ctx.project, requirementDoc: ctx.requirementDoc, sessionBound, mainSessionId, association, sessionOrigin } };
+      return { status: 200, payload: { cwd: cwd ?? null, session: session ?? null, project: ctx.project, requirementDoc: ctx.requirementDoc, sessionBound, mainSessionId, association, roleDerived, executorTasks, sessionOrigin } };
     }
     if (pathname === "/api/projects") {
       if (method === "GET") {
@@ -684,7 +712,40 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
       for (const row of rows) sessions.push({ ...row, liveness: await sessionStateOf(row.sessionId) });
       const mainSessionId = project.initialSessionId ?? null;
       const main = mainSessionId ? { sessionId: mainSessionId, role: "main", liveness: await sessionStateOf(mainSessionId) } : null;
-      return { status: 200, payload: { sessions, main, staleMain: Boolean(main && main.liveness.exists === false) } };
+      // 卡 `-263`（需求 `R187`）· **执行会话**：按 `tasks.session_id` 聚合的「正在干本项目卡」的会话。
+      // 这是**只读派生**行（与上面 `sessions` 的批准记录不同源），所以：
+      //   · 已经在主会话/批准列表里的，不再重复列（同一会话一行，避免「一处两条」）；
+      //   · 不给「解除」入口 —— 它的生命周期由任务状态决定（done/canceled 自动收回）；
+      //   · 明写 `derived:true`，前端据此标注来源，不要让人误以为是「批准过」。
+      const covered = new Set([mainSessionId, ...rows.map((r) => r.sessionId)].filter(Boolean));
+      const executors = [];
+      for (const ex of store.listExecutorSessions(project.id)) {
+        if (covered.has(ex.sessionId)) continue;
+        executors.push({ ...ex, derived: true, liveness: await sessionStateOf(ex.sessionId) });
+      }
+      return { status: 200, payload: { sessions, main, executors, staleMain: Boolean(main && main.liveness.exists === false) } };
+    }
+    // 卡 `-264`（需求 `R188`）· **派发目标预览**（只读，不建会话、不投递）。
+    // 用途：抽屉「下一步」区在点「启动执行」之前就告诉人「这条会交给谁」——
+    //   reuse  ⇒ 复用它（已绑定本项目的空闲会话）
+    //   create-and-authorize ⇒ 没有可用绑定会话，点了会新建一条并**首次授权**
+    // 判据与 `/execute` 共用 `pickDispatchTarget`（**不写第二份**，避免「预览说 A、执行做 B」）。
+    const projectDispatchTargetRoute = /^\/api\/projects\/([^/]+)\/dispatch-target$/.exec(pathname);
+    if (projectDispatchTargetRoute) {
+      if (method !== "GET") throw new TbError("USAGE_ERROR", "dispatch-target 仅支持 GET");
+      const project = store.requireProject(decodeURIComponent(projectDispatchTargetRoute[1]));
+      const port = store.hostSessionPort;
+      if (!port?.available) {
+        return {
+          status: 200,
+          payload: {
+            projectId: project.id, decision: "degraded", target: null, candidates: [],
+            reason: "host-session-unavailable", hostAvailable: false,
+          },
+        };
+      }
+      const picked = await pickDispatchTarget(store, project.id, { sessionStateOf, sessionOriginOf });
+      return { status: 200, payload: { projectId: project.id, ...picked, hostAvailable: true } };
     }
     // FR-84 补口（2026-10-22）· **本工作区已有会话**候选列表。
     // 用途：宿主**建会话**能力不可用时（实例未加载宿主 shim → `create()` 抛
@@ -988,7 +1049,8 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
           runsCount = Array.isArray(allRuns) ? allRuns.length : 0;
           if (!executionRun && runsCount > 0) executionRun = allRuns[runsCount - 1];
         } catch { /* 读失败按「无尝试」处理，不伪造 */ }
-        const executionRecord = { evidence, run: executionRun, runsCount };
+        // 卡 `-268`（需求 `R184`）：摘要按**展示口径**回传（不再露记账文案），原文另存 `summaryRaw`。
+        const executionRecord = { evidence, run: withDisplaySummary(executionRun), runsCount };
         const stage = ticketStage(task, { evidence, decision: null, comments, sessionState, currentRun, diagnostics });
         return { status: 200, payload: { task, comments, reviewEvidence: buildReviewEvidence({ comments }), ticketStage: stage, executionRecord } };
       }
@@ -1357,10 +1419,43 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
       // 于是被归因门 / 授权门 / 人工校验门拒绝的点击**照样留下副作用**（多一个空会话 + 视图被切走）。
       // 门序列的唯一来源仍是 store.assertExecutable（startTaskExecution 会再复检一次）。
       store.assertExecutable(ref);
-      // 宿主路径：可用则建会话（+尝试预置）并打开；不可用则降级（保留 directive 兜底）。
+      // 卡 `-264`（需求 `R188`）：**先解析派发目标**，再决定「复用已绑定空闲会话」还是「新建 + 首次授权」。
+      // 旧行为是「没给 sessionId 就一律新建」—— 每张卡一条孤立会话，项目里空闲的主会话/已批准会话完全没被利用。
+      let dispatch = null;          // { decision, target, reason, candidates }
+      let authorization = null;     // 新建路径的授权留痕（回包给人看，也方便审计对齐）
+      // 卡 `-272`（需求 `R188` 验收③）：**新建路径的任务书是否真的送达**（preset 可能被宿主静默吞掉）。
+      // null（不适用：复用路径 / 降级）· { delivered, via, reason } —— 界面的「已下发」必须以它为准。
+      let bookDelivery = null;
       if (!sessionId && port?.available) {
         try {
-          const preset = `任务 ${execTask.identifier}：${execTask.title}\n操作指引：认领 → 执行 → 提交"待验收"；不得置"完成"（人工确认）。`;
+          dispatch = await pickDispatchTarget(store, execTask.projectId, { sessionStateOf, sessionOriginOf });
+        } catch (error) {
+          // 解析失败不阻断：如实记一句，走「新建 + 授权」这条保底路（至少不会派给一个不知道状态的会话）。
+          dispatch = { decision: "create-and-authorize", target: null, candidates: [], reason: `resolve-error:${error?.code ?? error?.message ?? error}` };
+        }
+      }
+      // ① 复用路径：只在**判得出空闲**时才走（判不准/跨工作区/在跑 都不选）。
+      if (!sessionId && dispatch?.target?.sessionId) {
+        const target = dispatch.target;
+        let sent = null;
+        let sendReason = null;
+        try { sent = await port.sendPrompt(target.sessionId, buildReuseDirective({ task: execTask, project: store.getProject(execTask.projectId), target })); }
+        catch (error) { sendReason = error?.code ?? String(error?.message ?? error); }
+        if (Boolean(sent?.sent ?? sent?.delivered ?? false)) {
+          sessionId = target.sessionId;
+          reason = null;
+          // 与新建路径同一 UX：把执行会话切到前台（用户刚点了「启动执行」，本来就该看到它在跑）。
+          try { await port.openSession(sessionId); } catch { /* 打开失败不影响派发 */ }
+        } else {
+          // 投递失败 ⇒ **回落新建**（不谎报「已派给空闲会话」），原因如实带回去。
+          reason = `reuse-send-failed:${sendReason ?? sent?.reason ?? "not-delivered"}`;
+        }
+      }
+      // ② 新建路径（没有可用候选 / 复用投递失败）：建会话 → **当场授权**（首次授权）→ 任务书带授权段。
+      if (!sessionId && port?.available) {
+        try {
+          const project = store.getProject(execTask.projectId);
+          const preset = buildAuthorizationDirective({ task: execTask, project });
           // 2026-10-23 用户命名约束（口径 1）：任务会话统一「【任务】+ 任务标题 + 时间」。
           // 同时补 `cwd`（本仓旧缺漏）：不传 cwd 时宿主把会话落在**进程目录**（真机取证到 `cwd="/"`），
           // 正是「接续会话跨工作区错乱」的一个来源。
@@ -1368,6 +1463,8 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
           sessionName = taskSessionTitle(execTask.title);
           const created = await port.createSession({
             preset,
+            // 保持与 FR-95-15 守卫同一形状（`cwd: store.getProject(...)?.workspacePath ?? undefined`）：
+            // 这是「建会话必须带上项目工作区」的**行内可核对**证据，不要为了少一次读库把它改成变量。
             cwd: store.getProject(execTask.projectId)?.workspacePath ?? undefined,
             title: sessionName,
             // P5 档 C（卡 `-210`）：执行会话 ⇒ 只吃「摘要版」（`main-only` 下**不注入**）。
@@ -1379,6 +1476,53 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
             presetApplied = Boolean(created.presetApplied);
             titleApplied = created.titleApplied ?? null;
             titleReason = created.titleReason ?? null;
+            // 卡 `-272`（需求 `R188` 验收③）· **任务书必须真的送到**，不能「建了会话就算下发完成」。
+            //
+            // 实测缺口（旧口径必现）：宿主 `createSession({preset})` 在 scope 解析不到时（`index.js`
+            // `loadScopeFactory()` 失败 ⇒ preset binding 被拒）**会静静吞掉 preset**，只回
+            // `presetApplied:false` —— 会话建出来了、授权行也写了、回包还是 `create-and-authorize`，
+            // 而**授权指令与任务书一个字都没投进那条会话**，前端照样报「无需再申请关联」。
+            // 这正是 `R188` ③「投递给该会话的任务书里含【授权】/ 不得再申请 / 回写四节」没有兑现。
+            //
+            // 处置：preset 未送达 ⇒ **用 sendPrompt 补投一次同一份任务书**（不是重复投递：preset
+            // 那条路本来就失败了）；补投仍失败 ⇒ **如实记账**（审计 + 卡上评论 = 人看得见的地方），
+            // 回包 `launch.authorization.delivered=false` + 原因，界面据此不得谎称「已下发」。
+            let bookDelivered = Boolean(created.presetApplied);
+            let bookVia = bookDelivered ? "preset" : null;
+            let bookReason = bookDelivered ? null : "preset-not-applied";
+            if (!bookDelivered && typeof port.sendPrompt === "function") {
+              let resent = null;
+              try { resent = await port.sendPrompt(sessionId, preset); }
+              catch (error) { bookReason = error?.code ?? String(error?.message ?? error); }
+              if (Boolean(resent?.sent ?? resent?.delivered ?? false)) {
+                bookDelivered = true;
+                bookVia = "send-prompt-fallback";
+                bookReason = null;
+              } else if (resent) {
+                bookReason = resent?.reason ?? bookReason ?? "not-delivered";
+              }
+            }
+            bookDelivery = { delivered: bookDelivered, via: bookVia, reason: bookReason };
+            if (!bookDelivered) {
+              // 两条路（preset / 直投）都失败 ⇒ 人必须能看见「这张卡派下去了，但会话没收到任务书」。
+              try { store.recordAudit({ actor: "board", action: "authorize-exec-deliver", target: execTask.identifier, allowed: false, reason: String(bookReason ?? "not-delivered"), detail: JSON.stringify({ sessionId, projectId: execTask.projectId, via: bookVia }) }); } catch { /* ignore */ }
+              try { store.addComment(execTask.id, { body: `⚠ 执行会话已建并授权，但**任务书未送达**（${bookReason ?? "原因未知"}）—— 这条会话不知道自己要做什么。\n- 会话：${sessionId}\n- 已尝试：createSession 的 preset（未生效）+ sendPrompt 补投（未送达）\n- 处置：点「打开执行会话」把本卡任务书手工贴过去，或解决宿主 preset 投递能力（dsh-scope 未解析）后重派` }); } catch { /* ignore */ }
+            }
+            // **新建即授权**：人点「启动执行」就是授权本身（需求 `R188` 的「或」分支）。
+            // 不写这一行，就会退回 `-263` 之前的孤立会话：`project_sessions` 无行，只能靠派生兜底。
+            const auth = store.approveSessionAssociation(execTask.projectId, sessionId);
+            authorization = {
+              mode: "execute-click", projectId: execTask.projectId, sessionId, status: auth.status,
+              // 卡 `-272`：授权「已生效」与「任务书已送达」是两件事 —— 前者写库必然成功，后者靠宿主。
+              // 回包把两者分开给，界面才不会拿「授权成功」冒充「任务书已送达」。
+              delivered: bookDelivery?.delivered ?? null,
+              deliveryVia: bookDelivery?.via ?? null,
+              deliveryReason: bookDelivery?.reason ?? null,
+            };
+            try {
+              store.recordAudit({ actor: "board", action: "authorize-exec-session", target: execTask.identifier, allowed: true, reason: "execute-click", detail: JSON.stringify({ sessionId, projectId: execTask.projectId, pickReason: dispatch?.reason ?? null }) });
+            } catch { /* ignore */ }
+            try { store.recordTaskEvent(execTask.id, { type: "session_authorized", actor: "board", detail: `新建执行会话 ${sessionId} 并首次授权绑定项目 ${execTask.projectId}（execute-click）` }); } catch { /* ignore */ }
             await port.openSession(sessionId);
           } else {
             reason = "session-create-failed";
@@ -1391,10 +1535,23 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
       }
       const result = store.startTaskExecution(ref, { sessionId });
       result.launch.presetApplied = presetApplied;
+      // 卡 `-272`（需求 `R188` 验收③）：`presetApplied` 是**宿主自述**（preset 有没有生效），
+      // `bookDelivery` 是**任务书到底有没有送达**（preset 被吞 ⇒ 走 `sendPrompt` 补投，补投也失败 ⇒ false）。
+      // 两者分开给：界面判定「已下发」只能看后者，不能拿前者冒充。
+      result.launch.bookDelivery = bookDelivery;
       result.launch.titleApplied = titleApplied;
       if (titleApplied === false) result.launch.titleReason = titleReason;
       result.launch.sessionName = sessionName;
+      // 卡 `-264`：派发决策要可判读 —— 「复用了谁 / 为什么没复用 / 是不是刚授权的」都能从回包读出来。
+      result.launch.mode = sessionId ? (dispatch?.target?.sessionId === sessionId ? "reuse-bound" : (authorization ? "create-and-authorize" : "session")) : "degraded";
+      // 需求 `R188` 验收①点名的字段：`reusedFrom` 说明「这次复用的是哪一类绑定会话」
+      // （`main` 主会话 / `approved` 已批准关联 / `executor` 派生执行会话）。
+      // 非复用路径一律给 `null`（**键恒在**）：调用方不必区分「没这个字段」与「不是复用」。
+      result.launch.reusedFrom = result.launch.mode === "reuse-bound" ? (dispatch?.target?.kind ?? null) : null;
+      result.launch.dispatch = dispatch ? { decision: dispatch.decision, reason: dispatch.reason, target: dispatch.target, candidates: dispatch.candidates } : null;
+      if (authorization) result.launch.authorization = authorization;
       if (!sessionId) result.launch.reason = reason ?? "host-session-unavailable";
+      else if (reason) result.launch.fallbackReason = reason;
       emit("task.updated", { taskId: result.task.id, identifier: result.task.identifier, status: result.task.status });
       return { status: 200, payload: result };
     }
@@ -1425,7 +1582,14 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
           ? { sessionId: mainId, liveness: await sessionStateOf(mainId), origin: await sessionOriginOf(mainId, proj) }
           : null;
       }
-      return { status: 200, payload: { ...store.getTaskExecution(ref), claim: store.taskClaimState(ref), watchdog: assessTaskRef(store, ref), diagnostics: diag.diagnostics, diagnosticSummary: diag.summary, runs: store.listTaskRuns(ref), sessionRef } };
+      // 卡 `-264`（需求 `R188`）· **派发目标预览**：抽屉点「启动执行」前先告诉人「会交给谁」。
+      // 只在「还能派」的状态下算（in_review/done/canceled 不派发），且每候选要探活 ⇒ 不做无用功。
+      let dispatchTarget = null;
+      if (["todo", "blocked", "in_progress"].includes(diag.task.status) && store.hostSessionPort?.available) {
+        try { dispatchTarget = await pickDispatchTarget(store, diag.task.projectId, { sessionStateOf, sessionOriginOf }); }
+        catch (error) { dispatchTarget = { decision: "create-and-authorize", target: null, candidates: [], reason: `resolve-error:${error?.code ?? error?.message ?? error}` }; }
+      }
+      return { status: 200, payload: { ...store.getTaskExecution(ref), claim: store.taskClaimState(ref), watchdog: assessTaskRef(store, ref), diagnostics: diag.diagnostics, diagnosticSummary: diag.summary, runs: store.listTaskRuns(ref).map(withDisplaySummary), sessionRef, dispatchTarget } };
     }
     // FR-82：尝试记录（每次认领执行一条：状态/结果/摘要/错误/起止/心跳/运行时上限）
     const taskRunsRoute = /^\/api\/tasks\/([^/]+)\/runs$/.exec(pathname);
@@ -1433,7 +1597,7 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
       if (method !== "GET") throw new TbError("USAGE_ERROR", "runs 仅支持 GET");
       const task = store.requireTaskRef(decodeURIComponent(taskRunsRoute[1]));
       const runs = store.listTaskRuns(task);
-      return { status: 200, payload: { identifier: task.identifier, count: runs.length, currentRun: store.getCurrentRun(task), runs } };
+      return { status: 200, payload: { identifier: task.identifier, count: runs.length, currentRun: withDisplaySummary(store.getCurrentRun(task)), runs: runs.map(withDisplaySummary) } };
     }
     // FR-82：任务事件流（追加式；`since` = 已见游标，返回增量）
     const taskEventsRoute = /^\/api\/tasks\/([^/]+)\/events$/.exec(pathname);

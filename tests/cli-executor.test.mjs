@@ -16,6 +16,7 @@ import {
   buildTaskPrompt, cliArgsFor, cliCommandOf, collectDiffEvidence, evidenceComment,
   resolveCliExecutor, runCliExecutor, executeTaskWithCli, diffDelta, pathsOfStatusLines,
   snapshotWorkspace, snapshotDelta, argsAllowEdits, isBlindRun,
+  resolveDispatchDir, resolveWritableScope,
 } from "../src/core/executor.mjs";
 import { assessTask, runInFlight } from "../src/core/watchdog.mjs";
 
@@ -650,4 +651,39 @@ test("executeTaskWithCli：默认参数下零改动**仍按成功**（不误伤�
   assert.equal(store.listTaskRuns(after)[0].outcome, "success");
   store.close();
   rmSync(dir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// 方案 A（2026-11-13）：派发目录与「文档/仓库工作区」解耦。
+// 真机事故：本项目 workspacePath=00-project-real，前端卡目标在兄弟目录 00-project-realdemo/app-vue，
+// 于是 --add-dir / Step 0 的 cd / 硬边界三处一起指错，执行器在 Step 0 就被自己的契约拦下。
+// ---------------------------------------------------------------------------
+test("方案 A：teamTemplate.engineer.cwd 覆盖派发目录，--add-dir 与 Step 0 的 cd 随之改变", () => {
+  const project = { id: "p1", workspacePath: "/repo/00-project-real" };
+  const settings = { teamTemplate: { engineer: { cwd: "/repo/00-project-realdemo" } } };
+  assert.equal(resolveDispatchDir({ project, settings }), "/repo/00-project-realdemo");
+  // 未配置 ⇒ 逐字节回落 workspacePath（零回归）
+  assert.equal(resolveDispatchDir({ project, settings: null }), "/repo/00-project-real");
+  const args = cliArgsFor({ executorId: "cli:claude", cwd: resolveDispatchDir({ project, settings }), settings });
+  const i = args.indexOf("--add-dir");
+  assert.equal(args[i + 1], "/repo/00-project-realdemo");
+  const prompt = buildTaskPrompt({ identifier: "t-1", title: "x", description: "" }, { project, settings });
+  assert.match(prompt, /- ✅ 只允许改 \/repo\/00-project-realdemo 内的文件。/);
+  assert.match(prompt, /cd \/repo\/00-project-realdemo && pwd/);
+});
+
+test("方案 A：writeScope 渲染成「派发目录/子路径」，支持绝对路径条目与 extraDirs", () => {
+  const project = { id: "p1", workspacePath: "/repo/00-project-real" };
+  const settings = { teamTemplate: { engineer: { cwd: "/repo/00-project-realdemo" }, writeScope: ["app-vue"] } };
+  assert.equal(resolveWritableScope({ project, settings }), "/repo/00-project-realdemo/app-vue");
+  const prompt = buildTaskPrompt({ identifier: "t-1", title: "x", description: "" }, { project, settings });
+  assert.match(prompt, /只允许改 \/repo\/00-project-realdemo\/app-vue 内的文件/);
+
+  const mixed = { teamTemplate: { engineer: { cwd: "/repo/00-project-realdemo" }, writeScope: ["app-vue", "/repo/00-project-real/scada-docs"] } };
+  assert.equal(resolveWritableScope({ project, settings: mixed }), "/repo/00-project-realdemo/app-vue、/repo/00-project-real/scada-docs");
+
+  const withExtra = { teamTemplate: { engineer: { cwd: "/repo/00-project-realdemo", extraDirs: ["/repo/00-project-real"] } } };
+  const args = cliArgsFor({ executorId: "cli:claude", cwd: "/repo/00-project-realdemo", settings: withExtra });
+  assert.equal(args.filter((a) => a === "--add-dir").length, 2);
+  assert.ok(args.includes("/repo/00-project-real"));
 });

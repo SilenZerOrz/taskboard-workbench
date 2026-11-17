@@ -94,8 +94,13 @@ test("C 只读：GET 详情前后 version / 事件数 / 证据数 / 尝试数一
 test("D 前端真消费（源码守卫）：执行记录段存在，且排在「概览」之后", () => {
   const web = fs.readFileSync(path.resolve("web", "app.js"), "utf8");
   const iOverview = web.indexOf("drawerBody.appendChild(overview);");
-  const iRecord = web.indexOf("executionRecord");
+  // 卡 `-268` 修订：原先取 `indexOf("executionRecord")` —— 那是「**第一次提到**这个字段」的位置，
+  // 不等于「**那一段挂载**的位置」。`-268` 在概览**之前**用同一份 `executionRecord` 画标题栏徽标
+  // （首屏锚点），第一处命中随之前移 ⇒ 这条守卫当场假红。判据要盯**挂载点**：
+  const iSection = web.indexOf('"drawer-section exec-record"');
+  const iRecord = web.indexOf("drawerBody.appendChild(rsec);", iSection);
   assert.ok(iOverview > 0, "找不到概览挂载点（源码结构变了，守卫需要同步）");
+  assert.ok(iSection > 0, "找不到执行记录段（源码结构变了，守卫需要同步）");
   assert.ok(iRecord > 0, "web/app.js 必须消费 executionRecord —— 否则后端回传了也没人看");
   assert.ok(iRecord > iOverview, "执行记录段必须排在概览之后（否则又回到首屏看不到）");
   assert.ok(web.includes("本卡尚无执行记录"), "无记录时必须给显式空态，不能什么都不渲染");

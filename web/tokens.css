@@ -698,6 +698,30 @@ dialog h2 { margin: 0 0 var(--space-3); font-size: 15px; }
 .tb-stage-badge[data-stage="ready"] { color: var(--success); border-color: currentColor; }
 .tb-stage-badge[data-stage="stale"],
 .tb-stage-badge[data-stage="refs_unresolved"] { color: var(--danger); border-color: var(--danger); background: var(--danger-soft); font-weight: 600; }
+/* 卡 `-268`（需求 `R184`）③：标题栏「执行记录」徽标 —— **首屏锚点**。
+   真机 `-248`：执行状态埋在第 7 段、证据埋在第 14 段，首屏只有概览 ⇒ 人得先知道「跑没跑过」才谈得上往下翻。
+   它是**按钮**（点它滚到「执行记录」段），外观与 FR-108 交付阶段徽标同一档（11px 字、圆角胶囊）、
+   **28px 高**（与抽屉按钮统一尺寸同高），不上底色、不抢主色 —— 标题栏不承担主按钮（卡 `-224` 口径）。
+   三条 tone：`ok`（成功）/ `warn`（非成功）/ `running`（在途）；无记录时 `none` 走灰。
+   选择器为什么这么长：抽屉里有一条 `.tb-drawer button:not(.link):not(.icon)`（特异性 0,3,1）统管按钮尺寸
+   与**实底背景**，它会把徽标画成一颗普通按钮。这里用 4 个类（0,4,1）压住它 —— 与卡 `-238` 的执行者图标行
+   同一做法，不靠书写顺序博一次平局。 */
+.tb-drawer .tb-drawer-head button.tb-exec-badge:not(.link) {
+  display: inline-flex; align-items: center; gap: 4px;
+  min-height: 28px; height: 28px; padding: 0 var(--space-2);
+  border-radius: var(--radius-full);
+  font-size: 11px; font-weight: 400; line-height: 1;
+  white-space: nowrap; flex: 0 0 auto;
+  border: var(--border-hairline) solid var(--border);
+  color: var(--text-secondary); background: transparent;
+}
+.tb-drawer .tb-drawer-head button.tb-exec-badge:not(.link):hover { background: var(--surface-hover); }
+/* `hidden` 必须真的不显示：上面那条 `display: inline-flex` 会**压过** UA 样式表的 `[hidden] { display: none }`
+   （作者样式胜过 UA 样式）—— 不写这一条，「换卡先复位」就只是把文字清空、徽标还挂在标题上。 */
+.tb-drawer .tb-drawer-head button.tb-exec-badge[hidden] { display: none; }
+.tb-drawer .tb-drawer-head button.tb-exec-badge[data-tone="ok"] { color: var(--success); border-color: currentColor; }
+.tb-drawer .tb-drawer-head button.tb-exec-badge[data-tone="warn"] { color: var(--warning); border-color: currentColor; }
+.tb-drawer .tb-drawer-head button.tb-exec-badge[data-tone="running"] { color: var(--accent); border-color: currentColor; }
 /* 2026-10-23（用户真机批注）：整卡动作区（原正文底部「操作」区块）上移到标题栏，与「全部收起 / 还原 / ✕」同排。
    动作多时**只在动作区内部换行**，不挤掉标题、也不撑破标题栏；没有任何动作时整块不占位。 */
 .tb-drawer-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); justify-content: flex-end; align-items: center; flex: 0 1 auto; max-width: min(72%, 900px); }

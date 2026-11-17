@@ -12,7 +12,17 @@ import { normalizeQualityGates } from "./team.mjs";
  */
 const cliRuns = new Map();
 export function activeCliRuns() { return [...cliRuns.keys()]; }
-function directiveFor(engine, { teamId, taskRef, requirementId, qualityGates = null }) {
+/**
+ * 团队派发指令正文（卡 `-270` · 需求 `R186`）。
+ *
+ * 状态取值一律**英文枚举在前、中文作括号对照**（与工具描述同形态）：
+ * 中文只出现在「括号里当列名解释」的位置，**不再出现在「该传什么值」的位置** ——
+ * 执行 agent 照抄指令填中文必然被拒（`INVALID_FIELD`），这正是 R186 要消灭的那类系统性误导。
+ *
+ * 导出供守卫直接断言**真正下发的这份文本**（此前守卫靠 `find` 源码某一行，
+ * 锁到的是相邻说明行 ⇒ 真正下发的内容从没人锁过）。
+ */
+export function directiveFor(engine, { teamId, taskRef, requirementId, qualityGates = null }) {
   const head = engine === "official"
     ? `[派发团队 · DSH官方自带] teamId=${teamId} 请作为 Lead 用 spawn_teammate 召集成员、team_task_create 建任务看板。`
     : engine === "nanmicoder"
@@ -25,9 +35,9 @@ function directiveFor(engine, { teamId, taskRef, requirementId, qualityGates = n
     head,
     `目标：${taskRef}`,
     requirementId ? `需求：${requirementId}` : "",
-    `工作台任务标识：${taskRef}（执行/受阻请更新工作台状态：进行中→待验收；失败→受阻）`,
+    `工作台任务标识：${taskRef}（状态回写用英文枚举：in_progress（进行中）/ in_review（待验收）/ blocked（受阻）/ canceled（取消）；失败→blocked）`,
     `质量门（${source === "configured" ? "配置" : "默认"}）：${gates.join("→")}`,
-    "操作指引：按依赖就绪认领 → 执行 → 提交\"待验收\"；不得置\"完成\"。",
+    "操作指引：按依赖就绪认领 → 执行 → 提交 in_review（待验收）；不得置 done（完成只能人工确认）。",
   ].filter(Boolean).join("\n");
 }
 
@@ -256,6 +266,27 @@ function inflightOf(store, task) {
 }
 
 /**
+ * 投给项目**主会话**的汇总指令正文（卡 `-270` · 需求 `R186`）。
+ *
+ * 抽成独立纯函数有两个理由：
+ *   ① **守卫必须锁「真正发出去的那份文本」** —— 此前守卫靠 `find` 源码里的某一行，
+ *      结果锁到的是相邻的说明行（`工作台任务标识：` 那行），而**真正投进会话的**
+ *      「提交"待验收"（失败→受阻）」从来没人锁过 ⇒ 口径错、守卫却绿。
+ *   ② 口径只改一处：状态取值**英文枚举在前、中文作括号对照**，中文不再出现在
+ *      「该传什么值」的位置（`提交 in_review（待验收）`／`失败回写 blocked（受阻）`）。
+ *
+ * 导出供守卫直接断言真实产出，而不是去源码里捞某一行字符串。
+ */
+export function buildDispatchBriefLines(dispatched = []) {
+  // 一轮只投递**一条**汇总指令（避免拆解出大量子任务时刷屏目标会话）。
+  const lines = [`[任务工作台下发] 本轮派发 ${dispatched.length} 条任务（请作为项目执行团队承接）：`];
+  for (const d of dispatched) lines.push(`· ${d.task}（teamId=${d.teamId}）`);
+  lines.push("操作指引：按依赖就绪逐个认领 → 执行 → 提交 in_review（待验收）；失败回写 blocked（受阻）；不得置 done（完成只能人工确认）。");
+  lines.push("状态回写：taskboard_update_status 的 status 取英文枚举 in_progress（进行中）/ in_review（待验收）/ blocked（受阻）/ canceled（取消）；中文只是列名，传中文会被拒。完成不得自行置 done（人工确认）。");
+  return lines;
+}
+
+/**
  * 任务下发：把派发指令投递到项目**主会话**（真实闭环）。无绑定会话 / 宿主无 prompt 能力则如实标注降级。
  */
 async function deliverDispatched(store, project, dispatched) {
@@ -266,13 +297,8 @@ async function deliverDispatched(store, project, dispatched) {
   const reason = boundSessionId ? "prompt-unavailable" : "no-bound-session";
   for (const d of dispatched) { d.delivered = false; d.deliveryReason = reason; }
   if (!boundSessionId || typeof port?.sendPrompt !== "function") return result;
-  // 一轮只投递**一条**汇总指令（避免拆解出大量子任务时刷屏目标会话）。
-  const lines = [`[任务工作台下发] 本轮派发 ${dispatched.length} 条任务（请作为项目执行团队承接）：`];
-  for (const d of dispatched) lines.push(`· ${d.task}（teamId=${d.teamId}）`);
-  lines.push("操作指引：按依赖就绪逐个认领 → 执行 → 提交\"待验收\"（失败→受阻）；不得置\"完成\"（人工确认）。");
-  lines.push("状态回写：taskboard_update_status 的 status 取英文枚举 in_progress / in_review（待验收）/ blocked（受阻）/ canceled（取消）；中文只是列名，传中文会被拒。完成不得自行置 done（人工确认）。");
   let r = null;
-  try { r = await port.sendPrompt(boundSessionId, lines.join("\n")); } catch { r = null; }
+  try { r = await port.sendPrompt(boundSessionId, buildDispatchBriefLines(dispatched).join("\n")); } catch { r = null; }
   const sent = Boolean(r?.sent);
   for (const d of dispatched) {
     d.delivered = sent;
