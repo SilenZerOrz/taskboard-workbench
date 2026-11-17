@@ -40,6 +40,7 @@
     "./package.json": "./package.json"
   },
   "files": [
+    "assets/readme",
     "CHANGELOG.md",
     "index.js",
     "lib/client.js",
