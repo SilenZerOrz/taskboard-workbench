@@ -26,6 +26,25 @@
 > 三张图均为**独立进程形态**（`node src/server/server.mjs`，无 DSH 宿主）下的虚构示例项目，
 > 不含真实业务数据；独立进程下顶部会出现「无宿主会话通道」提示条，截图已省略。
 
+## 机制图：单一真源数据流
+
+![单一真源数据流机制图（规范 · 契约 · 门 · 回流的预览示意）](assets/readme/04-dataflow-norm-contract.png)
+
+*规范与项目信息只有一份真源：正文在磁盘（`spec/norms/` + 需求文档），项目行在库（`taskboard.sqlite`）。
+读取方先算 `digest` 得到契约快照；外部 agent 写之前必须带上摘要；落库前依次过形状校验、归因与授权门；
+落地后审计、推进清单与项目记忆都从同一份记录回流。图内节点与数据为**虚构示例**，只示机制。*
+
+五段泳道对应这条链路上的五个位置：
+
+| 段 | 位置 | 作用 |
+| --- | --- | --- |
+| 01 真源 | `spec/norms/` + 需求文档 + 项目行 | 正文与项目事实的唯一来源，不留第二份副本 |
+| 02 契约快照 | `CONTRACT_VERSION` / `contract_version` | 读正文算 `digest`，**只算不改**；快照用来判「读到的是不是当前版本」 |
+| 03 写操作入口 | 外部 agent（Claude · Codex · dsh） | 写调用必须带摘要：不带拒 `NORM_DIGEST_REQUIRED`，过期拒 `NORM_STALE` 并回带最新正文 |
+| 04 写前校验 | 形状校验 → 门序列 | 先判形状（必填 / 逃生口），再走「校验 → 归因 → 授权」；口径只写在一处，不新造 |
+| 05 落地与回流 | `store.mjs` / `advance.mjs` / `memory.mjs` | 事务 + 审计落地；推进清单是**纯投影**；项目记忆默认 `proposed`，需人确认才生效 |
+
+> 这张图讲的是**机制**（对应下文的 MCP 契约层），不是界面截图；真机形态见上面三张。
 
 ## 它解决什么
 
@@ -224,7 +243,7 @@ spec/团队agent.md      团队契约（随包发布，供工作台里的 agent 
 spec/norms/           机器执行规范（运行时唯一真源，随包；manifest.json 带 sha256 digest）
 tests/                `node --test` 单测
 tools/                开发与验证脚本（不进 npm 包，除 seed/env-check）
-assets/readme/        README 截图（随包发布，用于 GitHub 与 npm 页面）
+assets/readme/        README 截图与机制图（随包发布，用于 GitHub、npm 页面与插件市场）
 ```
 
 ## 测试
