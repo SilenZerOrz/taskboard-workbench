@@ -734,11 +734,36 @@ dialog h2 { margin: 0 0 var(--space-3); font-size: 15px; }
 .tb-drawer-utils:empty { display: none; }
 .tb-drawer-utils > button { padding: 0 var(--space-2); }
 .tb-drawer-body { padding: var(--space-4) var(--space-5) var(--space-6); overflow: auto; display: flex; flex-direction: column; gap: var(--space-4); }
-/* FR-87 修订：抽屉够宽时正文自动两栏 —— 内容、区块与顺序一字不动，只是把长竖列摊成两栏
-   （`break-inside: avoid` 保证区块不跨栏断行）。分栏阈值由 app.js 按**实测抽屉宽度**写在 data-cols 上，
-   因此拖宽 / 全屏 / 改窗口都会即时重算。 */
-.tb-drawer-body[data-cols="2"] { display: block; column-count: 2; column-gap: var(--space-5); }
-.tb-drawer-body[data-cols="2"] > .drawer-section { break-inside: avoid; -webkit-column-break-inside: avoid; margin: 0 0 var(--space-4); }
+/* 卡 `-292`（需求 `R196`）：抽屉正文改成**显式网格**（宽视口：主列 主信息 + 次列 明细）。
+   旧写法是 CSS 多列（`column-count: 2`）：内容横向摊开、长证据段被左边线压掉一截，读一张卡要左右来回拖
+   （真机 2026-11-23 · 卡 `-288` 截图）。现在阅读顺序恒为「从上到下、先主列后次列」，主信息不被压。
+   分栏阈值仍由 app.js 按**实测抽屉宽度**写在 data-cols 上（拖宽 / 全屏 / 改窗口都会即时重算）；
+   阈值从 1150 抬到 1400：常见视口（抽屉 ≤1160px）走**单列纵向流水** —— 主信息独占整幅宽度，
+   换行更少 ⇒ 真能「一屏看全」（实测：单列 709px vs 两列 819px，后者已经溢出首屏）。 */
+.tb-drawer-body[data-cols="2"] { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: var(--space-4); align-items: start; }
+.tb-drawer-body[data-cols="1"] { display: flex; flex-direction: column; }
+/* 网格分栏一律 `minmax(0, 1fr)`：`1fr` 的自动最小尺寸＝内容 min-content，长内容会把轨道顶得比容器还宽
+   ⇒ 横向溢出（卡 `-160` 的教训：凡 grid 分栏一律写 minmax(0, 1fr)）。 */
+.drawer-col { display: flex; flex-direction: column; gap: var(--space-4); min-width: 0; }
+/* 卡 `-292`：抽屉正文**分块**（组头 + 组体 + 组级折叠）。内容一个不删，只是按组收起来。
+   组头是 `<button>`：抽屉里有一条 `.tb-drawer button:not(.link):not(.icon)`（特异性 0,3,1）统管按钮尺寸
+   与**实底背景**，所以这里用 4 个类（0,4,1）压住它 —— 与卡 `-238` 的执行者图标行、卡 `-268` 的执行记录徽标
+   同一做法，不靠书写顺序博一次平局。 */
+.tb-drawer button.drawer-group-head:not(.link):not(.icon) {
+  display: flex; align-items: center; gap: var(--space-2);
+  width: 100%; min-height: 28px; padding: var(--space-1) var(--space-3);
+  background: var(--surface-muted); border: var(--border-hairline) solid var(--border);
+  border-radius: var(--radius-md); font-size: 12px; font-weight: 700;
+  color: var(--text-primary); text-align: left; justify-content: flex-start;
+}
+.tb-drawer button.drawer-group-head:not(.link):not(.icon):hover { background: var(--surface-hover); border-color: var(--accent); }
+.drawer-group { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; }
+.drawer-group-name { flex: 0 0 auto; }
+.drawer-group-count { margin-left: auto; flex: 0 0 auto; font-size: 11px; font-weight: 600; color: var(--text-tertiary); }
+.drawer-group-caret { flex: 0 0 auto; font-size: 10px; line-height: 1; color: var(--text-tertiary); transition: transform .12s ease; }
+.drawer-group.collapsed .drawer-group-caret { transform: rotate(-90deg); }
+.drawer-group-body { display: flex; flex-direction: column; gap: var(--space-4); }
+.drawer-group.collapsed > .drawer-group-body { display: none; }
 .drawer-section { display: flex; flex-direction: column; gap: var(--space-2); }
 .drawer-section > h3 { margin: 0; font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: none; letter-spacing: .02em; }
 /* FR-87：抽屉分区可折叠 —— 内容不动，只把长详情按区块收起（默认全展开，折叠状态按分区标题记忆） */
@@ -1185,9 +1210,21 @@ button.danger { border-color: var(--danger); color: var(--danger); background: v
 .review-evidence-pre { margin: var(--space-1) 0 0; padding: var(--space-2); max-height: 220px; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg); font-size: 11.5px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; color: var(--text-secondary); }
 
 /* FR-89：向导块的「1-2-3 操作顺序」——异常/待办卡不许把多个出口并列摆着让人自己猜先点哪个 */
-.next-steps { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 2px; }
+/* 卡 `-292`：关键步骤条 —— 服务端 `ticketStage.next.steps` 的有序呈现（当前步 `aria-current="step"`）。
+   文案**一字不改**，只是把「默认有序列表」换成「带编号徽标 + 当前步高亮」的步骤条：
+   原来的序号靠 UA 的 `list-style` 渲染（换样式就丢、也读不到），现在序号是**真元素**（读得到、测得到）。 */
+.next-steps { margin: 0; padding-left: 0; list-style: none; display: flex; flex-direction: column; gap: var(--space-1); }
 .next-steps > li { font-size: 12.5px; line-height: 1.7; color: var(--text-secondary); }
 .next-steps > li + li { margin-top: 1px; }
+.tb-step { display: flex; align-items: flex-start; gap: var(--space-2); }
+.tb-step-no {
+  flex: 0 0 auto; min-width: 18px; height: 18px; margin-top: 2px; text-align: center;
+  border-radius: var(--radius-full); border: var(--border-hairline) solid var(--border);
+  background: var(--surface-muted); color: var(--text-secondary); font-size: 11px; line-height: 16px;
+}
+.tb-step-text { flex: 1 1 auto; min-width: 0; }
+.tb-step[aria-current="step"] { color: var(--text-primary); }
+.tb-step[aria-current="step"] .tb-step-no { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 700; }
 /* `**加粗**` 轻量渲染（mkRich）落成的 <strong>：此前这些提示里写的是字面量 `**`，真机可见 */
 .hint strong, .next-steps strong, .empty-note strong { font-weight: 700; color: var(--text-primary); }
 

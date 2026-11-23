@@ -778,6 +778,7 @@
         .find((s) => s.classList.contains("exec-record"));
       if (!sec) { showBanner("「执行记录」段尚未就绪，请稍候重试", "error"); return; }
       sec.classList.remove("collapsed"); // FR-87 折叠态下先展开，否则"跳过去"看不到东西
+      expandGroupOf(sec); // 卡 `-292`：组也展开 —— 区块在收起的组里，滚过去也是白滚
       sec.scrollIntoView({ block: "start", behavior: "smooth" });
     });
     drawerHeadMain.append(drawerId, drawerStage, drawerExecBadge, drawerTitle);
@@ -822,7 +823,7 @@
     const DRAWER_WIDTH_KEY = "tb.drawer.width";
     const DRAWER_WIDTH_FULL = 0;
     const DRAWER_MIN_WIDTH = 460;
-    const DRAWER_COLS_MIN_WIDTH = 1150;
+    const DRAWER_COLS_MIN_WIDTH = 1400;
     const drawerWin = doc.defaultView ?? (typeof window !== "undefined" ? window : null);
     const drawerMaxWidth = () => Math.max(DRAWER_MIN_WIDTH, Math.round((drawerWin?.innerWidth ?? 1440) - 8));
     const clampDrawerWidth = (px) => Math.min(Math.max(Math.round(px), DRAWER_MIN_WIDTH), drawerMaxWidth());
@@ -892,9 +893,28 @@
 
     // FR-87：抽屉分区可折叠 —— 内容不动，只把长详情按区块收起；折叠状态按分区标题记忆。
     const drawerSections = () => Array.from(drawerBody.querySelectorAll(".drawer-section"));
+    /* 卡 `-292`（需求 `R196`）：抽屉正文的**分块分组**。
+       真机批注（2026-11-23 · 卡 `-288` 截图）：1440 宽抽屉把内容按 CSS 多列横排，长证据段被挤到左列、
+       读一张卡要左右来回拖；同一屏既有主信息又有十几段明细，找不到「现在该做什么」。
+       处置＝**只改呈现**：区块一个不删、字段与文案**一字不改**，只把既有 `.drawer-section` 归并进 5 个组，
+       默认只展开「主信息 + 当前阶段所在组」，其余按组折叠。
+       组表是**声明式**的（按区块标题关键字归组），新增区块时改这一张表即可；组数上限 5 由验证台兜着。 */
+    const DRAWER_GROUP_PREFIX = "group:";
+    const DRAWER_GROUPS = Object.freeze([
+      { key: "main", name: "主信息", match: ["概览", "下一步", "诊断"] },
+      { key: "exec", name: "执行与证据", match: ["执行记录", "执行会话", "CLI 执行器", "尝试记录", "事件流", "执行看护"] },
+      { key: "review", name: "评审与验收", match: ["评审", "人工校验"] },
+      { key: "link", name: "关联与治理", match: ["归因", "前后关联", "派生", "归属团队", "治理审计"] },
+      { key: "comments", name: "评论", match: ["反馈 / 评论", "反馈", "评论"] },
+    ]);
+    const drawerGroups = () => Array.from(drawerBody.querySelectorAll(".drawer-group"));
+    const sectionTitle = (section) => String(section?.querySelector?.(":scope > h3")?.textContent ?? "");
+    const groupOfTitle = (title) => DRAWER_GROUPS.find((g) => g.match.some((k) => title.includes(k))) ?? null;
     const syncExpandAllLabel = () => {
-      const sections = drawerSections();
-      const allCollapsed = sections.length > 0 && sections.every((section) => section.classList.contains("collapsed"));
+      // 卡 `-292`：折叠单位从「区块」升级为「组」（组没了才谈得上「全部收起」）—— 没有组时回落旧口径。
+      const groups = drawerGroups();
+      const units = groups.length ? groups : drawerSections();
+      const allCollapsed = units.length > 0 && units.every((section) => section.classList.contains("collapsed"));
       drawerExpandAll.textContent = allCollapsed ? "全部展开" : "全部收起";
     };
     /**
@@ -933,6 +953,104 @@
     };
 
     /**
+     * 卡 `-292`（需求 `R196`）：**组级**折叠。
+     *
+     * 记忆键＝`group:<组名>`，与 section 级键（区块标题）**不同命名空间** ⇒ 两套记忆不串味。
+     * 人手动碰过的组记进 `state.touchedSections`，默认策略不再摆布它（同 FR-89 的 section 级口径）。
+     *
+     * `expandInner`：展开组时把组内区块一并展开 —— 否则「点组头展开」看到的是一片空壳
+     * （组内区块可能被 FR-89 的 focus 策略收起）。默认态**不**展开（focus 策略说了算）。
+     */
+    const setGroupCollapsed = (group, collapsed, opts = {}) => {
+      const { remember = true, expandInner = true } = opts;
+      if (!group) return;
+      const key = `${DRAWER_GROUP_PREFIX}${group.dataset.groupName ?? ""}`;
+      group.classList.toggle("collapsed", collapsed);
+      group.querySelector(".drawer-group-head")?.setAttribute("aria-expanded", collapsed ? "false" : "true");
+      if (remember) {
+        const known = state.collapsedSections.includes(key);
+        if (collapsed && !known) state.collapsedSections.push(key);
+        if (!collapsed && known) state.collapsedSections = state.collapsedSections.filter((k) => k !== key);
+        if (!state.touchedSections.includes(key)) state.touchedSections.push(key);
+      }
+      if (!collapsed && expandInner) {
+        for (const section of group.querySelectorAll(".drawer-section")) setSectionCollapsed(section, false);
+      }
+    };
+
+    /** 展开某个区块**所在**的组（区块在组里被收起时，跳过去也看不见东西）。 */
+    const expandGroupOf = (node) => {
+      const group = node?.closest?.(".drawer-group");
+      if (!group) return null;
+      setGroupCollapsed(group, false);
+      return group;
+    };
+
+    /**
+     * 卡 `-292`：把已渲染的 `.drawer-section` **归并**进组容器 —— 只搬家、只加组头，
+     * 区块内部的字段与文案**一字不改**（原节点整体搬过去，不重建）。
+     *
+     * 默认展开：① 「主信息」组 ② 当前 `ticketStage` 所在组（由服务端给的 `next.focus` 命中哪个区块推出来，
+     * **前端不新写判断**）；其余默认折叠。`focus` 不可用（状态未识别 / 回包缺字段）⇒ 不干预，与 FR-89 同口径。
+     */
+    const applyDrawerGroups = (focus) => {
+      const sections = drawerSections();
+      if (!sections.length) return;
+      for (const old of Array.from(drawerBody.querySelectorAll(".drawer-col"))) old.remove();
+      const mainCol = mk("div", "drawer-col drawer-col-main");
+      const restCol = mk("div", "drawer-col drawer-col-rest");
+      const boxes = [];
+      const take = (def, members) => {
+        if (!members.length) return null;
+        const box = mk("div", "drawer-group");
+        box.dataset.group = def.key;
+        box.dataset.groupName = def.name;
+        const head = mk("button", "drawer-group-head");
+        head.type = "button";
+        head.setAttribute("aria-expanded", "true");
+        head.append(mk("span", "drawer-group-caret", "▾"), mk("span", "drawer-group-name", def.name));
+        head.appendChild(mk("span", "drawer-group-count", `${members.length} 块`));
+        const body = mk("div", "drawer-group-body");
+        for (const section of members) body.appendChild(section);
+        box.append(head, body);
+        boxes.push(box);
+        (def.key === "main" ? mainCol : restCol).appendChild(box);
+        return box;
+      };
+      const taken = new Set();
+      for (const def of DRAWER_GROUPS) {
+        const members = sections.filter((s) => !taken.has(s) && groupOfTitle(sectionTitle(s)) === def);
+        for (const section of members) taken.add(section);
+        take(def, members);
+      }
+      // 兜底：没命中任何组的区块**不许丢**（单列一组；组数会 > 5 ⇒ 由验证台报警，提示补组表）。
+      const orphans = sections.filter((s) => !taken.has(s));
+      if (orphans.length) take({ key: "other", name: "其他" }, orphans);
+
+      const focusList = Array.isArray(focus) ? focus : null;
+      const focusKeys = new Set();
+      if (focusList) {
+        for (const section of sections) {
+          const title = sectionTitle(section);
+          if (!focusList.some((k) => title.includes(k))) continue;
+          const def = groupOfTitle(title);
+          if (def) focusKeys.add(def.key);
+        }
+      }
+      for (const box of boxes) {
+        const memKey = `${DRAWER_GROUP_PREFIX}${box.dataset.groupName ?? ""}`;
+        const touched = state.touchedSections.includes(memKey);
+        let collapsed;
+        if (touched) collapsed = state.collapsedSections.includes(memKey); // 人手动碰过的组不被默认策略摆布
+        else if (!focusList) collapsed = false; // 状态未识别 ⇒ 不干预（与 FR-89 同口径）
+        else collapsed = !(box.dataset.group === "main" || focusKeys.has(box.dataset.group));
+        setGroupCollapsed(box, collapsed, { remember: false, expandInner: false });
+      }
+      drawerBody.append(mainCol, restCol);
+      syncExpandAllLabel();
+    };
+
+    /**
      * FR-89：按「下一步」给的 `focus` 决定哪些区块**默认展开**。
      *
      * 真机反馈（2026-10-22）：「既然任务收口了，为何该页面还有这么多人工检验、评审、执行会话按钮动作」
@@ -959,6 +1077,15 @@
     drawerBody.addEventListener("click", (event) => {
       const target = event && event.target;
       if (!target || typeof target.closest !== "function") return;
+      // 卡 `-292`：组头优先 —— 点组头只切**组**，不碰组内区块各自的折叠态。
+      const groupHead = target.closest(".drawer-group-head");
+      if (groupHead && drawerBody.contains(groupHead)) {
+        const group = groupHead.closest(".drawer-group");
+        if (!group) return;
+        setGroupCollapsed(group, !group.classList.contains("collapsed"));
+        syncExpandAllLabel();
+        return;
+      }
       const head = target.closest(".drawer-section > h3");
       if (!head || !drawerBody.contains(head)) return;
       const section = head.parentElement;
@@ -968,10 +1095,13 @@
     });
     // FR-87 修订：一键收起 / 展开全部区块（复用同一套折叠状态记忆）。
     drawerExpandAll.addEventListener("click", () => {
-      const sections = drawerSections();
-      if (!sections.length) return;
-      const collapseAll = !sections.every((section) => section.classList.contains("collapsed"));
-      for (const section of sections) setSectionCollapsed(section, collapseAll);
+      // 卡 `-292`：折叠单位升级为「组」—— 组是外层，先动组，再把组内区块一并对齐。
+      const groups = drawerGroups();
+      const units = groups.length ? groups : drawerSections();
+      if (!units.length) return;
+      const collapseAll = !units.every((section) => section.classList.contains("collapsed"));
+      for (const group of groups) setGroupCollapsed(group, collapseAll);
+      for (const section of drawerSections()) setSectionCollapsed(section, collapseAll);
       syncExpandAllLabel();
     });
     shell.append(drawerBackdrop, drawer);
@@ -6298,12 +6428,16 @@
         // 口径唯一来源＝服务端 `ticketStage.next`（`ticketStage()` 内部调 `deriveNextStep()`，纯函数 + 单测；
         // 卡 `-199` 起随 `GET /api/tasks/:ref` 一并返回，不再单独请求 `/next-step`）。
         // 这里只把 action id 映射成按钮与处理器 —— 不在前端重写一遍判断，避免两份口径。
+        // 卡 `-292`：组默认展开策略要用「当前阶段在哪个组」—— 口径仍取服务端 `ticketStage.next.focus`
+        // （**不**在前端另写一套阶段判断）；本变量只把 focus 递给分组层，判据一个字都没加。
+        let groupFocus = null;
         {
           const scrollToSection = (keyword) => {
             const sec = Array.from(drawerBody.querySelectorAll(".drawer-section"))
               .find((s) => String(s.querySelector(":scope > h3")?.textContent ?? "").includes(keyword));
             if (!sec) return false;
             sec.classList.remove("collapsed"); // FR-87 折叠态下先展开，否则"跳过去"看不到东西
+            expandGroupOf(sec); // 卡 `-292`：组也展开，否则跳到一块被组收起的区块
             sec.scrollIntoView({ block: "start", behavior: "smooth" });
             return true;
           };
@@ -6404,6 +6538,7 @@
           // 处置 = 只做**呈现层默认折叠**（内容与按钮一个不删，点标题即可展开），并把人手动开过的区块排除在外。
           const isClosed = t.status === "done" || t.status === "canceled";
           const foldedTitles = step && !nextShapeMissing ? applyFocusPolicy(step.focus) : [];
+          groupFocus = step && !nextShapeMissing && Array.isArray(step.focus) ? step.focus : null;
           syncExpandAllLabel();
           const sec = mk("div", "drawer-section next-step");
           sec.appendChild(mk("h3", null, "下一步"));
@@ -6431,7 +6566,15 @@
             // 操作顺序：异常/待办卡不许只丢几个并列按钮让人自己猜先点哪个（FR-89 第二条约束）。
             if (Array.isArray(step.steps) && step.steps.length) {
               const ol = mk("ol", "next-steps");
-              for (const s of step.steps) ol.appendChild(mk("li", null, s));
+              ol.dataset.stepCount = String(step.steps.length);
+              for (const [index, s] of step.steps.entries()) {
+                const li = mk("li", "tb-step");
+                li.append(mk("span", "tb-step-no", String(index + 1)), mk("span", "tb-step-text", s));
+                // 卡 `-292`：当前步标记。服务端 `ticketStage.next.steps` 是「从当前状态出发的 1-2-3 顺序」，
+                // **没有**逐步进度字段 ⇒ 前端不新造进度判断（那会变成第二套口径），第一步即当前步。
+                if (index === 0) li.setAttribute("aria-current", "step");
+                ol.appendChild(li);
+              }
               sec.appendChild(ol);
             }
             if ((step.actions || []).length) {
@@ -6461,6 +6604,10 @@
                 for (const section of drawerSections()) {
                   if (foldedTitles.includes(String(section.querySelector(":scope > h3")?.textContent ?? ""))) setSectionCollapsed(section, false);
                 }
+                // 卡 `-292`：处置区现在住在**组**里 —— 只展开区块不够，所在的组也得展开（否则又是空壳）。
+                for (const section of drawerSections()) {
+                  if (foldedTitles.includes(String(section.querySelector(":scope > h3")?.textContent ?? ""))) expandGroupOf(section);
+                }
                 syncExpandAllLabel();
                 const first = drawerSections().find((s) => foldedTitles.includes(String(s.querySelector(":scope > h3")?.textContent ?? "")));
                 first?.scrollIntoView({ block: "start", behavior: "smooth" }); // 展开后直接送到第一个处置区，省得再找
@@ -6475,6 +6622,9 @@
           for (const staleNextStep of Array.from(drawerBody.querySelectorAll(".drawer-section.next-step"))) staleNextStep.remove();
           drawerBody.insertBefore(sec, drawerBody.firstChild); // 放最前：先回答"该干嘛"，再看明细
         }
+        // 卡 `-292`（需求 `R196`）：全部区块渲染完后**归并进 5 个组**（只搬家、只加组头，内容一字不改），
+        // 并按「主信息 + 当前 ticketStage 所在组展开、其余默认折叠」给默认态。
+        applyDrawerGroups(groupFocus);
         // 卡 `-224`：所有区块（含刚插到最前面的「下一步」）都渲染完后，统一收敛主按钮层级。
         normalizeActionTiers();
       } catch (error) {
