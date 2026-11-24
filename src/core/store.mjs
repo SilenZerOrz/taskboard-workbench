@@ -2674,18 +2674,28 @@ export function openStore(options = {}) {
      * 任务不在认领态 / 认领已过期 → 返回 false（对齐 hermes `heartbeat_worker`）。
      * **缺心跳本身不计为失败**，因此这里不碰 consecutive_failures。
      */
-    heartbeatTask(ref, { lock = null, note = null, now = null, silent = false } = {}) {
+    heartbeatTask(ref, { lock = null, note = null, now = null, silent = false, renewLease = false, ttlMs = DEFAULT_CLAIM_TTL_MS } = {}) {
       const task = store.requireTaskRef(ref);
-      const at = new Date(now ?? Date.now()).toISOString();
-      const args = [at, at, task.id, at];
-      let sql = "update tasks set last_heartbeat_at = ?, updated_at = ? where id = ? and claim_lock is not null and (claim_expires is null or claim_expires >= ?)";
+      const ts = now ?? Date.now();
+      const at = new Date(ts).toISOString();
+      // 卡 `-294`（需求 `R198`）：心跳**续租**。
+      // 此前心跳只刷 `last_heartbeat_at`，认领锁的 `claim_expires` 从建立那刻起**永不延长** ——
+      // 于是跑过 TTL（30 分钟）的**活**任务会被回收器判成「认领过期 + 心跳陈旧」⇒ **把还在跑的当死了**
+      // （`executor.mjs` 里「子进程活着期间必须持续续命认领锁」那句注释写的正是这件事，只是没落成代码）。
+      // 续租**不复活已过期的认领**（过期即失效，只能被接管 / 回收）—— 与「过期后心跳应被拒」那条既有口径一致。
+      const expiresAt = renewLease ? new Date(ts + ttlMs).toISOString() : null;
+      let sql = "update tasks set last_heartbeat_at = ?, updated_at = ?";
+      const args = [at, at];
+      if (expiresAt) { sql += ", claim_expires = ?"; args.push(expiresAt); }
+      sql += " where id = ? and claim_lock is not null and (claim_expires is null or claim_expires >= ?)";
+      args.push(task.id, at);
       if (lock) { sql += " and claim_lock = ?"; args.push(lock); }
       const res = db.prepare(sql).run(...args);
       if (res.changes !== 1) return { ok: false, reason: "not-claimed-or-expired" };
       // FR-82：心跳同时计入当前尝试（heartbeats / last_heartbeat_at）
-      store.heartbeatTaskRun(task.identifier, { now: now ?? Date.now(), silent });
+      store.heartbeatTaskRun(task.identifier, { now: ts, silent });
       if (note) { try { store.addComment(task.id, { body: `心跳：${note}` }); } catch { /* ignore */ } }
-      return { ok: true, at };
+      return { ok: true, at, expiresAt };
     },
     /**
      * 卡 `-260`（需求 `R185`）：**经主会话下发的执行也要有心跳**。
@@ -2715,7 +2725,9 @@ export function openStore(options = {}) {
         const alive = state?.running === true || Number(state?.pending ?? 0) > 0;
         if (!alive) continue;
         try {
-          const ok = store.heartbeatTask(row.identifier, { now, silent: true });
+          // 卡 `-294`（需求 `R198`）：这一拍同时**续租**认领锁 —— 主会话下发的执行可能跑很久，
+          // 锁不续租就会在 TTL 到点后被回收器当成「认领过期 + 心跳陈旧」⇒ **把还在跑的当死了**。
+          const ok = store.heartbeatTask(row.identifier, { now, silent: true, renewLease: true });
           if (!ok?.ok) store.heartbeatTaskRun(row.identifier, { now, silent: true });
           beat.push(row.identifier);
         } catch { /* 单卡心跳失败不影响其它卡 */ }
@@ -2810,6 +2822,122 @@ export function openStore(options = {}) {
         const task = store.requireTaskRef(ref);
         if (projectId && task.projectId !== projectId) continue;
         const r = store.reclaimStaleClaim(ref, { now, heartbeatGapMs });
+        if (r.reclaimed) reclaimed.push({ identifier: ref, status: r.status });
+      }
+      return reclaimed;
+    },
+    // ---------------- 无心跳在途卡的自愈（卡 `-294` · 需求 `R198`） ----------------
+    /**
+     * **在途状态**（只读、零写）：这张卡「到底有没有人在跑」的**可判读事实**。
+     *
+     * 为什么要有这一层（`R198` 的根因）：看板此前只有两个二元信号 ——
+     * 「状态是不是 `in_progress`」（人设的）与「有没有人回话」（评论），
+     * **中间那层「执行进程还活着吗」没人给** ⇒ 进程死了卡照样显示「进行中」。
+     * 判据只用**在途尝试的心跳**（执行器每 30–45s 打一拍，见 `executor.HEARTBEAT_INTERVAL_MS`），
+     * 与看护 `runInFlight()` 同一份口径。
+     */
+    inflightState(ref, { now = null, heartbeatGapMs = DEFAULT_HEARTBEAT_GAP_MS } = {}) {
+      const task = ref && typeof ref === "object" && ref.id ? ref : store.requireTaskRef(ref);
+      const ts = now ?? Date.now();
+      const run = typeof store.getCurrentRun === "function" ? store.getCurrentRun(task) : null;
+      const claim = store.taskClaimState(task, { now: ts, heartbeatGapMs });
+      const lastAt = run?.lastHeartbeatAt ?? run?.startedAt ?? null;
+      const ageSeconds = lastAt ? Math.max(0, Math.round((ts - new Date(lastAt).getTime()) / 1000)) : null;
+      const stale = ageSeconds === null ? null : ageSeconds * 1000 >= heartbeatGapMs;
+      const executing = task.status === "in_progress";
+      return {
+        executing,
+        hasRun: Boolean(run),
+        attempt: run?.attempt ?? null,
+        /** 本次尝试自己绑的会话（`null` ＝ 直跑路径：没有会话可依托，进程就在本机）。 */
+        runSessionId: run?.sessionId ?? null,
+        sessionId: run?.sessionId ?? task.sessionId ?? null,
+        heartbeats: Number(run?.heartbeats ?? 0),
+        lastHeartbeatAt: lastAt,
+        heartbeatAgeSeconds: ageSeconds,
+        heartbeatStale: stale,
+        claimLocked: claim.locked,
+        claimExpired: claim.expired,
+        claimHeartbeatAgeSeconds: claim.heartbeatAgeSeconds,
+        /** 有效租约：有人持着**且没过期** ⇒ 有人在管，轮不到自愈回收。 */
+        leaseValid: Boolean(claim.locked && !claim.expired),
+        /**
+         * 「无心跳在途」：卡在「进行中」**且**挂着在途尝试，**但那次尝试的心跳已陈旧**
+         * ⇒ 这一列上「看起来在跑」，其实没人真在跑。
+         */
+        unwatched: Boolean(executing && run && stale === true),
+      };
+    },
+    /**
+     * **无心跳在途卡**的自愈回收（卡 `-294` · 需求 `R198`）。
+     *
+     * 为什么既有 `reclaimStaleClaim()` 够不着：`reclaimStaleClaims()` 只扫
+     * `claim_lock is not null` 的卡 ⇒ **「进行中」但没有认领锁**的卡永远扫不到。
+     * 而「没有认领锁」正是 `exec-cli` 在**已在 `in_progress` 的卡上再派单**时留下的形状
+     * （`claimForCliExecution` 此前只在「状态被推进」时才算认领）。
+     * 真机现场：`-293`（2026-11-23 16:52 派单 → 17:03 进程中断 → 次日 11:37 仍在「进行中」/停滞 1148m）。
+     *
+     * 判定（**全部**成立才回收 —— 宁可晚回收，也绝不把活任务判死）：
+     *   ① 卡在「进行中」；
+     *   ② 存在一条 `running` 的尝试记录（= 有过派发 ⇒ 有「进程死过」的证据；**没有尝试记录的不动**）；
+     *   ③ 该尝试的心跳已陈旧（沿用既有阈值 `DEFAULT_HEARTBEAT_GAP_MS` = 10 分钟）；
+     *   ④ **没有有效租约**（认领锁为空或已过期）—— 有人持着没过期的租约 ⇒ 有人在管，轮不到我们；
+     *   ⑤ 执行会话**不在运行**（`live.running !== true`）；
+     *   ⑥ **进程不存在**：本次尝试要么根本没有会话可依托（直跑路径，进程就在本机），
+     *      要么那条会话**已经不在宿主注册表里**（`live.live !== true`）。
+     *      会话**还在**（`live=true`）只是暂时空闲 ⇒ **不在这里抢**：那可能是 agent 正在思考，
+     *      交给既有的「认领到期」那条路（30 分钟）处置 —— 宁可晚回收，也绝不把活任务判死。
+     *
+     * 动作：**只改状态与留痕** —— 不删卡、不删证据、不删尝试记录（尝试只**闭合**，`outcome=reclaimed`，历史可回看）。
+     */
+    reclaimUnwatchedInflight(ref, { now = null, heartbeatGapMs = DEFAULT_HEARTBEAT_GAP_MS, sessionState = undefined, targetStatus = "todo" } = {}) {
+      const task = store.requireTaskRef(ref);
+      const ts = now ?? Date.now();
+      if (task.status !== "in_progress") return { reclaimed: false, reason: "not-in-progress" };
+      const inflight = store.inflightState(task, { now: ts, heartbeatGapMs });
+      if (!inflight.hasRun) return { reclaimed: false, reason: "no-run" };
+      if (inflight.heartbeatStale !== true) return { reclaimed: false, reason: "heartbeat-fresh" };
+      if (inflight.leaseValid) return { reclaimed: false, reason: "lease-valid" };
+      const live = sessionState === undefined
+        ? store.taskSessionState(inflight.runSessionId ? { id: task.id, sessionId: inflight.runSessionId } : task)
+        : sessionState;
+      if (live?.running) return { reclaimed: false, reason: "worker-alive" };
+      const sessionGone = !inflight.runSessionId || live?.live !== true;
+      if (!sessionGone) return { reclaimed: false, reason: "session-alive" };
+      const at = new Date(ts).toISOString();
+      const age = inflight.heartbeatAgeSeconds;
+      const mins = age == null ? null : Math.max(0, Math.round(age / 60));
+      // 尝试记录**保留**（只闭合不删）：历史可回看，证据不丢。
+      store.endTaskRun(task.identifier, { outcome: "reclaimed", summary: "执行进程已中断，已回收", actor: "watchdog", now: ts });
+      db.prepare(
+        "update tasks set status = ?, claim_lock = null, claim_expires = null, claim_owner = null, last_heartbeat_at = null, version = version + 1, updated_at = ? where id = ? and status = 'in_progress'",
+      ).run(targetStatus, at, task.id);
+      try { db.prepare("update team_tasks set status = 'cancelled', updated_at = ? where task_id = ? and status in ('open','running')").run(at, task.id); } catch { /* ignore */ }
+      // FR-79/82 补口：这次收口若是「投递到会话但没交作业」，补一条可见留痕（判定只看 delivery.mjs）。
+      const untaken = (() => { try { return store.noteUntakenDelivery(task.identifier, { now: ts }); } catch { return null; } })();
+      const label = targetStatus === "todo" ? "可开工(todo)" : targetStatus;
+      try {
+        store.addComment(task.id, {
+          body: `执行进程已中断，已回收 → 退回「${label}」`
+            + `\n- 判据：第 ${inflight.attempt} 次尝试的最后心跳在 ${mins == null ? "?" : `${mins} 分钟`}前（阈值 ${Math.round(heartbeatGapMs / 60000)} 分钟）`
+            + `，执行会话不在运行${live?.sessionId ? `（会话 ${String(live.sessionId).slice(0, 18)}…）` : ""} ⇒ 判定为「没人真在跑」`
+            + `\n- 已保留本次尝试记录（outcome=reclaimed），**未删除任何卡、证据或评论**`
+            + `\n- 工作区可能已有未提交的改动：请先人工核对（打开执行会话看现场，或直接看工作目录 diff），再决定重派还是作废`,
+        });
+      } catch { /* ignore */ }
+      try { store.recordAudit({ actor: "watchdog", action: "reclaim", target: task.identifier, allowed: true, reason: "inflight-no-heartbeat", detail: `attempt=${inflight.attempt} heartbeatAgeSeconds=${age ?? "null"} target=${targetStatus}` }); } catch { /* ignore */ }
+      try { store.recordTaskEvent(task.id, { type: "status_changed", from: "in_progress", to: targetStatus, actor: "watchdog", detail: "执行进程已中断，已回收（无心跳在途自愈）" }); } catch { /* ignore */ }
+      return { reclaimed: true, status: targetStatus, inflight, untaken: untaken ? { attempt: untaken.run.attempt, reason: untaken.reason } : null };
+    },
+    /** 批量自愈回收（看护/定时器用）：只收「无心跳在途」的卡，返回被回收的任务引用清单。 */
+    reclaimUnwatchedInflights({ projectId = undefined, now = null, heartbeatGapMs = DEFAULT_HEARTBEAT_GAP_MS } = {}) {
+      const ts = now ?? Date.now();
+      const candidates = db.prepare("select identifier from tasks where status = 'in_progress'").all().map((r) => r.identifier);
+      const reclaimed = [];
+      for (const ref of candidates) {
+        const task = store.requireTaskRef(ref);
+        if (projectId && task.projectId !== projectId) continue;
+        const r = store.reclaimUnwatchedInflight(ref, { now: ts, heartbeatGapMs });
         if (r.reclaimed) reclaimed.push({ identifier: ref, status: r.status });
       }
       return reclaimed;

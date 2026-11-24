@@ -1076,7 +1076,12 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
           // FR-79：卡片只带诊断**摘要**（{count, kinds, highestSeverity}），完整列表走 /diagnostics。
           const decorated = tasks.map((t) => {
             const patch = {};
-            if (t.status === "in_progress") patch.watchdog = assessTaskRef(store, t.identifier);
+            if (t.status === "in_progress") {
+              patch.watchdog = assessTaskRef(store, t.identifier);
+              // 卡 `-294`（需求 `R198`）：卡片要能一眼分清「真在跑」与「**在途但无心跳**」。
+              // 只给一个布尔（`unwatched`）不够 —— 人要判的是「多久没心跳」，所以整份事实一起给。
+              patch.inflight = store.inflightState(t);
+            }
             if (t.status === "in_progress" || t.status === "blocked" || t.status === "in_review" || t.triageAt) {
               patch.diagnostics = evaluateTaskDiagnostics(store, t).summary;
             }
@@ -1188,7 +1193,10 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
         // 卡 `-268`（需求 `R184`）：摘要按**展示口径**回传（不再露记账文案），原文另存 `summaryRaw`。
         const executionRecord = { evidence, run: withDisplaySummary(executionRun), runsCount };
         const stage = ticketStage(task, { evidence, decision: null, comments, sessionState, currentRun, diagnostics });
-        return { status: 200, payload: { task, comments, reviewEvidence: buildReviewEvidence({ comments }), ticketStage: stage, executionRecord } };
+        // 卡 `-294`（需求 `R198`）：详情把**在途事实**一并回传 —— 抽屉要说清「有没有人在跑」，
+        // 光有「进行中」这个状态是不够的（进程死了状态也不会变）。
+        const inflight = store.inflightState(task);
+        return { status: 200, payload: { task, comments, reviewEvidence: buildReviewEvidence({ comments }), ticketStage: stage, executionRecord, inflight } };
       }
       if (method === "PATCH") {
         const task = store.updateTask(ref, {
@@ -1725,7 +1733,7 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
         try { dispatchTarget = await pickDispatchTarget(store, diag.task.projectId, { sessionStateOf, sessionOriginOf }); }
         catch (error) { dispatchTarget = { decision: "create-and-authorize", target: null, candidates: [], reason: `resolve-error:${error?.code ?? error?.message ?? error}` }; }
       }
-      return { status: 200, payload: { ...store.getTaskExecution(ref), claim: store.taskClaimState(ref), watchdog: assessTaskRef(store, ref), diagnostics: diag.diagnostics, diagnosticSummary: diag.summary, runs: store.listTaskRuns(ref).map(withDisplaySummary), sessionRef, dispatchTarget } };
+      return { status: 200, payload: { ...store.getTaskExecution(ref), claim: store.taskClaimState(ref), inflight: store.inflightState(ref), watchdog: assessTaskRef(store, ref), diagnostics: diag.diagnostics, diagnosticSummary: diag.summary, runs: store.listTaskRuns(ref).map(withDisplaySummary), sessionRef, dispatchTarget } };
     }
     // FR-82：尝试记录（每次认领执行一条：状态/结果/摘要/错误/起止/心跳/运行时上限）
     const taskRunsRoute = /^\/api\/tasks\/([^/]+)\/runs$/.exec(pathname);
@@ -1813,7 +1821,13 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
     if (taskReclaimRoute) {
       if (method !== "POST") throw new TbError("USAGE_ERROR", "reclaim 仅支持 POST");
       const ref = decodeURIComponent(taskReclaimRoute[1]);
-      const r = store.reclaimStaleClaim(ref);
+      // 卡 `-294`（需求 `R198`）：**两条回收路径**，缺一不可。
+      //   ① 有认领锁 → 既有 `reclaimStaleClaim`（认领过期 **且** 心跳陈旧才回收，最保守）。
+      //   ② **没有认领锁**（`exec-cli` 在已在 `in_progress` 的卡上派单时不建锁的那条路）→
+      //      既有路径**根本扫不到**（它只扫 `claim_lock is not null`）⇒ 这里补「无心跳在途自愈」那条。
+      //      此前这条路上诊断给的「回收失效认领」按钮恒 409 ⇒ 人点不动 = 没有处置入口。
+      let r = store.reclaimStaleClaim(ref);
+      if (!r.reclaimed && r.reason === "not-claimed") r = store.reclaimUnwatchedInflight(ref);
       if (r.reclaimed) {
         refreshDiagnosticsAfterFix(store, ref); // 卡 `-248`：回收认领后重算（`unclaimed` 消解）
         const t = store.getTaskById(store.requireTaskRef(ref).id);

@@ -1658,6 +1658,16 @@
           : `执行方给出「下一步建议」（${wd.followups.length} 条），等待你决策：派生为子任务 或 忽略`;
         topline.appendChild(chip);
       }
+      // 卡 `-294`（需求 `R198`）：「在途但**无心跳**」—— 卡片**不得**把这张卡说成「运行中」。
+      // 事实源＝服务端 `inflight`（在途尝试的心跳 + 租约），与诊断 / 看护同一份口径，
+      // 不在卡面另算一套（另算就会漂）。
+      const infl = task.inflight;
+      if (infl && infl.unwatched) {
+        const mins = infl.heartbeatAgeSeconds == null ? null : Math.round(infl.heartbeatAgeSeconds / 60);
+        const chip = mk("span", "watchdog-chip watchdog-stalled", "无心跳");
+        chip.title = `在途但没有心跳：第 ${infl.attempt} 次尝试的最后心跳在 ${mins == null ? "?" : `${mins} 分钟`}前，执行会话不在运行 ⇒ 这一列上「看起来在跑」，其实没人真在跑。点开卡片可用「立即回收 / 退回待办（重新派发）/ 释放归属」处置。`;
+        topline.appendChild(chip);
+      }
       // FR-80：受阻分类 / 人工兜底标记
       if (task.status === "blocked") {
         const KIND_LABELS = { dependency: "依赖", needs_input: "需人给料", capability: "能力缺失", transient: "瞬时故障" };
@@ -6423,11 +6433,48 @@
         // 卡 `-199`：改读 `ticketStage.watch`（与「下一步」「诊断」同源）。`watch` 是 `assessTask()` 的完整回包，
         // `followups / reason` 都在里面 —— 「派生为子任务 / 忽略」和「执行会话未在线」文案不会因此丢掉。
         const watch = detail?.ticketStage?.watch ?? null;
-        if (watch && (watch.state === "stalled" || watch.state === "awaiting-decision")) {
+        // 卡 `-294`（需求 `R198`）：**在途事实** —— 说清「有没有人在跑」，并给**可点的处置**。
+        // 「进行中」只是人设的状态：进程死了它也不会变 ⇒ 光看状态列会把死任务说成「运行中」。
+        // 这一段**复用既有的「执行看护」区块**（不新开一个带标题的区块 —— 抽屉的区块标题清单是既有基线，
+        // 多一个标题等于凭空多出一块，真机看板上只会更挤）。
+        const infl = detail?.inflight ?? null;
+        const inflightBad = infl?.unwatched === true;
+        if ((watch && (watch.state === "stalled" || watch.state === "awaiting-decision")) || inflightBad) {
           const wsec = mk("div", "drawer-section");
           wsec.appendChild(mk("h3", null, "执行看护"));
-          const offline = watch.reason === "session-offline";
-          if (watch.state === "stalled") {
+          const offline = watch?.reason === "session-offline";
+          if (inflightBad) {
+            const mins = infl.heartbeatAgeSeconds == null ? null : Math.round(infl.heartbeatAgeSeconds / 60);
+            const p = mk("p", "hint", `⚠ 在途但没有心跳：第 ${infl.attempt} 次尝试的最后心跳在 ${mins == null ? "?" : `${mins} 分钟`}前，执行会话不在运行 ⇒ 没有人真在跑（卡片仍显示「进行中」）。`);
+            p.style.color = "#c0392b";
+            wsec.appendChild(p);
+            wsec.appendChild(mk("p", "hint", "处置三选一：立即回收（只改状态并留痕，不删卡、不删证据）/ 退回待办重新派发 / 释放归属（松开认领与会话）。工作区可能已有未提交的改动，请先人工核对。"));
+            const bar = mk("div", "watchdog-actions");
+            bar.appendChild(btn("立即回收（退回可开工）", async () => {
+              try {
+                const r = await api("POST", `/api/tasks/${ref}/reclaim`, {});
+                showBanner(r?.reclaimed ? `已回收：${ref} → ${r.status ?? "todo"}（执行进程已中断，已回收）` : `未回收：${r?.reason ?? "原因未知"}`, r?.reclaimed ? "info" : "error");
+                await loadTasks();
+                const fresh = (state.tasks ?? []).find((x) => x.identifier === ref);
+                await openTaskDetail(fresh ?? t);
+              } catch (e) { showBanner(`回收失败：${e.message}`, "error"); }
+            }, "primary"));
+            bar.appendChild(btn("退回待办（重新派发）", async () => {
+              try {
+                await api("POST", `/api/tasks/${ref}/execution/retry`, {});
+                showBanner("已退回待办（锁已释放）", "info");
+                closeDrawer(); await loadTasks();
+              } catch (e) { showBanner(`退回待办失败：${e.message}`, "error"); }
+            }));
+            bar.appendChild(btn("释放归属", async () => {
+              try {
+                await api("POST", `/api/tasks/${ref}/execution/release`, {});
+                showBanner("已释放归属（认领与会话已松开）", "info");
+                closeDrawer(); await loadTasks();
+              } catch (e) { showBanner(`释放归属失败：${e.message}`, "error"); }
+            }));
+            wsec.appendChild(bar);
+          } else if (watch.state === "stalled") {
             const p = mk("p", "hint", `⚠ 疑似停滞：已 ${watch.minutes} 分钟无进展回报（执行会话${offline ? "未在线" : "空闲"}）。任务会一直停在「进行中」——用上方「退回待办（重新派发）」释放并重派，或「标记失败」留证据。`);
             p.style.color = "#c0392b";
             wsec.appendChild(p);

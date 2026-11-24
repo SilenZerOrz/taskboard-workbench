@@ -439,7 +439,7 @@ export function pathsOfStatusLines(lines = []) {
  * 本轮要修的正是这个可观察性缺口。直跑路径不传（保持 `null`，与既有读数一致）。
  */
 export function claimForCliExecution(store, ref, { actor = "cli-executor", sessionId = null } = {}) {
-  const outcome = { claimed: false, runStarted: false, fromStatus: null, toStatus: null, note: null };
+  const outcome = { claimed: false, runStarted: false, fromStatus: null, toStatus: null, note: null, claimState: null };
   try {
     const fresh = store.requireTaskRef(ref);
     outcome.fromStatus = fresh.status;
@@ -463,11 +463,47 @@ export function claimForCliExecution(store, ref, { actor = "cli-executor", sessi
       store.startTaskRun(cur.identifier, { actor, sessionId });
       outcome.runStarted = true;
     }
+    // 卡 `-294`（需求 `R198`）：**无条件建立 / 续租认领并开心跳**。
+    //
+    // 此前这条分支只在「状态被推进」时才算认领 ⇒ 「已在进行中」的卡再派单 ⇒ `claimed:false`、
+    // **既没有认领锁也没有心跳** ⇒ ① 看护按「会话离线」判停滞；② 回收器只扫有锁的卡 ⇒ **永远扫不到**
+    // ⇒ 卡永远停在「进行中」，人看到的是「运行中」，实际没人跑。
+    // 真机现场：`-293`（2026-11-23 16:52 派单 → 17:03 进程中断 → 次日 11:37 仍在「进行中」/停滞 1148m）。
+    //
+    // 口径：**已持有则续租**（心跳 + 延长认领到期，**不重复建 run**）；未持有则建立（顺带把
+    // `session_id` 绑上，「打开执行会话」才指得到）。租约来源一律记 `todo` ——
+    // 回收后回到「可开工」由人重新派发（若记 `in_progress`，回收目标会原地打转，永远收不回来）。
+    if (store.requireTaskRef(fresh.identifier).status === "in_progress") {
+      const lease = ensureClaimLease(store, fresh.identifier, { actor, sessionId });
+      outcome.claimState = lease.state;
+      if (lease.ok) outcome.claimed = true;
+    }
     outcome.toStatus = store.requireTaskRef(fresh.identifier).status;
   } catch (error) {
     outcome.note = `claim-failed:${error?.message ?? error}`;
   }
   return outcome;
+}
+
+/**
+ * 卡 `-294`（需求 `R198`）：**保证这张在途卡有认领锁、且心跳是新的**。
+ *
+ *   · 没有锁 → 建立（`claimTask`；顺带开一条尝试记录，已在跑则**不重复开**）
+ *   · 锁已过期 → 接管（`claimTask` 的 CAS 本就允许接管过期认领）
+ *   · 锁有效 → **续租**（刷新心跳 + 延长 `claim_expires`），**不重复建 run**
+ *
+ * 只做「认领/心跳」这一件事，**不碰任务状态**（状态归 `claimForCliExecution` 管）。
+ */
+export function ensureClaimLease(store, ref, { sessionId = null, sourceStatus = "todo" } = {}) {
+  const state = store.taskClaimState(ref);
+  if (state.locked && !state.expired) {
+    const hb = store.heartbeatTask(ref, { note: null, renewLease: true });
+    if (hb?.ok) return { ok: true, state: "renewed" };
+    // 续租失败（读与写之间恰好过期）→ 落到「建立/接管」那条路。
+  }
+  const claim = store.claimTask(ref, { sessionId, sourceStatus });
+  if (claim.claimed) return { ok: true, state: "established", claim };
+  return { ok: false, state: "failed", reason: claim.reason ?? "unknown" };
 }
 
 export async function runCliExecutor({
@@ -518,8 +554,10 @@ export async function runCliExecutor({
     // （`heartbeatTaskRun`）—— 所以只在它没生效时才补一次，避免同一拍把 heartbeats 加两次。
     // 需要补的那条路：`/exec-cli` 的 `direct-handoff`（非 todo 状态人工点执行）**不建认领锁**，
     // `heartbeatTask` 会返回 `ok:false`，此时只能靠尝试心跳表明"在途"。
+    // 卡 `-294`（需求 `R198`）：这一拍同时**续租**认领锁 —— 跑过 TTL 的活任务若锁不续租，
+    // 会被回收器判成「认领过期 + 心跳陈旧」⇒ **把还在跑的当死了**（这正是本注释上方那段话的原意）。
     let ok = false;
-    try { ok = store.heartbeatTask(task.identifier, { note: null })?.ok === true; } catch { /* 心跳失败不阻断执行 */ }
+    try { ok = store.heartbeatTask(task.identifier, { note: null, renewLease: true })?.ok === true; } catch { /* 心跳失败不阻断执行 */ }
     if (!ok) { try { store.heartbeatTaskRun(task.identifier); } catch { /* 心跳失败不阻断执行 */ } }
   };
   const heartbeat = (store && heartbeatIntervalMs > 0) ? setInterval(beatOnce, heartbeatIntervalMs) : null;

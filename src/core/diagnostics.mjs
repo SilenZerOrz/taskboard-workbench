@@ -465,14 +465,26 @@ export const DIAGNOSTIC_RULES = Object.freeze([
       // （有人干了，只是没续认领 / 没改状态）⇒ 不报。真没产物时照报（宁可假阳性不可漏报）。
       if (ctx.artifacts?.delivered) return null;
       const why = claim?.locked && claim?.expired ? "认领已过期" : claim?.locked ? "认领心跳陈旧" : "未被执行者认领";
+      // 卡 `-294`（需求 `R198`）：把「**无心跳**」这条事实写进诊断正文 ——
+      // 只说「没人干」人不信（他刚派过单），说清「最后一次心跳在 N 分钟前」才是可核对的事实。
+      // 界面据此**不许**再把这张卡说成「运行中」。
+      const hb = ctx.inflight ?? null;
+      const hbAge = hb?.heartbeatAgeSeconds ?? null;
+      const hbClause = hb?.hasRun
+        ? `第 ${hb.attempt} 次尝试的最后心跳在 ${hbAge == null ? "?" : `${Math.round(hbAge / 60)} 分钟`}前（阈值 ${Math.round(Number(ctx.thresholds?.stallMs ?? 0) / 60000)} 分钟）`
+        : "本卡没有在途尝试记录";
       return {
         kind: "unclaimed", severity: "high",
         title: "无人认领的「进行中」任务",
-        detail: `任务处于「进行中」，但${why}（无有效认领锁），且执行会话不在运行——这条任务事实上没人干。`,
+        detail: `任务处于「进行中」，但${why}（无有效认领锁），且执行会话不在运行；${hbClause} ⇒ 没人真在跑。`
+          + `\n⚠ 工作区可能已有未提交的改动：先人工核对，再决定重派还是作废。`,
         suggested: "reclaim",
         actions: [
-          action("reclaim", "回收失效认领（退回来源列）", { kind: "primary", path: `/api/tasks/${encodeRef(task.identifier)}/reclaim` }),
+          action("reclaim", "回收失效认领（退回来源列）", { kind: "primary", path: `/api/tasks/${encodeRef(task.identifier)}/reclaim`, hint: "只改状态并留痕，不删卡、不删证据、不删尝试记录" }),
           ...commonActions(ctx),
+          // 卡 `-294`（需求 `R198` ④）：**释放归属**也是明确处置 —— 认领/会话都松开，
+          // 把「谁在跑」这件事交回给人（执行侧仍可重新认领）。
+          action("release", "释放归属（松开认领与会话）", { path: `/api/tasks/${encodeRef(task.identifier)}/execution/release` }),
         ],
       };
     },
@@ -817,6 +829,9 @@ export function collectContext(store, task, { now = Date.now(), thresholds = DEF
     claim: store.taskClaimState(task, { now }),
     sessionState,
     currentRun,
+    // 卡 `-294`（需求 `R198`）：**在途事实**（有没有人在跑 / 心跳多久前 / 有没有有效租约）。
+    // 「进行中」只是人设的状态，进程死了它也不会变 —— 诊断要能给「没人真在跑」一个可核对的理由。
+    inflight: typeof store.inflightState === "function" ? store.inflightState(task, { now }) : null,
     // FR-84：会话引用解析结果（供"打开会话 / 重建主会话"动作抉择）
     sessionRef: resolveSessionRef(store, task),
     // FR-85b：人在环升级门的判定（含 pending 去重信息）

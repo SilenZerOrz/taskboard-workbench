@@ -746,6 +746,20 @@ export function apply(ctx, config) {
         } catch (error) {
           console.error(`[taskboard-workbench] reclaim error: ${error?.message ?? error}`);
         }
+        // 卡 `-294`（需求 `R198`）：**无心跳在途卡**的自愈回收。
+        // 既有 `reclaimStaleClaims()` 只扫**有认领锁**的卡 ⇒ 「进行中」但没有锁的卡
+        // （`exec-cli` 在已在 in_progress 的卡上派单时留下的形状）永远扫不到 ⇒ 永远停在「进行中」。
+        // 这里补第二条路径：心跳已陈旧 **且** 执行会话不在运行 **且** 没有有效租约 ⇒ 没人真在跑 ⇒
+        // 自动退回「可开工」并写一条可读留痕（**只改状态与留痕**，不删卡、不删证据、不删尝试记录）。
+        try {
+          const healed = runtime.store.reclaimUnwatchedInflights();
+          for (const r of healed) {
+            console.log(`[taskboard-workbench] inflight self-heal ${r.identifier} → ${r.status}（执行进程已中断，已回收）`);
+            try { runtime.events?.publish?.("task.updated", { identifier: r.identifier, status: r.status }); } catch (_) { /* ignore */ }
+          }
+        } catch (error) {
+          console.error(`[taskboard-workbench] inflight self-heal error: ${error?.message ?? error}`);
+        }
         // FR-82 收口（定时器口径）：只收**超过运行时上限**的尝试（尊重该次自己的 max_ms），绝不误杀正在跑的。
         try {
           const rec = runtime.store.reconcileOrphanRuns();
