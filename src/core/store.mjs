@@ -39,7 +39,10 @@ import { HUMAN_REVIEW_LABEL, assertConclusion, categoryLabel, conclusionOutcome,
 import { createMemoryApi } from "./memory.mjs";
 import { createLeaseApi } from "./instance-lease.mjs";
 
-export const SCHEMA_VERSION = 15;
+// 16：+ `access_tokens`（FR-117 内网令牌载体：可撤销 / 可过期 / 带 scope 与项目绑定）。
+//     为什么不复用 `agents.token_hash`：那张表是**占位**（无撤销/过期/scope/项目绑定），
+//     拿它当载体 ⇒ 撤不掉、限不了范围、过期不了，与 FR-117「可撤销」直接冲突（设计稿 `-289` §3.2）。
+export const SCHEMA_VERSION = 16;
 
 /**
  * 「执行会话」判据（卡 `-263` · 需求 `R187`）：任务处于这些状态时，持有它的会话算「正在干 / 刚干完待验收」。
@@ -361,6 +364,28 @@ create table if not exists agents (
   permission_profile text,
   created_at text not null
 );
+-- 内网访问令牌（FR-117 / 设计稿 -289 §3.2 · schema 16）：**只存摘要，不存明文**。
+-- 与 agents.token_hash 的区别：本表带**撤销 / 过期 / scope / 项目绑定**，是可撤销的访问载体。
+-- 判活口径（每次请求现查，不缓存）：revoked_at is null and (expires_at is null or expires_at > now)。
+create table if not exists access_tokens (
+  id            text primary key,
+  label         text not null,
+  role          text not null check (role in ('human','agent','guest')),
+  actor         text not null,
+  token_hash    text not null,
+  token_prefix  text not null,
+  scopes        text not null default '["read:guest"]',
+  project_scope text,
+  created_at    text not null,
+  created_by    text,
+  expires_at    text,
+  revoked_at    text,
+  revoked_by    text,
+  revoke_reason text,
+  last_used_at  text
+);
+create index if not exists access_tokens_hash_idx on access_tokens(token_hash);
+create index if not exists access_tokens_live_idx on access_tokens(revoked_at, expires_at);
 -- 身份 ≠ 会话：会话绑定只是 agent 的**可选**属性（未绑定会话的本地 agent 同样有身份）。
 create table if not exists agent_sessions (
   agent_id text not null references agents(id) on delete cascade,

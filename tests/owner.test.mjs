@@ -67,7 +67,7 @@ test("存储：owner 字段读写与过滤（不再写进 labels）", () => {
     assert.equal(stats.ownedTasks, 0, "两个任务的 owner 都为空");
     assert.equal(stats.legacyOwnerLabels, 0);
     // FR-79/FR-82/FR-83/FR-81 + FR-50（team_members.executor）：schema 版本 10
-    assert.equal(stats.schemaVersion, 15); // 14：+ project_settings.flow_inject_policy（P5 档 C · -210）；13：+ task_evidence / task_mandates（0-B · -197）；12：+ 契约快照（project_contract / flow_injections · P1）
+    assert.equal(stats.schemaVersion, 16); // 16：+ access_tokens（FR-117 · -297）；14：+ project_settings.flow_inject_policy（P5 档 C · -210）；13：+ task_evidence / task_mandates（0-B · -197）；12：+ 契约快照（project_contract / flow_injections · P1）
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
