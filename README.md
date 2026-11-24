@@ -113,7 +113,7 @@ node cli/tb.mjs project list   # 或用 CLI 直接操作
 | 项 | 值 |
 | --- | --- |
 | Node.js | `>= 22.5.0`（依赖 `node:sqlite`） |
-| DSH | `>=0.2.1-rc.3`（与 `package.json#engines.dsh` 一致）；`0.2.2-rc.3` 真机验证通过 |
+| DSH | `>=0.2.2-rc.3`（与 `package.json#engines.dsh` 一致）；`0.2.2-rc.5` 真机验证通过 |
 | 运行时依赖 | 无（`dependencies` 为空） |
 
 ## 快速上手（CLI）
@@ -258,10 +258,10 @@ node src/mcp/server.mjs --print-tools   # MCP 工具清单自检
 
 | 项 | 值 |
 | --- | --- |
-| 当前版本 | **`0.3.5`**（2026-11-17） |
+| 当前版本 | **`0.3.6`**（2026-11-24） |
 | 发布轨 | `stable` → npm `dist-tags.latest` |
 | 版本策略 | `0.3.x` 期 patch 承载「修复 + 可选能力」；`0.4.0` 留给计划文档里预留的确认层 `acceptance_state` |
-| dsh 兼容 | `>=0.2.1-rc.3`（`package.json#engines.dsh`）；真机验证 `0.2.2-rc.3` |
+| dsh 兼容 | `>=0.2.2-rc.3`（`package.json#engines.dsh`）；真机验证 `0.2.2-rc.5` |
 | Node 要求 | `>= 22.5.0`（依赖 `node:sqlite`） |
 | 运行时依赖 | 无 |
 | 变更记录 | [CHANGELOG.md](./CHANGELOG.md) |
