@@ -265,7 +265,12 @@ test("G. 宿主草稿持久化自愈：非字符串 draft 必须归位成 \"\"�
   assert.match(applyBody, /repairConversationDraftStore\(\)/, "自愈必须在 apply() 里调用（早于会话视图挂载）");
 
   // 把自愈函数从 IIFE 里原样取出，用假 localStorage 驱动（不依赖浏览器）。
-  const region = source.slice(source.indexOf("#region repair-draft-store"), source.indexOf("#endregion"));
+  // ⚠ 收边必须**带起点**（`indexOf("#endregion", start)`）：不带起点会切到**文件里第一个**
+  //   `#endregion` —— 只要有人在前面新增一个 `#region` 区块（例如卡 `-293` 的
+  //   `#region host-open-file`），这里就会切出空串 ⇒ 守卫误红。
+  //   同仓 `tests/panel-asset-selfheal.test.mjs` 已是这个写法，此处对齐。
+  const regionStart = source.indexOf("#region repair-draft-store");
+  const region = source.slice(regionStart, source.indexOf("#endregion", regionStart));
   const fnSource = region.slice(
     region.indexOf("const repairConversationDraftStore = "),
     region.indexOf("\n  report.repairConversationDraftStore"),
