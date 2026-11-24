@@ -3,6 +3,7 @@
  */
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 
 import { PRIORITIES, STATUSES } from "../core/domain.mjs";
 import { materializeProjectNorms, normsView } from "../core/norms.mjs";
@@ -103,6 +104,118 @@ export function httpStatusFor(error) {
   if (error.code === "NOT_FOUND" || error.code.endsWith("_NOT_FOUND")) return 404;
   if (error.exitCode === EXIT.CONFLICT) return 409;
   return 400;
+}
+
+/**
+ * 卡 `-293`（需求 `R197`）· **只读**文件查看端点的体积上限。
+ * 超过即**拒**（不截断）：截断的半截文件比「读不到」更容易误导人。
+ */
+export const MAX_INLINE_FILE_BYTES = 512 * 1024;
+
+/** 二进制判定的取样字节数：只看**头部**这一段（整文件扫一遍不值得）。 */
+const BINARY_SNIFF_BYTES = 8000;
+
+/**
+ * 卡 `-293`（需求 `R197`）· 把「项目工作区内的相对路径」解析成**可安全读取**的绝对路径。
+ *
+ * 三道闸，缺一不可（任一不过即抛**明确**错误码，绝不返回半截内容）：
+ *   ① **词法闸**：路径里出现 `..` 段 ⇒ 直接拒（`FILE_PATH_TRAVERSAL`）。
+ *      为什么不用「解析后还在不在里面」兜底：`../a/../b` 这种**解析后仍在区内**的路径，
+ *      恰恰说明调用方在试探穿越 —— 意图本身就该拒，而不是让它「碰巧合法」。
+ *   ② **realpath 闸**：解析后 `realpath` 必须落在 `realpath(workspacePath)` 之内
+ *      ⇒ **符号链接逃逸**也挡住（工作区里指向 `/etc/passwd` 的软链，realpath 后落在外面 ⇒ 拒）。
+ *      比较两侧都用 realpath：macOS 上 `/tmp` 本身就是软链（→ `/private/tmp`），只比一边会误判。
+ *   ③ **形态闸**：不是普通文件 / 超过体积上限 / 判定为二进制 ⇒ 各自一个码。
+ *
+ * @param {{workspacePath: string|null, relPath: string, maxBytes?: number}} input
+ * @returns {{path: string, requested: string, absPath: string, size: number, text: string, lines: number}}
+ */
+export function resolveWorkspaceFile({ workspacePath, relPath, maxBytes = MAX_INLINE_FILE_BYTES } = {}) {
+  const requested = String(relPath ?? "").trim();
+  if (!requested) throw new TbError("FILE_PATH_INVALID", "缺少 path 参数（要项目工作区内的文件路径）", { path: requested });
+  const ws = String(workspacePath ?? "").trim();
+  if (!ws) throw new TbError("PROJECT_WORKSPACE_MISSING", "本项目未登记工作区（workspacePath）⇒ 无法限定只读范围", { path: requested });
+  // ① 词法闸：任何一段是 `..` 就拒（不解析、不碰盘）。
+  const segments = requested.split(/[\\/]+/);
+  if (segments.includes("..")) {
+    throw new TbError("FILE_PATH_TRAVERSAL", `路径含 \`..\` 穿越段，已拒绝：${requested}`, { path: requested });
+  }
+  let wsReal = "";
+  try { wsReal = realpathSync(ws); }
+  catch (error) {
+    throw new TbError("PROJECT_WORKSPACE_MISSING", `项目工作区不存在或不可读：${ws}（${error?.code ?? error?.message ?? "unknown"}）`, { workspacePath: ws });
+  }
+  // 绝对路径按**绝对**解释（仍要过下面这道 realpath 闸）；相对路径挂到工作区下。
+  const candidate = path.isAbsolute(requested) ? path.resolve(requested) : path.resolve(wsReal, requested);
+  let abs = "";
+  try { abs = realpathSync(candidate); }
+  catch (error) {
+    const code = error?.code ?? "";
+    if (code === "ENOENT" || code === "ENOTDIR") throw new TbError("FILE_NOT_FOUND", `文件不存在：${requested}`, { path: requested });
+    throw new TbError("FILE_PATH_INVALID", `路径无法解析：${requested}（${code || error?.message || "unknown"}）`, { path: requested });
+  }
+  // ② realpath 闸：`rel` 以 `..` 开头 = 在工作区之外；`rel === ""` = 就是工作区根（交给下面的「不是普通文件」判定）。
+  const rel = path.relative(wsReal, abs);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) {
+    throw new TbError("FILE_OUTSIDE_WORKSPACE", `路径落在项目工作区之外，已拒绝：${requested}`, { path: requested, workspacePath: wsReal, resolved: abs });
+  }
+  // ③ 形态闸
+  let st = null;
+  try { st = statSync(abs); }
+  catch (error) {
+    throw new TbError("FILE_NOT_FOUND", `文件不存在：${requested}（${error?.code ?? error?.message ?? "unknown"}）`, { path: requested });
+  }
+  if (!st.isFile()) throw new TbError("FILE_NOT_A_FILE", `不是普通文件，不提供预览：${requested}`, { path: requested });
+  if (st.size > maxBytes) {
+    throw new TbError("FILE_TOO_LARGE", `文件超过只读查看上限（${st.size} B > ${maxBytes} B），已拒绝`, { path: requested, size: st.size, maxBytes });
+  }
+  const buf = readFileSync(abs);
+  const head = buf.subarray(0, Math.min(buf.length, BINARY_SNIFF_BYTES));
+  let hasNul = false;
+  let ctrl = 0;
+  for (const byte of head) {
+    if (byte === 0) { hasNul = true; break; }
+    if (byte < 9 || (byte > 13 && byte < 32)) ctrl += 1;
+  }
+  // 二进制判据：头部出现 NUL 字节，或控制字符占比过高（经典 `is-binary` 启发式）。
+  if (hasNul || (head.length > 0 && ctrl / head.length > 0.1)) {
+    throw new TbError("FILE_NOT_TEXT", `文件判定为二进制，不提供文本预览：${requested}`, { path: requested });
+  }
+  const text = buf.toString("utf8");
+  return {
+    path: rel || requested,
+    requested,
+    absPath: abs,
+    size: st.size,
+    text,
+    lines: text.length === 0 ? 0 : text.split("\n").length,
+  };
+}
+
+/**
+ * 卡 `-293`（需求 `R197`）· **宿主「打开文件」尝试**（服务端一侧）。
+ *
+ * 能力在宿主插件进程里（`index.js` 的 `hostSessionPort.openFile`）；独立进程实例没有它 ⇒
+ * 如实回 `host-file-open-unavailable`（**不臆造成功**），前端据此降级到抽屉内只读查看器。
+ * 本函数**只读**：不建会话、不投递指令、不写库 —— 它只是「请宿主把文件显示出来」。
+ */
+async function tryHostOpenFile(store, absPath) {
+  const port = store?.hostSessionPort ?? null;
+  if (!port || typeof port.openFile !== "function") {
+    return { attempted: true, opened: false, via: null, reason: "host-file-open-unavailable" };
+  }
+  try {
+    const r = await port.openFile(absPath);
+    return {
+      attempted: true,
+      opened: Boolean(r?.opened),
+      via: r?.via ?? null,
+      reason: r?.opened ? null : (r?.reason ?? "host-file-open-failed"),
+      probed: r?.probed ?? null,
+    };
+  } catch (error) {
+    return { attempted: true, opened: false, via: null, reason: error?.code ?? error?.message ?? "host-file-open-failed" };
+  }
 }
 
 /**
@@ -660,6 +773,29 @@ export function createApiRouter({ store, aiElaborator, events, executorProbe = d
         return { status: 200, payload: docsView({ packagedDir: PACKAGED_DOCS_DIR, workspacePath, overrideDir: envConfig.docsDir ?? null }) };
       }
       throw new TbError("USAGE_ERROR", "docs 仅支持 GET / POST(materialize|reset) / PUT(dir)");
+    }
+    // 卡 `-293`（需求 `R197`）· **只读**查看项目工作区里的一个文件（执行记录里的「可检验引用」点开即读）。
+    //
+    // 只读边界（三条，硬约束）：
+    //   · **端点只读**：只 GET；不写库、不写审计、不改文件、不建会话；
+    //   · **不做任意路径读取**：路径必须落在该项目 `workspacePath` 内（`..` 穿越 / 绝对路径越界 /
+    //     符号链接逃逸各自一个错误码，见 `resolveWorkspaceFile` 的三道闸）；
+    //   · **不落盘**：超上限与二进制一律**拒**（不截断 —— 半截文件比读不到更容易误导人）。
+    //
+    // `?open=1` 是**可选**的宿主「打开文件」尝试（让 DSH 自己开文件/编辑器）；
+    // 探不到能力就如实回 `opened:false` + 原因，前端据此降级到抽屉内只读查看器（不臆造成功）。
+    const projectFileRoute = /^\/api\/projects\/([^/]+)\/file$/.exec(pathname);
+    if (projectFileRoute) {
+      if (method !== "GET") throw new TbError("USAGE_ERROR", "file 仅支持 GET（只读端点）");
+      const project = store.requireProject(decodeURIComponent(projectFileRoute[1]));
+      const opened = resolveWorkspaceFile({
+        workspacePath: project.workspacePath ?? null,
+        relPath: searchParams.get("path") ?? "",
+      });
+      const hostOpen = searchParams.get("open") === "1"
+        ? await tryHostOpenFile(store, opened.absPath)
+        : { attempted: false, opened: false, via: null, reason: "not-requested" };
+      return { status: 200, payload: { ...opened, hostOpen } };
     }
     // 会话 ↔ 项目关联（FR-63）：列出 / 申请 / 批准
     const projectAgentTeamsRoute = /^\/api\/projects\/([^/]+)\/agent-teams$/.exec(pathname);

@@ -538,6 +538,8 @@
     const sessionId = options.session ?? null; // FR-60：会话上下文（由 conversation.view 注入传入）
     const cwd = options.cwd ?? null;
     const openHostSession = typeof options.openSession === "function" ? options.openSession : null; // FR-48：客户端会话切换
+    // 卡 `-293`（需求 `R197`）：客户端宿主「打开文件」能力。**探到才调用**，探不到就降级到抽屉内只读查看器。
+    const openHostFile = typeof options.openFile === "function" ? options.openFile : null;
     const doc = root.ownerDocument ?? document;
     // FR-28：会话内**默认按本会话收敛**（档位＝`session:<本会话标识>`，可用「全部」一键切回）；
     // 拿不到 sessionId（非会话作用域入口）时保持「全部」，并由工具栏明写降级文案（见 NO_SESSION_NOTICE）。
@@ -588,6 +590,132 @@
       return `\n⚠ 任务书未送达（${d.reason ?? "原因未知"}）：会话已建、授权已生效，但该会话不知道要做什么 —— 点「打开执行会话」把任务书手工贴过去，或修好宿主 preset 投递后重派`;
     };
     const bookDeliveryFailed = (launch) => (launch?.bookDelivery?.delivered === false);
+
+    /**
+     * 卡 `-293`（需求 `R197`）· 执行记录里的「可核验引用」**点开即读**。
+     *
+     * 背景（2026-11-23 真机批注）：`-258` 起抽屉能显示「可核验引用」，但真机上一行 `file · docs/...`
+     * **点击无反应** —— 引用可核对却不可读，人还得自己去编辑器里找。
+     *
+     * 两条路，**如实标注走了哪条**（不谎报）：
+     *   ① **DSH 侧边栏打开**（主路 · 第 2 轮返工口径）：客户端 `options.openFile`
+     *      ⇒ 宿主 `betterSidebar.openTab({type:"editor", path:<绝对路径>}, {sessionId})`
+     *      —— 探不到 / 调用失败 ⇒ 如实说明原因，转②。
+     *   ② **抽屉内只读查看器**（兜底）：服务端只读端点 `GET /api/projects/:id/file?path=…`
+     *      ⇒ 等宽字体 + 行号（可选开关）+ 超长截断提示。
+     *
+     * ⚠ **绝对路径只认服务端回包**：侧边栏只认**绝对路径**，而客户端自己拼的路径
+     *   既没有 realpath、也可能拼错根 ⇒ 一律用服务端 `resolveWorkspaceFile` 回的 `absPath`
+     *   （它已过三道闸：`..` 穿越 / 越界 / 符号链接逃逸）。**不另写一套路径算法。**
+     * ⚠ 只处理 `kind === "file"` 的引用（`commit` 是 git 对象，不是文件，点击无意义）。
+     */
+    const REF_VIEWER_MAX_LINES = 1000;
+    /** 只读查看器：等宽正文 + 行号（可选）+ 截断提示。 */
+    const renderRefViewer = (host, payload) => {
+      const old = host?.querySelector?.(".exec-ref-viewer");
+      if (old) old.remove();
+      const box = mk("div", "exec-ref-viewer");
+      const text = String(payload?.text ?? "");
+      const lines = text.length === 0 ? [] : text.split("\n");
+      const shown = lines.slice(0, REF_VIEWER_MAX_LINES);
+      const truncated = lines.length > REF_VIEWER_MAX_LINES;
+      const head = mk("div", "exec-ref-viewer-head hint");
+      head.appendChild(mk("span", null, `${payload?.path ?? payload?.requested ?? ""} · ${payload?.size ?? 0} B · 共 ${lines.length} 行`));
+      if (truncated) head.appendChild(mk("span", "exec-ref-viewer-trunc", `（已截断：只显示前 ${REF_VIEWER_MAX_LINES} 行）`));
+      box.appendChild(head);
+      const body = mk("div", "exec-ref-viewer-body");
+      shown.forEach((line, index) => {
+        const row = mk("div", "exec-ref-viewer-line");
+        row.appendChild(mk("span", "exec-ref-viewer-ln", String(index + 1)));
+        row.appendChild(mk("span", "exec-ref-viewer-lc", line));
+        body.appendChild(row);
+      });
+      box.appendChild(body);
+      const tools = mk("div", "exec-ref-viewer-tools");
+      const lnBtn = mk("button", "link", "行号");
+      lnBtn.type = "button";
+      lnBtn.setAttribute("aria-pressed", "false");
+      lnBtn.title = "显示 / 隐藏行号";
+      lnBtn.addEventListener("click", () => {
+        const on = box.classList.toggle("with-ln");
+        lnBtn.setAttribute("aria-pressed", on ? "true" : "false");
+      });
+      const closeBtn = mk("button", "link", "关闭");
+      closeBtn.type = "button";
+      closeBtn.addEventListener("click", () => { box.remove(); });
+      tools.appendChild(lnBtn);
+      tools.appendChild(closeBtn);
+      box.appendChild(tools);
+      host?.appendChild?.(box);
+      return box;
+    };
+    /**
+     * 点引用：**先向服务端要权威绝对路径 + 只读内容**，再优先走 DSH 侧边栏打开；
+     * 打不开才在抽屉内展开只读查看器（兜底，**如实标注**）。
+     */
+    const openEvidenceRef = async ({ btn, note, ref, projectId }) => {
+      btn.disabled = true;
+      note.textContent = "正在打开…";
+      const host = btn.closest("li") ?? btn.parentElement;
+      // ① 服务端**只读**端点：路径三道闸（`..` 穿越 / 越界 / 符号链接逃逸）在这里过，
+      //    回包里的 `absPath` 是**权威绝对路径**（realpath 后的）—— 侧边栏只认它。
+      let payload = null;
+      try {
+        payload = await api("GET", `/api/projects/${encodeURIComponent(projectId)}/file?path=${encodeURIComponent(ref)}`);
+      } catch (error) {
+        btn.dataset.openVia = "failed";
+        note.textContent = `打开失败：${error?.message ?? error}${error?.code ? `（${error.code}）` : ""}`;
+        btn.disabled = false;
+        return;
+      }
+      const fileName = String(payload?.path ?? ref).split(/[\\/]/).pop() || String(ref);
+      // ② 主路：DSH 侧边栏插件（`options.openFile` 本身就是「探到才有」的产物 ⇒ 探不到就降级）
+      let fallbackReason = "本实例没有宿主「打开文件」能力";
+      if (openHostFile) {
+        try {
+          const r = await openHostFile(payload?.absPath);
+          if (r?.ok) {
+            btn.dataset.openVia = `host:${r.via ?? "unknown"}`;
+            const via = String(r.via ?? "");
+            note.textContent = via.startsWith("betterSidebar")
+              ? `已在 DSH 侧边栏打开 ${fileName}`
+              : `已在宿主打开 ${fileName}（${via}）`;
+            // 宿主已经打开了这个文件 ⇒ 抽屉里那份**旧快照**就是陈的，留着会让人以为看到的是最新内容。
+            host?.querySelector?.(".exec-ref-viewer")?.remove();
+            btn.disabled = false;
+            return;
+          }
+          fallbackReason = r?.reason ?? "原因未知";
+        } catch (error) {
+          fallbackReason = error?.message ?? String(error);
+        }
+      }
+      // ③ 兜底：抽屉内只读查看器（内容上面那一步已经取回来了，不必再请求一次）。
+      try {
+        renderRefViewer(host, payload);
+        btn.dataset.openVia = "viewer";
+        note.textContent = `已在本抽屉内展开只读查看器（兜底：DSH 侧边栏打不开 —— ${fallbackReason}；未改动任何文件）`;
+      } catch (error) {
+        btn.dataset.openVia = "failed";
+        note.textContent = `打开失败：${error?.message ?? error}`;
+      }
+      btn.disabled = false;
+    };
+    /** 渲染一条引用：`file` 类 ⇒ 可点按钮；其余 ⇒ 原样文字（`commit` 是 git 对象，点击无意义）。 */
+    const renderEvidenceRef = ({ kind, ref, label, projectId }) => {
+      if (kind !== "file" || !ref) return mk("span", "exec-ref-text", label);
+      const wrap = mk("span", "exec-ref-open-wrap");
+      const btn = mk("button", "exec-ref-open link", label);
+      btn.type = "button";
+      btn.dataset.ref = ref;
+      btn.dataset.kind = kind;
+      btn.title = `点击查看：${ref}（优先在 DSH 侧边栏打开；打不开就在这里展开只读查看器）`;
+      const note = mk("span", "exec-ref-open-note hint");
+      btn.addEventListener("click", () => { void openEvidenceRef({ btn, note, ref, projectId }); });
+      wrap.appendChild(btn);
+      wrap.appendChild(note);
+      return wrap;
+    };
 
     // ---------------------------------------------------------------- chrome
     const shell = mk("div", "app-shell");
@@ -5319,7 +5447,15 @@
               if (refs.length) {
                 rsec.appendChild(mk("h4", null, `可核验引用（${refs.length}）`));
                 const ul = mk("ul", "exec-record-refs");
-                for (const rf of refs) ul.appendChild(mk("li", null, `${rf?.kind ?? "?"} · ${rf?.ref ?? rf?.value ?? rf?.path ?? JSON.stringify(rf)}`));
+                for (const rf of refs) {
+                  const kind = String(rf?.kind ?? "?").trim() || "?";
+                  const ref = String(rf?.ref ?? rf?.value ?? rf?.path ?? "").trim();
+                  const label = `${kind} · ${ref || JSON.stringify(rf)}`;
+                  const li = mk("li");
+                  // 卡 `-293`（需求 `R197`）：`file` 类引用**可点**（点开即在 DSH 界面里读到内容）。
+                  li.appendChild(renderEvidenceRef({ kind, ref, label, projectId: t.projectId }));
+                  ul.appendChild(li);
+                }
                 rsec.appendChild(ul);
               }
               rsec.appendChild(mk("p", "hint", `证据由 ${evd.actor ?? "未标注"} 于 ${fmtTime(evd.createdAt)} 写入 · 对应任务版本 v${evd.taskVersion ?? "-"}${evd.refsState ? ` · 引用状态 ${evd.refsState}` : ""}`));

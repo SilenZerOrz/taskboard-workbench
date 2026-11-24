@@ -1348,3 +1348,49 @@ button.danger { border-color: var(--danger); color: var(--danger); background: v
 .tb-drawer .tb-exec-picker button.tb-exec-choice:disabled { opacity: 0.42; cursor: not-allowed; }
 .tb-agent-icon { width: 13px; height: 13px; fill: currentColor; flex: 0 0 auto; }
 .tb-exec-note { margin: 0; flex: 1 1 100%; }
+
+/* ── 卡 `-293`（需求 `R197`）：证据引用「点开即读」的只读查看器 ──────────────────
+   一行 `file · docs/...` 过去是**死的**（点不动）—— 引用可核对却不可读。
+   现在它是按钮；点开优先走宿主打开，打不开就在抽屉里展开这个**只读**查看器。
+
+   纪律：
+   · 查看器**只读** —— 没有保存/编辑/写入任何控件；
+   · 行号**默认关**（可选开关）—— 平时读内容不需要行号，要定位时才开；
+   · 正文**等宽**且**保留缩进**（`white-space: pre`）—— 代码文件的缩进就是语义；
+   · 超长**显式写明已截断**（不静默 slice）—— 半截内容比不显示更容易误导人。 */
+.exec-record-refs { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: var(--space-1); }
+.exec-record-refs li { display: flex; flex-direction: column; gap: 2px; }
+.exec-ref-open-wrap { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-2); }
+.tb-drawer button.exec-ref-open.link {
+  padding: 0 var(--space-1); font-size: 12px; font-weight: 500;
+  text-align: left; word-break: break-all; cursor: pointer;
+}
+.tb-drawer button.exec-ref-open.link:disabled { cursor: progress; }
+.exec-ref-open-note { font-size: 11px; }
+.exec-ref-text { font-size: 12px; }
+.exec-ref-viewer {
+  margin-top: var(--space-1);
+  border: 1px solid var(--border); border-radius: var(--radius-md);
+  background: var(--surface-sunken, var(--surface));
+  display: flex; flex-direction: column; gap: var(--space-1);
+  max-height: 420px; overflow: hidden;
+}
+.exec-ref-viewer-head {
+  display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: baseline;
+  padding: var(--space-2) var(--space-3) 0 var(--space-3);
+}
+.exec-ref-viewer-trunc { color: var(--warning); }
+.exec-ref-viewer-body {
+  overflow: auto; padding: 0 var(--space-3);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px; line-height: 1.55;
+}
+.exec-ref-viewer-line { display: flex; gap: var(--space-2); }
+.exec-ref-viewer-lc { white-space: pre; flex: 1 1 auto; min-width: 0; }
+/* 行号默认**不显示**（可选开关）—— 加了 `.with-ln` 才出现 */
+.exec-ref-viewer-ln {
+  display: none; flex: 0 0 auto; min-width: 3.5em; text-align: right;
+  color: var(--text-tertiary); user-select: none;
+}
+.exec-ref-viewer.with-ln .exec-ref-viewer-ln { display: block; }
+.exec-ref-viewer-tools { display: flex; gap: var(--space-2); padding: 0 var(--space-3) var(--space-2); }

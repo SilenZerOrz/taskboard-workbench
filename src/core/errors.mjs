@@ -90,6 +90,16 @@ export const ERROR_CATEGORY = Object.freeze({
   // 冲突
   // 卡 `-229`（R170）：开局缺口投递时项目还没绑主会话 ⇒ 冲突类（先绑/重建主会话再重试；非数据错误）
   NO_MAIN_SESSION: EXIT.CONFLICT,
+  // 卡 `-293`（R197）：**只读文件查看端点**的逐条拒绝码。
+  // 为什么每种拒绝一个码：验收③要求「`../` / workspace 外 / 不存在」各返回**明确**错误码 ——
+  // 全塞进 USAGE_ERROR 等于没分。人看到码才知道是「路径写法不对」「越界」还是「文件真不在」。
+  FILE_PATH_INVALID: EXIT.USAGE,      // path 参数缺失 / 不可解析
+  FILE_PATH_TRAVERSAL: EXIT.USAGE,    // 路径含 `..` 穿越段 ⇒ 直接拒（不靠解析后兜底）
+  FILE_OUTSIDE_WORKSPACE: EXIT.USAGE, // realpath 后落在项目 workspacePath 之外（含符号链接逃逸）
+  FILE_NOT_FOUND: EXIT.DATA,           // 工作区内确实没有这个文件
+  FILE_NOT_A_FILE: EXIT.DATA,         // 是目录 / 设备等，不是普通文件
+  FILE_TOO_LARGE: EXIT.DATA,           // 超过只读查看上限（默认 512KB）
+  FILE_NOT_TEXT: EXIT.DATA,            // 判定为二进制，不提供文本预览
   VERSION_CONFLICT: EXIT.CONFLICT,
   PROJECT_EXISTS: EXIT.CONFLICT,
   // FR-03：非空项目不得删除（仍有任务/需求条目/需求文档正文）⇒ 冲突，须先清空

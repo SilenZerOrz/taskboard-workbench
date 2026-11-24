@@ -54,6 +54,49 @@ export function createHostSessionPort({ getService, getCtx, getStore } = {}) {
   const sessionController = () => getService?.("sessionController");
   const agents = () => getService?.("agents");
   const uiWorkspace = () => getService?.("uiWorkspace");
+  /**
+   * 卡 `-293`（需求 `R197`）· 宿主「打开文件」能力的**候选服务**与**候选方法名**。
+   *
+   * 为什么是**候选表**而不是直接调某个方法：宿主各版本暴露的服务名/方法名不一样，
+   * **假定某个方法存在**＝把「探不到」伪装成「探到了」（这正是验收①禁止的）。
+   * 所以这里只列候选，运行时**逐一探**、探到才调。
+   */
+  const OPEN_FILE_SERVICES = ["uiWorkspace", "workspace", "sessions"];
+  const OPEN_FILE_METHODS = ["openFile", "openPath", "showFile", "viewFile", "readFile", "openWorkspaceFile", "openResource", "revealFile"];
+  /**
+   * 列一个服务实例上的**真实 key 列表**（自有属性 + 原型上的方法名）。
+   * 为什么要「真实列表」：能力探测只报 `true/false` 时，人无法判断是「宿主没有这个能力」
+   * 还是「我们找错了方法名」—— 打印出实际 key，排查才有落点（验收①要求打印真实 key 列表）。
+   */
+  const serviceKeys = (service) => {
+    if (!service || (typeof service !== "object" && typeof service !== "function")) return [];
+    const out = new Set();
+    try { for (const key of Object.keys(service)) out.add(key); } catch { /* ignore */ }
+    try {
+      const proto = Object.getPrototypeOf(service);
+      if (proto) for (const key of Object.getOwnPropertyNames(proto)) if (key !== "constructor") out.add(key);
+    } catch { /* ignore */ }
+    return [...out].sort();
+  };
+  /**
+   * 宿主「打开文件」能力**探测**（只读）：逐个候选服务取实例、列真实 key、找「打开文件」类方法。
+   * 一个都探不到 ⇒ `openFile: null` ⇒ 前端**降级**到抽屉内只读查看器（不臆造成功）。
+   */
+  const probeOpenFile = () => {
+    const probed = [];
+    for (const name of OPEN_FILE_SERVICES) {
+      let service = null;
+      try { service = getService?.(name) ?? null; } catch { service = null; }
+      const keys = serviceKeys(service);
+      const method = OPEN_FILE_METHODS.find((m) => typeof service?.[m] === "function") ?? null;
+      probed.push({ service: name, present: Boolean(service), keys, openFileMethod: method });
+    }
+    return probed;
+  };
+  const serviceOf = (name) => {
+    try { return getService?.(name) ?? null; } catch { return null; }
+  };
+
   /** 注入用 store（懒取）：宿主未给 store（单测 / 纯 adapter 用法）⇒ 一律不注入，行为与接线前完全一致。 */
   const store = () => {
     try { return getStore?.() ?? null; } catch { return null; }
@@ -418,8 +461,40 @@ export function createHostSessionPort({ getService, getCtx, getStore } = {}) {
         return { opened: false, reason: error?.message ?? String(error) };
       }
     },
+    /**
+     * 卡 `-293`（需求 `R197`）· 宿主「**打开文件**」出口。
+     *
+     * 口径与 `openSession` 同源：**探到才调用**。
+     *   · 先跑 `probeOpenFile()`（列出候选服务上的**真实 key 列表**）⇒ 探到方法才调；
+     *   · 一个都探不到 ⇒ 如实回 `{opened:false, reason:"host-file-open-unavailable"}`，
+     *     前端据此降级到抽屉内只读查看器（**绝不臆造成功**）。
+     *
+     * 只读：只是「请宿主把文件显示出来」，不建会话、不投递指令、不写库。
+     */
+    async openFile(absPath) {
+      if (!absPath) return { opened: false, reason: "no-path", probed: [] };
+      const probed = probeOpenFile();
+      const hit = probed.find((p) => p.openFileMethod);
+      if (!hit) return { opened: false, reason: "host-file-open-unavailable", probed };
+      const service = serviceOf(hit.service);
+      try {
+        const result = service[hit.openFileMethod](absPath);
+        if (result && typeof result.then === "function") await result;
+        return { opened: true, via: `${hit.service}.${hit.openFileMethod}`, probed };
+      } catch (error) {
+        return { opened: false, reason: error?.code ?? error?.message ?? String(error), via: `${hit.service}.${hit.openFileMethod}`, probed };
+      }
+    },
     getCurrentSessionId() {
       return null;
+    },
+    /**
+     * 卡 `-293`（R197）· **只读**能力探测（同步）：候选宿主服务上的**真实 key 列表** + 探到的
+     * 「打开文件」方法名。启动日志与排障都用它 —— 只报 `true/false` 时人无从判断是「宿主没这能力」
+     * 还是「我们找错了方法名」。
+     */
+    probeOpenFileService() {
+      return probeOpenFile();
     },
     /** 诊断：各宿主服务在**调用时刻**是否已就绪（懒取模式下的真实可见性）。 */
     /**
@@ -450,6 +525,13 @@ export function createHostSessionPort({ getService, getCtx, getStore } = {}) {
         scopedRename: false,
         sameControllerAsRoot: null,
         verdict: "unknown",
+        // 卡 `-293`（R197）：宿主「打开文件」能力探测 —— **真实 key 列表**一并带出，
+        // 便于人判断「宿主到底有没有这个能力 / 我们是不是找错了方法名」。
+        // 放在 try 之前 ⇒ scope 解析失败时这一段**照样**在（那是两条独立的排查线）。
+        openFile: (() => {
+          const probed = probeOpenFile();
+          return { probed, verdict: probed.some((p) => p.openFileMethod) ? "open-file-available" : "open-file-unavailable" };
+        })(),
       };
       try {
         const createScope = await loadScopeFactory();
@@ -494,6 +576,8 @@ export function createHostSessionPort({ getService, getCtx, getStore } = {}) {
         uiWorkspace: Boolean(uiWorkspace()),
         sessionQuery: Boolean(getService?.("sessionQuery")),
         scopeFactory: scopeFactoryState,
+        // 卡 `-293`（R197）：宿主「打开文件」能力位（探不到就是 false，前端据此降级，不臆造成功）。
+        openFile: probeOpenFile().some((p) => p.openFileMethod),
       };
     },
   };
@@ -561,7 +645,7 @@ export function apply(ctx, config) {
   // 宿主会话能力探测（懒取，仅用于日志；真正调用仍在 hostSessionPort 内现取）。
   const probeService = (name) => { try { return Boolean(ctx?.get?.(name)); } catch { return false; } };
   console.log(
-    `[taskboard-workbench] host ready: prefix=${PREFIX} dataDir=${runtime.dataDir} projects=${runtime.ensured.projects.length} migration=${JSON.stringify(runtime.migration)} aiElaborate=${Boolean(aiElaborator)} teamEngine=${teamEngineMode} services=${JSON.stringify({ sessionController: probeService("sessionController"), sessions: probeService("sessions"), uiWorkspace: probeService("uiWorkspace"), tools: probeService("tools") })}`,
+    `[taskboard-workbench] host ready: prefix=${PREFIX} dataDir=${runtime.dataDir} projects=${runtime.ensured.projects.length} migration=${JSON.stringify(runtime.migration)} aiElaborate=${Boolean(aiElaborator)} teamEngine=${teamEngineMode} services=${JSON.stringify({ sessionController: probeService("sessionController"), sessions: probeService("sessions"), uiWorkspace: probeService("uiWorkspace"), tools: probeService("tools") })} openFileProbe=${JSON.stringify((() => { try { return runtime.store.hostSessionPort.probeOpenFileService(); } catch { return []; } })())}`,
   );
 
   const registered = [];
